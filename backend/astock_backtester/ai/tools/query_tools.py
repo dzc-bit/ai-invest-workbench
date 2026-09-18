@@ -97,7 +97,13 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
         # 回填保留元数据：agent 据此告诉模型"还有 M 行，用 read_tool_result 从 offset=K 续读"。
         payload["shown_rows"] = retained.kept
         payload["more_rows"] = retained.omitted
-        return f"查询成功 {payload.get('row_count')} 行：\n{retained.text}"
+        payload["resume_offset"] = retained.resume_offset
+        note = (
+            "\n（已达单次查询 500 行上限，库中可能还有更多数据——请在 SQL 里收紧条件或分页，不要当作全量结论。）"
+            if payload.get("truncated")
+            else ""
+        )
+        return f"查询成功 {payload.get('row_count')} 行：\n{retained.text}{note}"
 
     def compute_stock_stats(args: dict[str, Any]) -> dict[str, Any]:
         symbol = normalize_symbol(str(args.get("symbol", "")))
@@ -142,14 +148,13 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
         )
 
     def update_stock_data(args: dict[str, Any]) -> dict[str, Any]:
-        from astock_backtester.data.operations import fetch_daily_bars_into_cache
+        from astock_backtester.data.operations import fetch_capital_flow_into_cache, fetch_daily_bars_into_cache
 
+        mode = str(args.get("mode") or "daily_bars").strip().lower()
+        if mode not in ("daily_bars", "capital_flow"):
+            return {"ok": False, "error": "mode 只能是 daily_bars（日线+随行资金流合并）或 capital_flow（资金流缺口补齐）"}
         symbols = [normalize_symbol(str(s)) for s in args.get("symbols", []) if str(s).strip()]
         symbols = list(dict.fromkeys(symbols))
-        if not symbols:
-            return {"ok": False, "error": "symbols 不能为空"}
-        if len(symbols) > BACKFILL_MAX_SYMBOLS:
-            return {"ok": False, "error": f"单次最多补齐 {BACKFILL_MAX_SYMBOLS} 只股票"}
         try:
             start_date = str(args["start_date"])
             end_date = str(args["end_date"])
@@ -164,6 +169,43 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
         if pd.Timestamp(end) > pd.Timestamp(date.today()):
             end_date = date.today().isoformat()
 
+        # 全市场资金流补齐：同步链路逐只循环在步数预算内不可能完成，
+        # 走数据中心同款后台任务（分批、可取消、失败归因），模型轮询进度。
+        if not symbols:
+            if mode != "capital_flow":
+                return {
+                    "ok": False,
+                    "error": "日线补齐必须指定 symbols（最多 20 只）；全市场日线请在数据中心使用全市场同步。",
+                }
+            try:
+                missing = backend.warehouse.read_capital_flow_missing_symbols(start_date, end_date)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"读取资金流缺口名单失败：{exc}"}
+            if not missing:
+                return {
+                    "ok": True,
+                    "mode": mode,
+                    "status": "ok",
+                    "imported_rows": 0,
+                    "summary_detail": "窗口内没有缺资金流的股票，无需补齐。",
+                }
+            job = backend.sync_manager.start_capital_flow_backfill(sorted(missing), start_date, end_date)
+            return {
+                "ok": True,
+                "mode": mode,
+                "background_job": {
+                    "job_id": job.job_id,
+                    "mode": job.mode,
+                    "status": job.status,
+                    "total_symbols": job.total_symbols,
+                    "start_date": job.start_date.isoformat(),
+                    "end_date": job.end_date.isoformat(),
+                },
+                "summary_detail": f"已启动全市场资金流补齐后台任务（{job.total_symbols} 只），用 sync_job_status 轮询进度。",
+            }
+        if len(symbols) > BACKFILL_MAX_SYMBOLS:
+            return {"ok": False, "error": f"单次最多补齐 {BACKFILL_MAX_SYMBOLS} 只股票"}
+
         def fetcher(symbols_list: list[str], fetch_start: str, fetch_end: str) -> pd.DataFrame:
             frames = []
             for symbol in symbols_list:
@@ -173,34 +215,106 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
         def flow_fetcher(symbols_list: list[str], fetch_start: str, fetch_end: str) -> dict[str, Any]:
+            # 爬虫内部已按首只股票的失败模式自适应 skip_eastmoney，无需调用方预判。
             return backend.capital_flow_crawler.fetch_many_fund_flows(symbols_list, fetch_start, fetch_end, timeout=15)
 
-        result = fetch_daily_bars_into_cache(
-            cache=backend.cache,
-            warehouse=backend.warehouse,
-            fetcher=fetcher,
-            capital_flow_fetcher=flow_fetcher,
-            symbols=symbols,
-            start_date=start_date,
-            end_date=end_date,
-        )
+        if mode == "capital_flow":
+            # 资金流缺口补齐：允许为“暂无日K”的股票先写资金流独立行，并跳过
+            # 已完整的股票——与 /fetch/capital-flow 同一条链路。AI 侧不同步
+            # 重扫 coverage（60 秒级），改由后台刷新接管。
+            result = fetch_capital_flow_into_cache(
+                cache=backend.cache,
+                capital_flow_fetcher=flow_fetcher,
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                warehouse=backend.warehouse,
+                refresh_coverage=False,
+            )
+        else:
+            result = fetch_daily_bars_into_cache(
+                cache=backend.cache,
+                warehouse=backend.warehouse,
+                fetcher=fetcher,
+                capital_flow_fetcher=flow_fetcher,
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                refresh_coverage=False,
+            )
+            try:
+                backend.start_coverage_refresh(force=True)
+            except Exception:  # noqa: BLE001 - 后台刷新失败不阻塞补齐结果
+                pass
         for entry in result.logs:
             backend.log(entry.level, entry.message)
-        return {
+        payload: dict[str, Any] = {
             "ok": True,
+            "mode": mode,
             "status": result.status,
             "imported_rows": result.imported_rows,
             "fetched_symbols": result.fetched_symbols,
+            "skipped_symbols": result.skipped_symbols,
             "missing_symbols": result.missing_symbols,
             "failure_count": len(result.failures),
         }
+        # 失败/缺失明细行集化：模型才知道“缺谁、为什么”，能改参数重试而不是盲目重来。
+        rows: list[dict[str, Any]] = [
+            {
+                "symbol": str(item.get("symbol", "")),
+                "reason": str(item.get("error") or item.get("message") or "抓取失败"),
+            }
+            for item in result.failures
+        ]
+        rows.extend({"symbol": symbol, "reason": "未取到该区间的目标数据"} for symbol in result.missing_symbols)
+        if rows:
+            payload["rows"] = rows
+        return payload
 
     def summarize_update(payload: dict[str, Any]) -> str:
+        if payload.get("background_job"):
+            job = payload["background_job"]
+            return f"资金流补齐已转后台任务 {job.get('job_id')}（{job.get('total_symbols')} 只），请轮询 sync_job_status。"
+        detail = payload.get("summary_detail")
+        if detail:
+            return str(detail)
+        heads = "、".join(str(item.get("symbol")) for item in (payload.get("rows") or [])[:3])
+        rows_note = f"；示例：{heads}" if heads else ""
         return (
-            f"数据补齐{payload.get('status')}：写入 {payload.get('imported_rows')} 行，"
-            f"成功 {len(payload.get('fetched_symbols', []))} 只，缺失 {len(payload.get('missing_symbols', []))} 只，"
-            f"失败 {payload.get('failure_count', 0)} 项。"
+            f"数据补齐（{payload.get('mode')}）{payload.get('status')}：写入 {payload.get('imported_rows')} 行，"
+            f"成功 {len(payload.get('fetched_symbols', []))} 只，"
+            f"跳过 {len(payload.get('skipped_symbols', []))} 只，"
+            f"缺失 {len(payload.get('missing_symbols', []))} 只，失败 {payload.get('failure_count', 0)} 项"
+            f"{rows_note}。明细在结果的 rows 里，可用 read_tool_result 续读。"
         )
+
+    def sync_job_status(args: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(args.get("job_id", "")).strip()
+        if not job_id:
+            return {"ok": False, "error": "job_id 不能为空"}
+        job = backend.sync_manager.get_job(job_id)
+        if job is None:
+            return {"ok": False, "error": f"没有找到任务 {job_id}（任务只保留在内存中，服务重启后失效）"}
+        return {"ok": True, "job": job.model_dump(mode="json")}
+
+    def summarize_job(payload: dict[str, Any]) -> str:
+        job = payload.get("job", {})
+        failures = job.get("recent_failures") or []
+        head = (
+            f"任务 {job.get('mode')}（{job.get('job_id')}）状态 {job.get('status')}："
+            f"已处理 {job.get('processed_symbols', 0)}/{job.get('total_symbols', 0)} 只"
+            f"（完成 {job.get('completed_symbols', 0)}、跳过 {job.get('skipped_symbols', 0)}、失败 {job.get('failed_symbols', 0)}），"
+            f"写入 {job.get('imported_rows', 0)} 行。"
+        )
+        if job.get("status") == "running":
+            head += f" 当前：{job.get('current_symbol') or '…'}。"
+        if failures:
+            sample = "；".join(
+                f"{item.get('symbol', '?')}（{str(item.get('error') or item.get('reason') or item.get('message') or '失败')[:40]}）"
+                for item in failures[:3]
+            )
+            head += f" 近期失败示例：{sample}"
+        return head
 
     return [
         AiTool(
@@ -238,19 +352,45 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
         AiTool(
             name="update_stock_data",
             description=(
-                "唯一的写操作：通过数据中心同款补齐链路，把指定股票在区间的日线/市值/资金流写回本地数据仓。"
-                "用户要求'补数据/更新数据/拉取某股票行情入库'时使用；执行后会写入仓库并刷新覆盖信息。"
+                "唯一的写操作，通过数据中心同款补齐链路写回本地数据仓。两种 mode："
+                "daily_bars（默认）补指定股票区间的日线/市值并把资金流合并进新拉的日线行；"
+                "capital_flow 补资金流缺口——允许为暂无日 K 的股票先写资金流独立行，"
+                "省略 symbols 时自动找出窗口内缺资金流的股票并启动全市场后台任务（用 sync_job_status 轮询）。"
+                "资金流独立行不能让股票变成可回测的日线数据。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "symbols": {"type": "array", "items": {"type": "string"}, "description": "最多 20 个 6 位代码"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["daily_bars", "capital_flow"],
+                        "description": "补齐类型，默认 daily_bars",
+                    },
+                    "symbols": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "最多 20 个 6 位代码；capital_flow 模式下省略表示全市场后台任务",
+                    },
                     "start_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "end_date": {"type": "string", "description": "YYYY-MM-DD"},
                 },
-                "required": ["symbols", "start_date", "end_date"],
+                "required": ["start_date", "end_date"],
             },
             executor=update_stock_data,
             summarizer=summarize_update,
+            read_only=False,
+        ),
+        AiTool(
+            name="sync_job_status",
+            description="查询补齐后台任务（update_stock_data 的 capital_flow 全市场模式启动）的进度：已处理/成功/失败/写入行数。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "update_stock_data 返回的 background_job.job_id"}
+                },
+                "required": ["job_id"],
+            },
+            executor=sync_job_status,
+            summarizer=summarize_job,
         ),
     ]

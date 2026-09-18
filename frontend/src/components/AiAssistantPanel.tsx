@@ -501,17 +501,19 @@ export function AiAssistantPanel({
         </div>
       ) : null}
 
-      {sessions.length > 0 ? (
-        <details
-          className="ai-insights ai-history"
-          onToggle={(event) => {
-            // 展开时才刷新：list_sessions 会全量读一遍会话 JSON，不该挂在每轮响应上。
-            if (event.currentTarget.open) {
-              void refreshSessions();
-            }
-          }}
-        >
-          <summary>历史对话（{sessions.length}）</summary>
+      {/* 历史区永远渲染：列表为空时也要能展开触发刷新，否则“首次开抽屉时
+          无历史 → 之后产生对话 → 列表永无刷新路径”是一条死路。 */}
+      <details
+        className="ai-insights ai-history"
+        onToggle={(event) => {
+          // 展开时才刷新：list_sessions 会全量读一遍会话 JSON，不该挂在每轮响应上。
+          if (event.currentTarget.open) {
+            void refreshSessions();
+          }
+        }}
+      >
+        <summary>{sessions.length > 0 ? `历史对话（${sessions.length}）` : "历史对话"}</summary>
+        {sessions.length > 0 ? (
           <ul>
             {sessions.map((item) => (
               <li
@@ -543,8 +545,10 @@ export function AiAssistantPanel({
               </li>
             ))}
           </ul>
-        </details>
-      ) : null}
+        ) : (
+          <p className="ai-history-empty">还没有历史会话。开始对话后，再次展开这里即可加载。</p>
+        )}
+      </details>
 
       {insights.length > 0 ? (
         <details className="ai-insights">

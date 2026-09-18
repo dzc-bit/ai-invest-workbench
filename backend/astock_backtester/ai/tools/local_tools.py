@@ -35,7 +35,11 @@ MAX_CONDITION_EXPRESSIONS = 6
 
 
 class AiBackend(Protocol):
-    """Narrow view of DataServiceState the tools are allowed to touch."""
+    """Narrow view of DataServiceState the tools are allowed to touch.
+
+    只允许公共接口（AGENTS.md §15-3）：coverage 快照与后台同步任务都走
+    DataServiceState/SyncJobManager 的公开方法，不触碰私有属性。
+    """
 
     cache: Any
     warehouse: Any
@@ -45,8 +49,13 @@ class AiBackend(Protocol):
     briefing_provider: Any
     risk_provider: Any
     capital_flow_crawler: Any
+    sync_manager: Any
 
     def log(self, level: str, message: str) -> None: ...
+
+    def coverage_snapshot(self) -> list[Any]: ...
+
+    def start_coverage_refresh(self, *, force: bool = False) -> Any | None: ...
 
 
 def _validated_nodes(expressions: list[str], *, mode: str) -> tuple[list[ConditionNode], list[dict[str, Any]]]:
@@ -141,20 +150,68 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
         return f"{label}。示例：{heads or '无'}"
 
     def data_health_report(_: dict[str, Any]) -> dict[str, Any]:
-        profile = backend.warehouse.data_gap_profile()
+        # 损坏 ≠ 缺失：分区损坏会让画像读取抛异常，此时明确让模型“先修损坏”，
+        # 而不是收到一条裸 tool_error 后去补数据。
+        try:
+            profile = backend.warehouse.data_gap_profile()
+        except Exception as exc:  # noqa: BLE001
+            # 注意：Warehouse.corrupt_partitions 是 @property（返回 dict），不是方法。
+            try:
+                corrupt = sorted(backend.warehouse.corrupt_partitions)
+            except Exception:  # noqa: BLE001
+                corrupt = []
+            payload: dict[str, Any] = {
+                "ok": False,
+                "error_code": "warehouse_corrupt" if corrupt else "tool_error",
+                "error": f"缺口画像读取失败：{exc}",
+            }
+            if corrupt:
+                payload["corrupt_partitions"] = corrupt
+                payload["hint"] = "存在损坏分区：请先在数据中心处理损坏分区，损坏会被伪装成“缺失数据”，补齐无法修复。"
+            return payload
         if not profile.get("available"):
             return {"ok": False, "error": str(profile.get("reason", "数据仓缺口画像不可用"))}
-        return {"ok": True, "profile": profile}
+        result: dict[str, Any] = {"ok": True, "profile": profile}
+        # 停更分布行集化：摘要只给 top，逐条明细进 rows 供 read_tool_result 续读。
+        rows: list[dict[str, Any]] = []
+        for dataset, label in (("daily_bars", "日线"), ("market_cap", "市值"), ("capital_flow", "资金流")):
+            section = profile.get(dataset, {})
+            if section.get("delisted_symbols"):
+                rows.append({"dataset": label, "note": f"{section['delisted_symbols']} 只已退市（终态，无需补齐）"})
+            for entry in section.get("stale_distribution", []):
+                rows.append({"dataset": label, "last_date": entry.get("last_date"), "symbols": entry.get("symbols")})
+        if rows:
+            result["rows"] = rows
+        # coverage 汇总：模型回答“还缺多少行”不必再自己 SQL 数——SQL 行数统计
+        # 只得内部缺口，不含日历/生命周期/停更尾部，会和覆盖卡打架。
+        try:
+            coverage = backend.coverage_snapshot()
+        except Exception:  # noqa: BLE001
+            coverage = []
+        if any(item.symbols > 0 for item in coverage):
+            result["coverage"] = [
+                {
+                    "dataset": item.dataset,
+                    "symbols": item.symbols,
+                    "missing_rows": item.missing_rows,
+                    "end_date": str(item.end_date or ""),
+                }
+                for item in coverage
+            ]
+        return result
 
     def summarize_data_health(payload: dict[str, Any]) -> str:
         profile = payload.get("profile", {})
         window = profile.get("window", {})
         daily = profile.get("daily_bars", {})
         lines = [
-            f"数据窗口 {window.get('start_date')}~{window.get('end_date')}："
+            f"数据窗口 {window.get('start_date')}~{window.get('end_date')}"
+            f"（画像只覆盖最近 {len(window.get('partitions', []))} 个年分区，更早停更的股票不在分布里）："
             f"日线 {daily.get('symbols')} 只，其中 {daily.get('symbols_current')} 只更新到最新，"
             f"{daily.get('symbols_stale')} 只已停更。"
         ]
+        if daily.get("delisted_symbols"):
+            lines.append(f"另有 {daily['delisted_symbols']} 只已退市（终态，不算缺口，不要建议补齐）。")
         stale = daily.get("stale_distribution", [])[:5]
         if stale:
             parts = "；".join(f"{entry['symbols']} 只停在 {entry['last_date']}" for entry in stale)
@@ -169,6 +226,15 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
             if entries:
                 parts = "；".join(f"{entry['symbols']} 只停在 {entry['last_date']}" for entry in entries)
                 lines.append(f"{label}停更：{parts}。")
+                if section.get("delisted_symbols"):
+                    lines.append(f"（{label}另有 {section['delisted_symbols']} 只退市股已从停更统计剔除。）")
+        coverage = payload.get("coverage") or []
+        if coverage:
+            parts = "；".join(
+                f"{item['dataset']} {item['symbols']} 只缺 {item['missing_rows']} 行" for item in coverage
+            )
+            lines.append(f"覆盖缺口汇总（累计真实缺口口径，含日历/生命周期/停更尾部）：{parts}。")
+            lines.append("注意：直接用 SQL 数 NULL 行只能得到内部缺口，不等于覆盖缺口口径。长期停牌的股票会计为缺口且无法补齐。")
         return "\n".join(lines)
 
     def recent_daily_bars(args: dict[str, Any]) -> dict[str, Any]:
@@ -226,6 +292,7 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
         )
         payload["shown_rows"] = retained.kept
         payload["more_rows"] = retained.omitted
+        payload["resume_offset"] = retained.resume_offset
         return (
             f"{payload.get('symbol')} {payload.get('name')} 最近 {len(rows)} 个交易日："
             f"最新收盘 {last_close}，MA5 {last.get('ma5')} / MA10 {last.get('ma10')} / MA20 {last.get('ma20')}，"
@@ -379,12 +446,14 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
             name="data_health_report",
             description=(
                 "检查本地数据仓具体缺哪些数据：各数据集停更股票分布（多少只停在哪个日期）、"
-                "疑似写入失败日、市值/资金流尾部缺口。回答“数据为什么缺/哪些股票没更新/"
-                "能不能回测某个区间/数据健康”类问题前先调用本工具。"
+                "疑似写入失败日、市值/资金流尾部缺口、覆盖缺口汇总（累计真实缺口口径）与退市股计数。"
+                "停更分布的逐条明细在结果的 rows 里，可用 read_tool_result 续读。"
+                "回答“数据为什么缺/哪些股票没更新/能不能回测某个区间/数据健康”类问题前先调用本工具。"
             ),
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             executor=data_health_report,
             summarizer=summarize_data_health,
+            digest_chars=2_600,
         ),
         AiTool(
             name="recent_daily_bars",
@@ -439,6 +508,7 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
             },
             executor=run_strategy_backtest,
             summarizer=summarize_backtest,
+            read_only=False,
         ),
     ]
 

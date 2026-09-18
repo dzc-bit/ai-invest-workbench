@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from astock_backtester.ai.config import AiConfig
 from astock_backtester.ai.digest import DigestEngine, DigestStore, parse_digest_items
 from astock_backtester.ai.insights import EventBroker
@@ -15,6 +16,19 @@ from astock_backtester.models import (
     MarketNewsResponse,
     RealtimeMarketSnapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_external_crawl(monkeypatch):
+    """简报引擎的涨停池来自东财公开 XHR；单测不打真实网络。
+
+    否则离线/CI 环境里每次 run_once 多出秒级 DNS/连接超时，
+    ``_gather_sources`` 变慢、线程循环的计时断言随机翻车。
+    """
+    monkeypatch.setattr(
+        "astock_backtester.ai.tools.astock_data_tools.fetch_limit_up_rows",
+        lambda kind: [],
+    )
 
 DIGEST_JSON = (
     '[{"title": "光量子计算取得突破", "summary": "图灵量子发布第三代光量子计算机。", '

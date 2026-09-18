@@ -184,6 +184,43 @@ def test_truncated_flag_maps_per_protocol():
     assert responses_final["content"] == "半截"
 
 
+def test_chat_completions_maps_finish_reason_length_to_truncated():
+    """chat-completions 的 ``finish_reason == "length"`` 同样不能漏标截断。"""
+    captured: dict = {}
+
+    def chunk(delta, finish_reason):
+        delta_obj = SimpleNamespace(content=delta, tool_calls=None)
+        choice = SimpleNamespace(delta=delta_obj, finish_reason=finish_reason)
+        return SimpleNamespace(choices=[choice])
+
+    def create(**kwargs):
+        captured["payload"] = kwargs
+        return iter(
+            [
+                chunk("写到一半就", None),
+                chunk("被掐断", "length"),
+            ]
+        )
+
+    client = OpenAiCompatibleClient(
+        lambda: AiConfig(base_url="http://x", api_key="k", model="m", max_tokens=512),
+        client_factory=lambda config: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    final = list(client.chat([{"role": "user", "content": "hi"}]))[-1][1]
+    assert final["content"] == "写到一半就被掐断"
+    assert final["truncated"] is True
+    assert captured["payload"]["max_tokens"] == 512
+
+
+def test_max_tokens_clamped_to_supported_range():
+    """设置里的输出上限按 256~32000 夹取，三协议共用同一 config.max_tokens。"""
+    assert AiConfig(base_url="http://x", api_key="k", model="m", max_tokens=1).sanitized().max_tokens == 256
+    assert AiConfig(base_url="http://x", api_key="k", model="m", max_tokens=999_999).sanitized().max_tokens == 32_000
+    assert AiConfig(base_url="http://x", api_key="k", model="m", max_tokens=4_096).sanitized().max_tokens == 4_096
+
+
 def test_chat_anthropic_error_event_raises_instead_of_passing_silently():
     """SSE 里的 error 事件（如 overloaded_error）以前落进分支空档被静默忽略。"""
 

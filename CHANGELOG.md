@@ -4,6 +4,15 @@
 
 ## 未发布
 
+- **审查修复轮**（独立审查发现问题的集中修复）：
+  - **资金流缺口口径修正**：coverage 停更尾部的资金流边界改为取 OHLC 末行与资金流末行的较大者——此前"暂无日 K 先写资金流独立行"的股票会被按日线末行反复计成缺口，表现为补齐资金流后覆盖卡缺口不降、与"缺失数据监控"折叠区互相矛盾。
+  - **AI 能补资金流缺口了**：`update_stock_data` 新增 `mode="capital_flow"`（与 `/fetch/capital-flow` 同链路：跳过已完整、可为暂无日 K 的股票写独立行），省略 symbols 时自动按缺口名单启动全市场后台任务并新增只读工具 `sync_job_status` 轮询进度；失败/缺失明细行集化进 `rows`，模型能改参数重试而不是只看到"缺 N 只"。AI 写路径不再同步做 60 秒级全仓 coverage 重扫（转后台刷新）。
+  - **AI 缺口探索更准**：`data_health_report` 携带覆盖缺口汇总（累计真实缺口口径）与停更逐条明细（`rows`，可 `read_tool_result` 续读）；缺口画像剔除退市股并单列 `delisted_symbols`；分区损坏时明确回 `warehouse_corrupt`（"先修损坏"而不是"补数据"）；`read_capital_flow_missing_symbols` 改为扫窗口覆盖的所有年分区。
+  - **定时简报/复盘报告的爬取正文过不可信围栏**：`digest._gather_sources` 与 `reports._gather_review_sources` 的新闻/涨停池/复盘段落此前裸拼进 prompt（工具路径有 `wrap_untrusted`，定时引擎路径漏了）；同时 agent 的不可信工具摘要改为**先压缩再包围栏**，闭合标记不再被二次截断切掉。
+  - **续读 offset 修正**：`retain_rows` 新增 `resume_offset`（"第一行没展示的行号"）——`recent_daily_bars` 是 tail 保留（省略的是头部行），旧提示让模型从已展示的尾部行续读，"近 30 日哪天放量"依旧答不全。
+  - **历史对话折叠区空列表死路**：列表为空时也渲染折叠区（空态文案 + 展开即刷新），首次开抽屉没历史的用户产生第一轮对话后能正常看到历史。
+  - **其余**：zaopan 页面 200 但解析为空时不再输出"已读取"套话，走与 fupan 相同的行情/本地兜底；`news._clean_html_text` 升级为 text_cleaning 统一清洗（script/style 内文不再残留、空白折叠）；新增 `data/text_cleaning.py` 作为文本清洗唯一归属（briefing/market_commentary/研报标题统一消费）；THS 大盘评分的 dppj 正则限定在 `<script>` 块内且拒绝 0 分占位值；briefing 编码改"声明优先、缺失才探测"；optimize 流补 15 秒 heartbeat；SQL 摘要透出"已达 500 行上限"；`retain_rows` 数字不再用 `%g` 削精度；前端 AI 错误文案补句读、TS 类型补 heartbeat；交易日历超出节假日表覆盖年份时打 warning；并发工具判定收敛到 registry 的 `read_only` 标志。
+
 - **AI 对话历史续用**：`GET /ai/sessions`、`GET /ai/session?session_id=`、`POST /ai/session/delete` 三条路由接上了早已落盘却从未接线过的 `SessionStore.list_sessions/delete`。AI 助手抽屉现在首次打开会把最近一条有内容的会话回读成当前转录，并在"历史对话"折叠区里列出全部历史会话，可切换、可删除、可新建。追问继续带着被恢复的 `session_id`，因此更早的对话与滚动纪要会真的回到 agent 上下文，重启应用不再"失忆"。回读只暴露展示用的 `display`，协议消息与待压缩归档不出网络边界；正在生成回答的会话不允许删除（回 `ai_session_busy`，否则 worker 收尾时会把文件重新写回来）。
 - **AI 对话交互修正**：提交后立即清空输入框（此前文本残留，再按一次 Enter 会把同一句话重复发给 agent）；转录行改用含 `ts` 的稳定 key，不再用数组下标，避免整段 display 被替换时复用错位的 DOM 节点。
 - **回答出字更跟手**：NDJSON 写出关掉 Nagle（`disable_nagle_algorithm`），此前 Windows 回环上的逐事件小包被攒住，表现为出字一顿一顿；`react-markdown@10` 的 `Markdown()` 每次渲染都重建 processor 并同步重解析且自身不 memo，所以流式期间每个 token 都会把**全部历史轮次**重解析一遍——现在历史与流式块都走 memo 化的 `MarkdownBlock`（插件数组提到模块级，否则内联字面量让 memo 失效），token 再按 `requestAnimationFrame` 合帧提交；自动滚底改为只在用户原本贴着底部时跟随，流式期间能往上翻前文。

@@ -14,6 +14,18 @@ from bs4 import BeautifulSoup, Tag
 from astock_backtester.data.http_transport import BROWSER_USER_AGENT, create_scraping_session
 from astock_backtester.data.parsing import parse_float
 from astock_backtester.data.symbols import normalize_symbol
+from astock_backtester.data.text_cleaning import (
+    CN_FIELD_KEYWORDS as _CN_FIELD_KEYWORDS,
+)
+from astock_backtester.data.text_cleaning import (
+    collapse_ws,
+)
+from astock_backtester.data.text_cleaning import (
+    is_noisy_market_line as _is_noisy_content_line,
+)
+from astock_backtester.data.text_cleaning import (
+    is_percent_text as _is_percent_text,
+)
 from astock_backtester.models import (
     MarketBriefingLink,
     MarketBriefingResponse,
@@ -40,7 +52,7 @@ INDEX_SYMBOLS = [
 
 
 def _clean_text(value: str | None, max_length: int | None = None) -> str:
-    text = re.sub(r"\s+", " ", unescape(value or "")).strip()
+    text = collapse_ws(unescape(value or "")).strip()
     if max_length is not None and len(text) > max_length:
         return f"{text[:max_length].rstrip()}..."
     return text
@@ -60,39 +72,12 @@ def _node_text(node: Tag | None, max_length: int | None = None) -> str:
     return _clean_text(node.get_text(" ", strip=True) if node else "", max_length=max_length)
 
 
-_TIMESTAMP_PATTERN = re.compile(r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?")
-_NUMERIC_TOKEN_PATTERN = re.compile(r"^[+-]?\d+(?:\.\d+)?%?$")
-_CN_FIELD_KEYWORDS = (
-    "名称",
-    "板块",
-    "股票数",
-    "计算方式",
-    "涨幅",
-    "涨跌幅",
-    "最新",
-    "同比指数盈利",
-)
-_SENTENCE_PUNCTUATION_PATTERN = re.compile(r"[，。；、：,.!?！？]")
-
-
-def _is_percent_text(value: str) -> bool:
-    return bool(re.search(r"[+-]?\d+(?:\.\d+)?%", value))
-
-
 def _is_number_text(value: str) -> bool:
     return bool(re.search(r"[+-]?\d+(?:\.\d+)?", value))
 
 
 def _is_rank_text(value: str) -> bool:
     return bool(re.fullmatch(r"\d{1,3}", value.strip()))
-
-
-def _numeric_soup_tokens(text: str) -> list[str]:
-    return [
-        token
-        for token in re.split(r"\s+", text)
-        if token and (_NUMERIC_TOKEN_PATTERN.match(token) or re.search(r"\d", token))
-    ]
 
 
 def _is_headerless_market_number_row(row: list[str]) -> bool:
@@ -172,46 +157,6 @@ def _infer_table_columns(rows: list[list[str]], title: str | None) -> list[str]:
         base = ["名称", "涨跌幅", "最新价"]
         return base[:width] + _neutral_columns(width)[len(base[:width]) :]
     return _neutral_columns(width)
-
-
-def _is_noisy_content_line(text: str) -> bool:
-    cleaned = _clean_text(text)
-    if not cleaned:
-        return True
-    compact = re.sub(r"\s+", "", cleaned)
-    if re.fullmatch(r"[%％]+", compact):
-        return True
-    if compact == "同比指数盈利":
-        return True
-    timestamp_count = len(_TIMESTAMP_PATTERN.findall(cleaned))
-    without_timestamps = _TIMESTAMP_PATTERN.sub("", cleaned).strip()
-    if timestamp_count >= 2 and len(without_timestamps) <= 24:
-        return True
-
-    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", without_timestamps))
-    digit_count = len(re.findall(r"\d", without_timestamps))
-    text_length = max(len(re.sub(r"\s+", "", without_timestamps)), 1)
-    numeric_tokens = _numeric_soup_tokens(without_timestamps)
-    has_field_keywords = sum(1 for keyword in _CN_FIELD_KEYWORDS if keyword in without_timestamps) >= 2
-    if (
-        has_field_keywords
-        and len(numeric_tokens) >= 3
-        and (_is_percent_text(without_timestamps) or timestamp_count > 0)
-        and not _SENTENCE_PUNCTUATION_PATTERN.search(without_timestamps)
-    ):
-        return True
-    if digit_count >= 8 and cjk_count <= 6 and digit_count / text_length >= 0.35:
-        return True
-    if len(numeric_tokens) >= 4 and cjk_count <= 8 and not re.search(r"[，。；、：]", without_timestamps):
-        return True
-    if (
-        len(numeric_tokens) >= 4
-        and digit_count >= 8
-        and digit_count / text_length >= 0.28
-        and not re.search(r"[，。；、：]", without_timestamps)
-    ):
-        return True
-    return False
 
 
 def _readable_content_from_node(node: Tag | None) -> str:
@@ -331,7 +276,7 @@ def _remove_non_textual_nodes(node: Tag) -> Tag:
     root = clone.find()
     if not isinstance(root, Tag):
         return node
-    for child in root.select("script,style,table,a,img,svg,canvas"):
+    for child in root.select("script,style,noscript,iframe,textarea,form,button,table,a,img,svg,canvas"):
         child.decompose()
     return root
 
@@ -595,7 +540,12 @@ class MarketBriefingProvider:
 
     def _response_text(self, response: requests.Response) -> str:
         response.raise_for_status()
-        response.encoding = getattr(response, "apparent_encoding", None) or response.encoding or "gbk"
+        # 声明优先：HTTP 头已带 charset（或非默认 ISO-8859-1）时尊重声明，
+        # 只在缺失/失配时才用 apparent_encoding 探测——THS 页面是 GBK 且常
+        # 不带 charset，探测是必要兜底；但对已声明的响应强行探测偶发误判
+        # （GBK→cp1252），整页变乱文后所有清洗都白做。
+        if not response.encoding or response.encoding.lower() == "iso-8859-1":
+            response.encoding = getattr(response, "apparent_encoding", None) or response.encoding or "gbk"
         return response.text
 
     def _prewarm_ths_session(self) -> None:
@@ -663,6 +613,8 @@ class MarketBriefingProvider:
 
     def _parse_zaopan(self, soup: BeautifulSoup) -> MarketBriefingResponse:
         summary = _node_text(soup.select_one(".yestoday"))
+        if _is_noisy_content_line(summary):
+            summary = ""
         sections: list[MarketBriefingSection] = []
         main = soup.select_one(".content-main-fl")
         if main:
@@ -701,14 +653,18 @@ class MarketBriefingProvider:
                         tables=tables,
                     )
                 )
-        fallback_summary = "同花顺早盘已读取，重点关注昨日行情、公司事项、机构观点和停复牌信息。"
         expanded_sections, diagnostics = self._expand_article_links(sections[:8], THS_ZAOPAN_URL)
+        if not summary and not expanded_sections:
+            # 页面 200 但选择器全落空（改版/风控空壳）时，不能把“已读取”套话
+            # 当真实早盘正文（§7 source 语义），走与 fupan 相同的行情/本地兜底。
+            diagnostics.append("同花顺早盘页未解析到有效内容。")
+            return self._zaopan_market_or_local_fallback(diagnostics)
         return MarketBriefingResponse(
             kind="zaopan",
             updated_at=datetime.now(UTC),
             source="ths-zaopan",
             source_url=_first_ths_article_link_url(expanded_sections) or THS_ZAOPAN_URL,
-            summary=summary or (sections[0].content if sections and sections[0].content else fallback_summary),
+            summary=summary or (sections[0].content if sections and sections[0].content else "同花顺早盘已读取，但页面暂未提供摘要。"),
             sections=expanded_sections,
             diagnostics=diagnostics,
         )

@@ -651,3 +651,129 @@ def test_coverage_capital_flow_counts_symbols_absent_from_flow(tmp_path):
     assert coverage["capital_flow"].missing_rows > 2
     # 日线最新日 06-03，600519 数据停在 06-02 → 至少 1 个尾部交易日。
     assert coverage["capital_flow"].missing_rows >= 3
+
+
+def test_coverage_capital_flow_tail_respects_standalone_flow_rows(tmp_path):
+    """独立资金流行把资金流末行推到日线末行之后时，覆盖的日期不算缺口。
+
+    §8 允许“暂无日 K 也先写资金流独立行”。旧口径把资金流尾部边界强制取
+    日线末行，独立行覆盖的每个交易日被反复计成缺口——表现为补齐资金流后
+    coverage 的缺口不降，而缺口画像（按 flow 末行）显示已最新，两个视图矛盾。
+
+    000001 是参照股：OHLC 更新到全局最新日 06-04，把 `daily_end` 推到 06-04。
+    没有它时窗口终点就是 600519 自己的日线末行 06-02，旧口径同样返回 0，
+    测试锁不住边界修复。
+    """
+    warehouse = Warehouse(tmp_path)
+    # 600519：OHLC 只到 06-02；06-03/06-04 是资金流独立行（OHLC 全空）。
+    # 000001：OHLC 与资金流都完整到 06-04。
+    frame = pd.DataFrame(
+        {
+            "symbol": ["600519", "600519", "000001", "000001", "000001", "000001"],
+            "trade_date": ["2026-06-01", "2026-06-02", "2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"],
+            "open": [10.0, 10.1, 8.0, 8.1, 8.2, 8.3],
+            "high": [10.5, 10.6, 8.5, 8.6, 8.7, 8.8],
+            "low": [9.8, 9.9, 7.9, 8.0, 8.1, 8.2],
+            "close": [10.2, 10.3, 8.1, 8.2, 8.3, 8.4],
+            "volume": [1000, 1001, 900, 910, 920, 930],
+            "amount": [10200.0, 10303.0, 7290.0, 7462.0, 7636.0, 7812.0],
+            "float_market_cap": [1e9, 1.01e9, 8e8, 8.05e8, 8.1e8, 8.15e8],
+            "main_net_inflow": [100.0, 100.0, 50.0, 51.0, 52.0, 53.0],
+        }
+    )
+    standalone = pd.DataFrame(
+        {
+            "symbol": ["600519", "600519"],
+            "trade_date": ["2026-06-03", "2026-06-04"],
+            "open": [float("nan")] * 2,
+            "high": [float("nan")] * 2,
+            "low": [float("nan")] * 2,
+            "close": [float("nan")] * 2,
+            "volume": [0.0] * 2,
+            "amount": [0.0] * 2,
+            "main_net_inflow": [100.0, 100.0],
+        }
+    )
+    warehouse.write_daily_bars(frame)
+    warehouse.write_daily_bars(standalone)
+
+    coverage = {item.dataset: item for item in warehouse.coverage()}
+
+    # 旧口径：600519 的资金流边界取日线末行 06-02 → 06-03/06-04 被计成 2 个缺口。
+    # 新口径：边界取 max(日线末行 06-02, 资金流末行 06-04) = 06-04 → 缺口为 0。
+    assert coverage["capital_flow"].missing_rows == 0
+    # 日线口径照算尾部：600519 的 OHLC 停在 06-02，全局最新日 06-04 → 缺 2 行。
+    assert coverage["daily_bars"].missing_rows == 2
+
+
+def test_read_capital_flow_missing_symbols_spans_window_partitions(tmp_path):
+    """``read_capital_flow_missing_symbols`` 必须扫窗口覆盖的所有年分区。
+
+    旧实现只读最新分区：横跨旧分区的补数窗口里，"资金流只存在于旧分区"
+    的股票会被误判为缺流。000002 在旧分区有流、最新分区的行缺流——
+    合并两个分区后它不该进缺口名单。
+    """
+    warehouse = Warehouse(tmp_path)
+    frame = pd.DataFrame(
+        {
+            "symbol": ["000001", "000002", "000002", "000003"],
+            "trade_date": ["2025-12-30", "2025-12-30", "2026-01-05", "2026-01-05"],
+            "open": [10.0, 10.0, 10.0, 10.0],
+            "high": [10.5, 10.5, 10.5, 10.5],
+            "low": [9.8, 9.8, 9.8, 9.8],
+            "close": [10.2, 10.2, 10.2, 10.2],
+            "volume": [1000, 1000, 1000, 1000],
+            "main_net_inflow": [50.0, 60.0, float("nan"), float("nan")],
+        }
+    )
+    warehouse.write_daily_bars(frame)
+
+    missing = warehouse.read_capital_flow_missing_symbols("2025-12-01", "2026-01-31")
+
+    assert "000001" not in missing  # 旧分区已有资金流
+    assert "000002" not in missing  # 旧分区有流；只扫最新分区时会误判
+    assert "000003" in missing  # 窗口内始终无资金流
+
+
+def test_data_gap_profile_excludes_delisted_from_stale_distribution(tmp_path):
+    """退市股的停更是终态不是缺口：必须从停更分布剔除并单列 delisted_symbols。
+
+    不剔除的话，UI 与 AI 会把退市股当成“需要补数据”，而实际上补齐链路
+    永远无法让退市股“追上”最新交易日。
+    """
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                # A 更新到 06-04；B/C 停在 06-03，其中 B 已退市。
+                "symbol": ["000001"] * 4 + ["000002"] * 3 + ["000003"] * 3,
+                "trade_date": [
+                    "2026-06-01",
+                    "2026-06-02",
+                    "2026-06-03",
+                    "2026-06-04",
+                    "2026-06-01",
+                    "2026-06-02",
+                    "2026-06-03",
+                    "2026-06-01",
+                    "2026-06-02",
+                    "2026-06-03",
+                ],
+                "open": [10.0] * 10,
+                "high": [10.5] * 10,
+                "low": [9.8] * 10,
+                "close": [10.2] * 10,
+                "volume": [1000] * 10,
+            }
+        )
+    )
+    warehouse.upsert_symbol_lifecycle([{"symbol": "000002", "delisted_date": "2026-06-03", "status": "delisted"}])
+
+    profile = warehouse.data_gap_profile()
+
+    daily = profile["daily_bars"]
+    assert daily["symbols"] == 3
+    assert daily["delisted_symbols"] == 1
+    assert daily["symbols_stale"] == 1
+    # 分布里只剩未退市的 000003
+    assert {"last_date": "2026-06-03", "symbols": 1} in daily["stale_distribution"]

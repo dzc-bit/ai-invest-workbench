@@ -597,13 +597,23 @@ class ClsFinanceProvider:
         return emotion
 
 
+_SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+
+
 def _parse_ths_market_degree(text: str) -> float | None:
     if not text:
         return None
     payload_degree = _parse_ths_market_degree_payload(text)
     if payload_degree is not None:
         return payload_degree
-    for match in THS_MARKET_DPPJ_RE.finditer(text):
+    # 只要是 HTML（含标签字符）就只在 <script> 块内找 dppj_data：§5 明令禁止
+    # 把标签属性（如 data-dppj_data="85"）里的数字当评分；indexflash 载荷不含
+    # HTML 标签，仍在全文匹配。
+    if "<" in text:
+        haystack = "\n".join(match.group(1) for match in _SCRIPT_BLOCK_RE.finditer(text))
+    else:
+        haystack = text
+    for match in THS_MARKET_DPPJ_RE.finditer(haystack):
         value = _normalize_ths_market_degree(match.group(1))
         if value is not None:
             return value
@@ -654,7 +664,8 @@ def _market_degree_from_payload(payload: Any) -> float | None:
 
 def _normalize_ths_market_degree(value: object) -> float | None:
     parsed = _parse_float(value)
-    if parsed is None or parsed < 0:
+    # 0 分是上游的占位/缺数值，不是真实评级；与“没解析到”同等对待。
+    if parsed is None or parsed <= 0:
         return None
     if parsed <= 10:
         return parsed

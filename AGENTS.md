@@ -203,9 +203,11 @@ tests/test_capital_flow_crawler.py
 
 `/health` 不能同步阻塞重型 `warehouse.coverage()` 扫描。数据中心连接和操作后刷新应快速返回最近 coverage 快照，并用后台刷新更新缺失行数；不要让 60 秒级 coverage 扫描卡住“本地服务已连接”、按钮状态或全市场同步进度。
 
-`Warehouse.coverage()` 缺失行口径（1.5.x 起）：**累计真实缺口**。日线 = 每只股票在 [首行日期, min(最新数据日, 退市日)] 窗口内的交易日期望行数 − 实有行数（内部洞 + 多日未同步的尾部缺口都算）；市值/资金流保留“已有行但字段为空”的内部统计，再叠加“最后一条数据之后到最新交易日”的停更尾部（边界取 OHLC 最后行，避免与内部 NaN 重复计数）。无生命周期记录的股票走保守口径照算。因此多日未同步时缺失行数会是大数字（数十万级），这是特性不是 bug；真正的补齐手段是全市场同步。
+`Warehouse.coverage()` 缺失行口径（1.5.x 起）：**累计真实缺口**。日线 = 每只股票在 [首行日期, min(最新数据日, 退市日)] 窗口内的交易日期望行数 − 实有行数（内部洞 + 多日未同步的尾部缺口都算）；市值/资金流保留“已有行但字段为空”的内部统计，再叠加“最后一条数据之后到最新交易日”的停更尾部。停更尾部边界：市值取 OHLC 最后行（cap 行只存在于 OHLC 行上）；资金流取 **OHLC 末行与资金流末行的较大者**——§8 允许“暂无日 K 先写资金流独立行”，独立行覆盖的日期已有数据，若按 OHLC 末行计会“补齐后缺口不降、与缺口画像互相矛盾”。无生命周期记录的股票走保守口径照算。因此多日未同步时缺失行数会是大数字（数十万级），这是特性不是 bug；真正的补齐手段是全市场同步。
 
-配套明细：`Warehouse.data_gap_profile()`（停更分布/疑似写入失败日/市值与资金流停更尾部，只读最近年分区，10 分钟缓存、写入自动失效）——数据中心"缺失数据监控"折叠区与 AI 工具 `data_health_report` 消费同一份明细，保证 UI 与 AI 看到一致的"具体缺什么"。
+配套明细：`Warehouse.data_gap_profile()`（停更分布/疑似写入失败日/市值与资金流停更尾部，只读最近年分区，10 分钟缓存、写入自动失效、lifecycle 变更即失效）。已标记退市的股票从停更分布剔除并单列 `delisted_symbols`（退市是终态不是缺口）。数据中心"缺失数据监控"折叠区与 AI 工具 `data_health_report` 消费同一份明细，保证 UI 与 AI 看到一致的"具体缺什么"；`data_health_report` 另带 coverage 快照汇总与损坏分区区分（`error_code=warehouse_corrupt`），模型据此能分辨"先修损坏还是先补数据"。
+
+节假日硬编码表（`data/trading_calendar.py`）只覆盖到有限年份；计算范围超出表覆盖年份时会在日志打一次性 warning，**每年发布前必须更新 `_A_SHARE_HOLIDAY_RANGES`**，否则次年春节/国庆会被计成永远补不回来的缺口。
 
 后台刷新期间如果 `/health` 返回三项 coverage 全是 `symbols=0`、无日期、`missing_rows=0` 且 `coverage_refreshing=true`，前端不能把它当权威结果覆盖已有覆盖表；应保留旧覆盖并继续轮询，等刷新完成后的真实快照再更新。
 
@@ -360,26 +362,26 @@ python -m ruff check backend tests scripts
 
 1. **符号与数值解析只有一个家**：符号规范化/新浪转换在 `data/symbols.py`，宽松数值解析在 `data/parsing.py`。任何爬虫不得再私建 `_normalize_code`、`_to_float`、`_sina_symbol` 之类的本地副本。
 2. **HTTP 策略集中在 `data/http_transport.py`**：UA 常量（MINIMAL/USER/BROWSER）、`create_scraping_session()`（trust_env=False，爬虫请求不读系统代理）、`resilient_get()`（瞬时错误重试 + curl_cffi 降级）。新增数据源先复用这一层。
-3. **禁止跨模块私有访问**：service/operations/sync 只能用公共接口——`RealtimeMarketProvider.retained_successful_snapshot()`、`DataServiceState.start_coverage_refresh()`、`Warehouse.read_capital_flow_missing_symbols()`、`SyncJobManager.start_full_market()/cancel_job()`。不允许再出现 `getattr(obj, "私有名", None)` 式的测试兼容 shim。
+3. **禁止跨模块私有访问**：service/operations/sync 只能用公共接口——`RealtimeMarketProvider.retained_successful_snapshot()`、`DataServiceState.start_coverage_refresh()/coverage_snapshot()`、`Warehouse.read_capital_flow_missing_symbols()/corrupt_partitions()`、`SyncJobManager.start_full_market()/start_capital_flow_backfill()/get_job()/cancel_job()`、`data/text_cleaning.py`（文本清洗唯一归属：`html_to_plaintext/collapse_ws/is_noisy_market_line`）。不允许再出现 `getattr(obj, "私有名", None)` 式的测试兼容 shim。
 4. **依赖方向单向**：`data/*` 只允许依赖 `models` 与 data 内共享模块（symbols/parsing/http_transport/importer/trading_calendar/cls），禁止反向 import 根包（service/engine/cli）。当前全仓 0 个 import 环。
 5. **回测条件必须双注册**：`conditions.py` 里每个 condition_id 必须同时有行级 `EVALUATORS` 和向量化 `MASK_BUILDERS`；`tests/test_core.py::test_condition_registry_stays_in_sync` 是守卫，新增条件只改 conditions.py 一个文件。
 6. **错误响应必须带稳定 code**：后端错误码 `no_local_data / validation_error / payload_error / request_failed`（`service.py::_stream_error_code`），数据缺失类失败抛 `LocalDataUnavailable`；AI 模块额外有 `ai_not_configured / ai_upstream_error / ai_session_busy / ai_session_not_found`（`ai/errors.py`）。前端经 `api.ts` 的 `BackendError` 消费，AI 抽屉经 `aiTypes.ts::translateAiError` 按码翻译。新增错误路径必须带码。
 7. **回环测试不走代理**：`tests/test_data_service_http.py` 用 `ProxyHandler({})` 的 opener 发起全部回环请求；开发机开着 Clash 等系统代理时测试也必须绿。AI 回环测试（`tests/test_ai_service_http.py`）沿用同一模式，且 cache_dir 必须指向 tmp 子目录（`tmp_path/"本地数据仓"`），否则 AI 配置会落在 pytest 共享根目录造成跨测试泄漏。
 8. **AI 子系统边界（违反即回退）**：
    - `backend/astock_backtester/ai/` 是独立子包，只依赖 `models`、data 公共接口与根包的 backtest_runner/condition_parser/indicators；任何 data/* 或 engine 不得反向 import ai。
-   - AI 对数据仓默认只读：`query_warehouse_sql` 只允许 SELECT/WITH（DuckDB 内存连接 + 语句黑名单 + 自动 LIMIT 500）；**唯一写路径**是 `update_stock_data` → `operations.fetch_daily_bars_into_cache`，不得出现第二个写工具或裸 SQL 写。
+   - AI 对数据仓默认只读：`query_warehouse_sql` 只允许 SELECT/WITH（DuckDB 内存连接 + 语句黑名单 + 自动 LIMIT 500）；**唯一写工具**是 `update_stock_data`（`mode=daily_bars` → `fetch_daily_bars_into_cache`；`mode=capital_flow` → `fetch_capital_flow_into_cache`，省略 symbols 时按缺口名单转 `SyncJobManager.start_capital_flow_backfill` 后台任务），不得出现第二个写工具或裸 SQL 写。
    - 分层记忆：短期窗口按条数与字符数双阈值控制（`agent.SHORT_TERM_WINDOW` 条协议消息 + `SHORT_TERM_MAX_CHARS` 字符，两者都未超限才不压缩，具体数值以 `ai/agent.py` 常量为准），溢出先进 `pending_archive` 再压缩为 `rolling_summary`；长期记忆提取是哨兵之后的独立 daemon 线程，**绝不允许阻塞 /ai/chat/stream 的事件流**。
-   - 爬取内容（新闻/复盘/研报）进入模型上下文前必须经 `ai/context.py::wrap_untrusted` 分隔。
-   - 工具结果只以摘要进上下文，全量留在内存 `ToolResultStore`（有条数/字节/TTL 三重上限）。摘要必须携带**精确保留元数据**（`context.retain_rows` 的 seen/kept/omitted）：只写"已截断"而不说省略多少行，模型就不知道要不要续读。表格/榜单类工具用 `AiTool.digest_chars` 自己声明预算（默认 1200 字会把 20 行榜单切成 8 行）；模型可用只读工具 `read_tool_result(call_id, offset)` 按行续读，**不得**为了省事把全量 payload 直接灌进上下文。
+   - 爬取内容（新闻/复盘/研报）进入模型上下文前必须经 `ai/context.py::wrap_untrusted` 分隔——工具路径与定时引擎（`digest._gather_sources`/`reports._gather_review_sources`）同样适用；且必须**先按 `digest_chars` 压缩、再包不可信围栏**，反序会让闭合标记被二次截断切掉，隔离退化成"只有开标记"。
+   - 工具结果只以摘要进上下文，全量留在内存 `ToolResultStore`（有条数/字节/TTL 三重上限）。摘要必须携带**精确保留元数据**（`context.retain_rows` 的 seen/kept/omitted + `resume_offset`）：只写"已截断"而不说省略多少行、缺的行在哪，模型就不知道要不要、从哪续读（tail 保留时省略的是头部行，resume_offset=0）。表格/榜单类工具用 `AiTool.digest_chars` 自己声明预算（默认 1200 字会把 20 行榜单切成 8 行）；模型可用只读工具 `read_tool_result(call_id, offset)` 按行续读，**不得**为了省事把全量 payload 直接灌进上下文。
    - 工具失败必须以稳定 code 进协议 tool 消息与会话文件（`registry.CODE_*`：`unknown_tool` / `bad_arguments` / `no_data` / `tool_error`，加上 `interrupted` / `result_evicted` / `not_rowset`），让中断恢复与回放能按类别分支（改参数重试 vs 换工具 vs 先补数据）；code 服务的是代码与历史，用户文案仍走中文摘要。
    - 会话 JSON 带 `schema_version`；格式演进只走**相邻迁移**——新版本可加字段，绝不移动、改写或销毁已落盘的会话代，读侧必须继续容忍旧代。
    - 会话历史回读只允许暴露 `display`（`facade.session_view`）：协议消息、`pending_archive` 与 `rolling_summary` 不得出现在任何 HTTP 响应里，否则恢复出来的历史就能反向注入模型指令；该会话仍有轮次在生成时不得删除（`delete_session` 抛 `ai_session_busy`，因为 worker 会在 `finally` 里把文件重新写回来）。
-   - 工具批次可以并发（`agent.SERIAL_TOOLS` 之外的只读工具，上限 `MAX_PARALLEL_TOOLS`），但 **tool 消息必须按 `tool_calls` 原顺序在主线程落盘**——乱序会破坏 `_repair_interrupted_turn` 依赖的 assistant(tool_calls)→tool 配对，整条会话被上游判为协议非法。`update_stock_data`（唯一写路径）与 `run_strategy_backtest`（整表读进 pandas）**永远独占**。
-   - 事件流静默满 `AI_STREAM_HEARTBEAT_SECONDS` 必须发 `heartbeat` 事件：前端按"多久没收到字节"判定空闲超时（180 秒），一次长回测期间的静默会被误杀成"回答中断"，而 worker 仍在跑并持着会话锁，用户下一次发送白等 90 秒。
+   - 工具批次可以并发（并发判定以 registry 的 `read_only` 标志为单一事实来源，`agent.SERIAL_TOOLS` 保留为显式串行名单，上限 `MAX_PARALLEL_TOOLS`），但 **tool 消息必须按 `tool_calls` 原顺序在主线程落盘**——乱序会破坏 `_repair_interrupted_turn` 依赖的 assistant(tool_calls)→tool 配对，整条会话被上游判为协议非法。`update_stock_data`（唯一写工具）与 `run_strategy_backtest`（整表读进 pandas）**永远独占**。
+   - 事件流静默满 `AI_STREAM_HEARTBEAT_SECONDS` 必须发 `heartbeat` 事件：前端按"多久没收到字节"判定空闲超时（180 秒），一次长回测期间的静默会被误杀成"回答中断"，而 worker 仍在跑并持着会话锁，用户下一次发送白等 90 秒。`/ai/optimize` 流同理（`AI_OPTIMIZE_HEARTBEAT_SECONDS`）。
    - 上下文截断只能落在行或 JSON 字段边界（`context.truncate_text`）：把 `"close": 12.34` 切成 `12.` 会让模型读到格式合法但数值错误的价格，比整行丢弃危险得多；禁止按字符硬切。
    - 单次 `AgentRunner.run` 产出的 UI 工件（strategy/chart）**只能是 run 内的局部 dict**，绝不允许做成实例属性——runner 是每服务一个单例，两个会话并发时会拿到彼此的策略与权益曲线。
    - LLM 配置只存 `运行产物/AI配置/ai-config.json`；`GET /ai/config` 只回掩码，`GET /ai/config/reveal` 仅用于桌面端展示用户自己的 Key；会话落盘 `运行产物/AI对话/`、记忆落盘 `运行产物/AI记忆/`；三者在 .gitignore 覆盖范围内，不得提交。
-   - AI 快讯（insight）必须带 `source="ai-insight"` 与免责声明；`data_fresh` 信号只触发刷新，不得替代任何行情模块的 live 判定。
+   - AI 快讯（insight）必须带 `source="ai-insight"` 与免责声明；`GET /ai/news` 的"AI 聚合要点"记录标签是 `ai-agent`（1.4.0 起的产品约定，与事件流 insight 的 ai-insight 并存）；`data_fresh` 信号只触发刷新，不得替代任何行情模块的 live 判定。
    - LLM 客户端复用 `openai` SDK（`ai/llm_client.py` 只做错误码映射与事件规范化）；测试用 FakeModel/注入 client_factory，禁止网络。
    - a-stock-data 裁剪端点（`ai/tools/astock_data_tools.py`）统一走 `data/symbols.py` + `data/http_transport.py`，东财系请求必须过 `_em_get` 限流。
    - 提示词模板含字面 JSON 时必须用 `{{ }}` 转义（`str.format` 会把 `{"content": ...}` 当占位符，曾踩坑）。

@@ -71,6 +71,9 @@ from astock_backtester.recommended_strategies import recommended_strategies
 HEALTH_COVERAGE_WAIT_SECONDS = 0.1
 HEALTH_COVERAGE_REFRESH_TTL_SECONDS = 60.0
 BACKTEST_WARMUP_CALENDAR_DAYS = 120
+# /ai/optimize 流的静默心跳：与 chat 流（facade.AI_STREAM_HEARTBEAT_SECONDS）同思路，
+# 单个网格组合的回测 + AI 解读可静默数分钟，前端 120 秒空闲超时会把任务误杀成中断。
+AI_OPTIMIZE_HEARTBEAT_SECONDS = 15.0
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
 
@@ -607,15 +610,32 @@ class DataServiceHandler(BaseHTTPRequestHandler):
             code = "grid_too_large" if isinstance(exc, GridTooLargeError) else "validation_error"
             self._send_json({"code": code, "message": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
+        write_lock = Lock()
+        stop_heartbeat = Event()
+
+        def write_event(event: dict[str, Any]) -> None:
+            with write_lock:
+                self._write_ndjson(event)
+
+        def beat() -> None:
+            # 网格里单个组合的回测 + AI 解读可以静默几分钟；与 chat 流一样
+            # 靠心跳保活，避免前端 120 秒空闲超时把正在跑的任务误杀成中断。
+            while not stop_heartbeat.wait(AI_OPTIMIZE_HEARTBEAT_SECONDS):
+                try:
+                    with write_lock:
+                        self._write_ndjson({"type": "heartbeat"})
+                except ClientDisconnected:
+                    return
+
+        heartbeat_thread: Thread | None = None
         try:
             self._send_ndjson_headers()
+            heartbeat_thread = Thread(target=beat, name="ai-optimize-heartbeat", daemon=True)
+            heartbeat_thread.start()
             self._write_ndjson({"type": "phase", "phase": "读取本地数据"})
             frame = self._read_backtest_frame(settings)
             if frame.empty:
                 raise LocalDataUnavailable("No cached daily bars found for the optimization range.")
-
-            def write_event(event: dict[str, Any]) -> None:
-                self._write_ndjson(event)
 
             summary = run_optimization(frame, strategy, settings, grid, write_event)
             self._write_ndjson({"type": "phase", "phase": "生成 AI 解读"})
@@ -631,7 +651,7 @@ class DataServiceHandler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001 - grid result stays useful without AI
                 self.server.state.log("warning", f"ai optimize insight failed: {exc}")
                 insight_error = str(exc)
-            self._write_ndjson(
+            write_event(
                 {
                     "type": "result",
                     "result": {**summary, "insight": insight, "insight_error": insight_error},
@@ -642,9 +662,13 @@ class DataServiceHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.server.state.log("error", f"ai optimize failed: {exc}")
             try:
-                self._write_ndjson({"type": "error", "message": str(exc), "code": _stream_error_code(exc)})
+                write_event({"type": "error", "message": str(exc), "code": _stream_error_code(exc)})
             except ClientDisconnected:
                 return
+        finally:
+            stop_heartbeat.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1.0)
 
     _ALLOWED_REVEAL_ORIGINS = {
         "tauri://localhost",

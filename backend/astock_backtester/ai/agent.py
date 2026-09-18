@@ -220,23 +220,31 @@ class AgentRunner:
                     "code": execution.code,
                 }
             )
-            session_tool_content = execution.summary
+            payload = execution.payload if isinstance(execution.payload, dict) else {}
+            more_rows = payload.get("more_rows")
+            more_hint = ""
+            if more_rows:
+                # resume_offset 是"第一行没展示的行号"（tail 保留时是 0 而不是
+                # kept——kept 恰是已展示的尾部行）。由工具的保留元数据给出。
+                resume = payload.get("resume_offset", payload.get("shown_rows", 0))
+                more_hint = (
+                    f"\n（另有 {more_rows} 行未展开，可调用 "
+                    f'read_tool_result(call_id="{plan.call_id}", offset={resume}) 续读）'
+                )
+            if plan.name in UNTRUSTED_DIGEST_TOOLS:
+                # 先压到预算内再包不可信围栏：反过来的话围栏闭合标记几乎总是被
+                # 二次截断切掉，注入隔离退化成“只有开标记”（AGENTS.md §15-8）。
+                session_tool_content = wrap_untrusted(
+                    self._budget.digest(execution.summary, execution.digest_chars)
+                ) + more_hint
+            else:
+                session_tool_content = self._budget.digest(execution.summary + more_hint, execution.digest_chars)
             if execution.code:
                 # 失败类别跟着摘要进协议消息与会话文件：中断恢复和回放后要能区分
                 # "改参数重试"/"换工具"/"先补数据"，而不是只留一句人读文案。
                 session_tool_content = f"[code={execution.code}] {session_tool_content}"
             if execution.diagnostics:
                 session_tool_content += "\n诊断: " + "；".join(execution.diagnostics[:3])
-            payload = execution.payload if isinstance(execution.payload, dict) else {}
-            more_rows = payload.get("more_rows")
-            if more_rows:
-                session_tool_content += (
-                    f"\n（另有 {more_rows} 行未展开，可调用 "
-                    f'read_tool_result(call_id="{plan.call_id}", offset={payload.get("shown_rows", 0)}) 续读）'
-                )
-            if plan.name in UNTRUSTED_DIGEST_TOOLS:
-                session_tool_content = wrap_untrusted(session_tool_content)
-            session_tool_content = self._budget.digest(session_tool_content, execution.digest_chars)
             session_tool = {"role": "tool", "tool_call_id": plan.call_id, "content": session_tool_content}
             self._session_messages_target(session).append(session_tool)
         return steps
@@ -249,12 +257,20 @@ class AgentRunner:
         the assistant(tool_calls)->tool pairing ``_repair_interrupted_turn``
         relies on intact.
         """
-        if len(plans) > 1 and not any(plan.name in SERIAL_TOOLS for plan in plans):
+        if len(plans) > 1 and not any(self._must_serialize(plan) for plan in plans):
             with ThreadPoolExecutor(
                 max_workers=min(MAX_PARALLEL_TOOLS, len(plans)), thread_name_prefix="ai-tool"
             ) as pool:
                 return list(pool.map(lambda plan: self._registry.execute(plan.name, plan.arguments), plans))
         return [self._registry.execute(plan.name, plan.arguments) for plan in plans]
+
+    def _must_serialize(self, plan: _ToolCall) -> bool:
+        """并发判定的单一事实来源是 registry 的 ``read_only`` 标志；
+        ``SERIAL_TOOLS`` 保留为显式串行名单（防御“新增只读但实际重”的工具）。"""
+        if plan.name in SERIAL_TOOLS:
+            return True
+        tool = self._registry.get(plan.name)
+        return tool is not None and not tool.read_only
 
     # ----------------------------------------------------------- messages
     def _build_request_messages(self, session: dict[str, Any], system_prompt: str) -> list[dict[str, Any]]:

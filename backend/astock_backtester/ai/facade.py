@@ -426,6 +426,10 @@ class AiService:
         Refuses while that session still has a turn generating: the worker saves
         the session in its ``finally`` block, which would resurrect the file
         right after the delete and leave a "deleted" transcript on screen.
+
+        忙判定与 unlink 之间存在毫秒级 TOCTOU（判定后新请求可抢锁开跑），
+        这是 best-effort 边界：删除后的陈旧 session_id 在 worker 收尾时会落到
+        全新 uuid 会话，不会复活已删除的文件。
         """
         safe = sanitize_session_id(session_id)
         if safe is None:

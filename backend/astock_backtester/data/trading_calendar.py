@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 _A_SHARE_HOLIDAY_RANGES: dict[int, tuple[tuple[str, str], ...]] = {
     2024: (
@@ -61,10 +64,32 @@ def _holiday_dates(start_date: pd.Timestamp, end_date: pd.Timestamp) -> set[pd.T
     return dates
 
 
+def holiday_table_last_year() -> int:
+    """节假日硬编码表覆盖的最后一年。
+
+    表只到 2028 年；更晚的年份里春节/国庆等休市日会被当作交易日计入
+    coverage 缺口（补齐链路永远补不回来）。调用方（coverage/同步）据此
+    打日志预警，提醒维护者每年更新该表。
+    """
+    return max(_A_SHARE_HOLIDAY_RANGES) if _A_SHARE_HOLIDAY_RANGES else 0
+
+
+_holiday_gap_warned = False
+
+
 def a_share_trade_dates(start_date: pd.Timestamp | date | str, end_date: pd.Timestamp | date | str) -> set[pd.Timestamp]:
+    global _holiday_gap_warned
     start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize()
     if end < start:
         return set()
+    if not _holiday_gap_warned and end.year > holiday_table_last_year():
+        _holiday_gap_warned = True
+        logger.warning(
+            "交易日历节假日表只覆盖到 %d 年，%d 年及以后的休市日会被当作交易日计入缺口；"
+            "请更新 data/trading_calendar.py 的 _A_SHARE_HOLIDAY_RANGES。",
+            holiday_table_last_year(),
+            end.year,
+        )
     weekdays = {pd.Timestamp(day).normalize() for day in pd.date_range(start=start, end=end, freq="B")}
     return weekdays - _holiday_dates(start, end)

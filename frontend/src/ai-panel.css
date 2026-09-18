@@ -271,6 +271,12 @@
   max-height: 240px;
 }
 
+.ai-history-empty {
+  margin: 4px 0 0;
+  color: var(--ink-3);
+  font-size: var(--text-xs);
+}
+
 .ai-session-item {
   display: flex;
   align-items: center;

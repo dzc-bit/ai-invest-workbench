@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from astock_backtester.ai.config import AiConfig
+from astock_backtester.ai.context import wrap_untrusted
 from astock_backtester.models import BacktestSettings, StrategyConfig
 
 REPORT_DIR_NAME = "AI报告"
@@ -137,6 +138,11 @@ def evolution_report_name(now: datetime) -> str:
     return f"策略体检-{now.astimezone().strftime('%Y%m%d-%H%M')}.md"
 
 
+def _crawled_review_block(label: str, body: str) -> str:
+    # 同 digest._gather_sources：爬取正文进模型上下文前必须套不可信分隔符。
+    return f"{label}\n{wrap_untrusted(body)}"
+
+
 def _gather_review_sources(backend: Any, digest_items: list[dict[str, Any]]) -> str:
     sections: list[str] = []
     try:
@@ -151,26 +157,26 @@ def _gather_review_sources(backend: Any, digest_items: list[dict[str, Any]]) -> 
             lines.append(
                 "- 强势板块：" + "、".join(f"{s.name} {(s.change_pct or 0):+.2f}%" for s in snapshot.strong_sectors[:5])
             )
-        sections.append("【实时行情】(" + snapshot.status + ")\n" + "\n".join(lines))
+        sections.append(_crawled_review_block("【实时行情】(" + snapshot.status + ")", "\n".join(lines)))
     except Exception:  # noqa: BLE001
         pass
     try:
         news = backend.news_provider.latest_news()
         headlines = [f"- {item.title}（{item.source}）" for item in news.items[:15]]
         if headlines:
-            sections.append("【新闻/电报】\n" + "\n".join(headlines))
+            sections.append(_crawled_review_block("【新闻/电报】", "\n".join(headlines)))
     except Exception:  # noqa: BLE001
         pass
     try:
         fupan = backend.briefing_provider.latest_fupan()
         if fupan.summary:
-            sections.append(f"【同花顺复盘】{fupan.summary[:600]}")
+            sections.append(_crawled_review_block("【同花顺复盘】", fupan.summary[:600]))
     except Exception:  # noqa: BLE001
         pass
     try:
         zaopan = backend.briefing_provider.latest_zaopan()
         if zaopan.summary:
-            sections.append(f"【同花顺早盘】{zaopan.summary[:400]}")
+            sections.append(_crawled_review_block("【同花顺早盘】", zaopan.summary[:400]))
     except Exception:  # noqa: BLE001
         pass
     try:

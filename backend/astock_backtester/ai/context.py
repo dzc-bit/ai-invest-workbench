@@ -48,15 +48,33 @@ def truncate_text(text: str, limit: int) -> str:
 
 @dataclass(frozen=True)
 class Retained:
-    """"保留了什么、又省略了什么"。省略计数必须精确，模型才知道要不要回读。"""
+    """"保留了什么、又省略了什么"。省略计数必须精确，模型才知道要不要回读。
+
+    ``resume_offset`` 是"第一行没被展示的行号"：head 保留时是 ``kept``，
+    tail 保留时是 ``0``（被省略的是最早的行），head_tail 是中段起点。
+    agent 的续读提示与 ``read_tool_result`` 的分页都以它为准——只回
+    "省略了几行"不回"省略的行在哪"，tail 保留时模型按 offset=kept 续读
+    只会重读已展示的尾部行，永远读不到头部。
+    """
 
     text: str
     seen: int
     kept: int
+    resume_offset: int = 0
 
     @property
     def omitted(self) -> int:
         return max(self.seen - self.kept, 0)
+
+
+def _format_cell_number(value: float) -> str:
+    """行集单元格的数字渲染：``%g`` 只有 6 位有效数字，成交量/资金流这类
+    大数会变成 ``1.23457e+07`` 削掉精度，行情场景模型可能误读。"""
+    if value != value:  # NaN
+        return "--"
+    if value.is_integer() and abs(value) < 1e15:
+        return str(int(value))
+    return f"{value:.6f}".rstrip("0").rstrip(".")
 
 
 def retain_rows(
@@ -71,6 +89,8 @@ def retain_rows(
 
     ``keep="tail"`` 给"越新越重要"的数据（近 N 日行情），``head_tail`` 两头都留。
     紧凑表格比逐行 ``key=value`` 省一大半字数，同样的预算能多装几倍行数。
+    单元格 ``text[:cell_chars]`` 的硬切只作用于已格式化的短字段（日期/价格/
+    名称），不用于长正文——正文截断一律走 :func:`truncate_text`。
     """
     seen = len(rows)
     if seen == 0:
@@ -90,7 +110,12 @@ def retain_rows(
         cells = []
         for column in headers:
             value = row.get(column)
-            text = "--" if value is None else (f"{value:g}" if isinstance(value, float) else str(value))
+            if value is None:
+                text = "--"
+            elif isinstance(value, float):
+                text = _format_cell_number(value)
+            else:
+                text = str(value)
             cells.append(text[:cell_chars])
         return "|".join(cells)
 
@@ -102,10 +127,21 @@ def retain_rows(
         lines.append(render(rows[index]))
         previous = index
     kept = len(indexes)
+    resume_offset = kept
+    if kept < seen:
+        expected = 0
+        for index in indexes:
+            if index != expected:
+                break
+            expected += 1
+        resume_offset = expected
     text = "\n".join(lines)
     if seen > kept:
-        text += f"\n（共 {seen} 行，已显示 {kept} 行，另有 {seen - kept} 行未展开）"
-    return Retained(text, seen, kept)
+        if keep == "tail":
+            text += f"\n（共 {seen} 行，已显示最新的 {kept} 行，最早的 {seen - kept} 行未展开）"
+        else:
+            text += f"\n（共 {seen} 行，已显示 {kept} 行，另有 {seen - kept} 行未展开）"
+    return Retained(text, seen, kept, resume_offset)
 
 
 def wrap_untrusted(text: str) -> str:

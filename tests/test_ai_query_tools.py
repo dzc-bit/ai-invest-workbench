@@ -131,6 +131,7 @@ def test_update_stock_data_routes_through_operations(monkeypatch):
             imported_rows=120,
             fetched_symbols=["600519"],
             missing_symbols=[],
+            skipped_symbols=[],
             failures=[],
             logs=[SimpleNamespace(level="info", message="补齐完成")],
         )

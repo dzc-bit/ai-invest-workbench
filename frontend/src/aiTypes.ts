@@ -66,6 +66,9 @@ export type AiResultEvent = {
   updated_at?: string;
 };
 export type AiErrorEvent = { type: "error"; code?: string; message?: string };
+// 事件流静默保活心跳：前端 dispatchChatEvent 对未知 type 静默忽略，
+// 类型上仍要显式声明，避免 union 撒谎。
+export type AiHeartbeatEvent = { type: "heartbeat" };
 
 export type AiChatEvent =
   | AiSessionEvent
@@ -74,7 +77,8 @@ export type AiChatEvent =
   | AiToolCallEvent
   | AiToolResultEvent
   | AiResultEvent
-  | AiErrorEvent;
+  | AiErrorEvent
+  | AiHeartbeatEvent;
 
 export type AiChatHandlers = {
   onSession?: (event: AiSessionEvent) => void;
@@ -276,8 +280,8 @@ export function translateAiError(error: unknown): string {
         .replace(/^[\s（）:：-]+/u, "")
         .trim();
       const tail = detail.length > 160 ? `${detail.slice(0, 160)}…` : detail;
-      return `模型服务调用失败，请检查网络、API Key 与服务商状态后重试${
-        tail ? `。服务商返回：${tail}` : ""
+      return `模型服务调用失败，请检查网络、API Key 与服务商状态后重试。${
+        tail ? `服务商返回：${tail}。` : ""
       }若是回答过长或上下文超限，请新建对话后拆小问题再问。`;
     }
     return error.message;
