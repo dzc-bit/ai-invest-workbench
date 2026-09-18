@@ -2,7 +2,7 @@
 description: 启动本地数据服务 sidecar 并探测全部关键接口
 ---
 
-对本地数据服务做一轮接口探针（参考 `AGENT必读.md` §11）。步骤：
+对本地数据服务做一轮接口探针（参考 `AGENTS.md` §11）。步骤：
 
 1. 用 Python `subprocess.Popen([...])` 参数数组启动 sidecar（路径含空格和中文，禁止拼未转义字符串）：
 

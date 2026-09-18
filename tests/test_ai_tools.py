@@ -335,3 +335,37 @@ def test_limit_up_pool_parses_rows(monkeypatch):
     item = execution.payload["items"][0]
     assert item["price"] == 1523.0 and item["zt_stat"] == "3天2板"
     assert "连板2" in execution.summary
+
+
+def test_read_tool_result_pages_a_stored_rowset():
+    """摘要写着"另有 M 行未展开"，模型就必须能按行把剩下的取回来。"""
+    from astock_backtester.ai.context import ToolResult, ToolResultStore
+    from astock_backtester.ai.tools.registry import build_read_result_tool
+
+    store = ToolResultStore()
+    rows = [{"symbol": f"{index:06d}", "close": 10.0 + index} for index in range(50)]
+    store.put(
+        ToolResult(
+            call_id="c1",
+            name="query_warehouse_sql",
+            arguments={},
+            payload={"ok": True, "rows": rows},
+            summary="ignored",
+        )
+    )
+    registry = ToolRegistry()
+    registry.register(build_read_result_tool(store))
+
+    first = registry.execute("read_tool_result", '{"call_id": "c1"}')
+    assert first.ok is True
+    assert first.payload["shown_rows"] == 40 and first.payload["more_rows"] == 10
+    assert "第 1~40 行（共 50 行）" in first.summary
+    assert "还剩 10 行未读，可继续 offset=40" in first.summary
+
+    second = registry.execute("read_tool_result", '{"call_id": "c1", "offset": 40}')
+    assert second.payload["shown_rows"] == 10 and second.payload["more_rows"] == 0
+    assert "该结果已全部读完" in second.summary
+
+    gone = registry.execute("read_tool_result", '{"call_id": "nope"}')
+    assert gone.ok is False and gone.code == "result_evicted"
+    assert "不是数据不存在" in gone.summary

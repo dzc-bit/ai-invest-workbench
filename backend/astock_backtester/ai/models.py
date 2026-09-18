@@ -66,6 +66,7 @@ class AiConfigUpdate(BaseModel):
     api_style: str = "chat-completions"
     research_style: str = "balanced"
     temperature: float = 0.3
+    max_tokens: int = 4096
     max_steps: int = 8
     insights_enabled: bool = True
     insight_max_per_hour: int = 6

@@ -15,6 +15,7 @@ protocol message list grows past the compaction threshold.
 
 from __future__ import annotations
 
+import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -34,8 +35,77 @@ UNTRUSTED_CLOSE = "<<< 外部抓取内容结束 >>>"
 def truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    dropped = len(text) - limit
-    return f"{text[:limit]}...[已截断 {dropped} 字符]"
+    # 绝不按字符硬切：`"close": 12.34` 切成 `12.` 会让模型读到一个格式合法但
+    # 数值错误的价格/百分比，在行情场景里比整行丢弃危险得多。
+    cut = text.rfind("\n", 0, limit)
+    if cut < limit // 2:
+        cut = max(text.rfind(",", 0, limit), text.rfind("}", 0, limit))
+    if cut < limit // 2:
+        cut = limit
+    dropped = len(text) - cut
+    return f"{text[:cut].rstrip()}\n...[已截断，后续 {dropped} 字符未提供]"
+
+
+@dataclass(frozen=True)
+class Retained:
+    """"保留了什么、又省略了什么"。省略计数必须精确，模型才知道要不要回读。"""
+
+    text: str
+    seen: int
+    kept: int
+
+    @property
+    def omitted(self) -> int:
+        return max(self.seen - self.kept, 0)
+
+
+def retain_rows(
+    rows: list[dict[str, Any]],
+    *,
+    columns: list[str] | None = None,
+    max_rows: int = 12,
+    cell_chars: int = 26,
+    keep: str = "head",
+) -> Retained:
+    """Render rows as a compact header + pipe-separated lines with exact omission.
+
+    ``keep="tail"`` 给"越新越重要"的数据（近 N 日行情），``head_tail`` 两头都留。
+    紧凑表格比逐行 ``key=value`` 省一大半字数，同样的预算能多装几倍行数。
+    """
+    seen = len(rows)
+    if seen == 0:
+        return Retained("", 0, 0)
+    headers = list(columns or list(rows[0]))
+    if keep != "head" and seen > max_rows:
+        if keep == "tail":
+            indexes = list(range(seen - max_rows, seen))
+        else:
+            head = max_rows // 2
+            tail = max_rows - head
+            indexes = [*range(head), *range(seen - tail, seen)]
+    else:
+        indexes = list(range(min(seen, max_rows)))
+
+    def render(row: dict[str, Any]) -> str:
+        cells = []
+        for column in headers:
+            value = row.get(column)
+            text = "--" if value is None else (f"{value:g}" if isinstance(value, float) else str(value))
+            cells.append(text[:cell_chars])
+        return "|".join(cells)
+
+    lines = ["|".join(headers)]
+    previous = -1
+    for index in indexes:
+        if index != previous + 1:
+            lines.append(f"…省略 {index - previous - 1} 行…")
+        lines.append(render(rows[index]))
+        previous = index
+    kept = len(indexes)
+    text = "\n".join(lines)
+    if seen > kept:
+        text += f"\n（共 {seen} 行，已显示 {kept} 行，另有 {seen - kept} 行未展开）"
+    return Retained(text, seen, kept)
 
 
 def wrap_untrusted(text: str) -> str:
@@ -53,22 +123,48 @@ class ToolResult:
 
 
 class ToolResultStore:
-    """Bounded in-memory store of full tool payloads, keyed by call id."""
+    """Bounded in-memory store of full tool payloads, keyed by call id.
 
-    def __init__(self, max_entries: int = 200) -> None:
+    条数上限挡不住 500 行 SQL 结果和整条权益曲线，所以再加字节估算与 TTL：
+    被淘汰的结果由 ``read_tool_result`` 明确报"已不在内存，请重新调用原工具"，
+    不会让模型误以为数据不存在。
+    """
+
+    def __init__(self, max_entries: int = 200, max_bytes: int = 64 * 1024 * 1024, ttl_seconds: float = 6 * 3600) -> None:
         self._entries: OrderedDict[str, ToolResult] = OrderedDict()
+        self._sizes: dict[str, int] = {}
+        self._bytes = 0
         self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._ttl_seconds = ttl_seconds
 
     def put(self, result: ToolResult) -> None:
+        self._evict_expired()
+        self._entries.pop(result.call_id, None)
+        self._bytes = max(0, self._bytes - self._sizes.pop(result.call_id, 0))
+        try:
+            size = len(json.dumps(result.payload, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            size = len(str(result.payload))
         self._entries[result.call_id] = result
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
+        self._sizes[result.call_id] = size
+        self._bytes += size
+        while len(self._entries) > self._max_entries or (self._bytes > self._max_bytes and len(self._entries) > 1):
+            popped_id, _ = self._entries.popitem(last=False)
+            self._bytes = max(0, self._bytes - self._sizes.pop(popped_id, 0))
 
     def get(self, call_id: str) -> ToolResult | None:
         return self._entries.get(call_id)
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    def _evict_expired(self) -> None:
+        cutoff = time.monotonic() - self._ttl_seconds
+        stale = [key for key, item in self._entries.items() if item.created_at < cutoff]
+        for key in stale:
+            self._entries.pop(key, None)
+            self._bytes = max(0, self._bytes - self._sizes.pop(key, 0))
 
 
 class ContextBudget:
@@ -84,8 +180,10 @@ class ContextBudget:
         self.digest_chars = digest_chars
         self.context_payload_chars = context_payload_chars
 
-    def digest(self, text: str) -> str:
-        return truncate_text(text, self.digest_chars)
+    def digest(self, text: str, chars: int | None = None) -> str:
+        """工具摘要进上下文前的硬上限。表格类工具需要更大的预算（默认 1200 字
+        会把 20 行榜单切成 8 行），由工具自己声明 ``digest_chars``。"""
+        return truncate_text(text, chars or self.digest_chars)
 
     def count_tokens(self, messages: list[dict[str, Any]]) -> int:
         total = 0

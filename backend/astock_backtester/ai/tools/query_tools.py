@@ -17,6 +17,7 @@ from typing import Any
 
 import pandas as pd
 
+from astock_backtester.ai.context import retain_rows
 from astock_backtester.ai.tools.local_tools import AiBackend
 from astock_backtester.ai.tools.registry import AiTool
 from astock_backtester.data.symbols import normalize_symbol
@@ -92,9 +93,11 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
         rows = payload.get("rows", [])
         if not rows:
             return "查询成功：0 行"
-        preview_keys = list(rows[0])[:4]
-        first = "，".join(f"{key}={rows[0].get(key)}" for key in preview_keys)
-        return f"查询成功 {payload.get('row_count')} 行{'（已截断）' if payload.get('truncated') else ''}；首行：{first}"
+        retained = retain_rows(rows, max_rows=25)
+        # 回填保留元数据：agent 据此告诉模型"还有 M 行，用 read_tool_result 从 offset=K 续读"。
+        payload["shown_rows"] = retained.kept
+        payload["more_rows"] = retained.omitted
+        return f"查询成功 {payload.get('row_count')} 行：\n{retained.text}"
 
     def compute_stock_stats(args: dict[str, Any]) -> dict[str, Any]:
         symbol = normalize_symbol(str(args.get("symbol", "")))
@@ -216,6 +219,7 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
             },
             executor=query_warehouse_sql,
             summarizer=summarize_sql,
+            digest_chars=3_600,
         ),
         AiTool(
             name="compute_stock_stats",

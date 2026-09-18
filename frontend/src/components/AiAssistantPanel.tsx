@@ -1,12 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { AlertTriangle, Bot, Download, Send, Settings2, Sparkles, Square, X } from "lucide-react";
+import { AlertTriangle, Bot, Download, MessageSquarePlus, Send, Settings2, Sparkles, Square, Trash2, X } from "lucide-react";
 import {
+  deleteAiSession,
   loadAiConfig,
   loadAiReportFile,
   loadAiReports,
+  loadAiSession,
+  loadAiSessions,
   loadAiStatus,
   revealAiKey,
   runAiChatStream,
@@ -21,6 +24,7 @@ import type {
   AiDisplayTurn,
   AiInsight,
   AiReportMeta,
+  AiSessionMeta,
   AiStatus,
   AiTask,
   AiToolStep
@@ -50,6 +54,40 @@ const QUICK_PROMPTS: Array<{ label: string; message: string }> = [
   }
 ];
 
+// 插件数组必须是模块级常量：内联字面量每次渲染都是新引用，memo 会直接失效。
+const MARKDOWN_REMARK = [remarkGfm];
+const MARKDOWN_REHYPE = [rehypeSanitize];
+
+// react-markdown@10 的 Markdown() 每次渲染都重建 processor 并同步 parse+run，
+// 自己不做 memo。流式期间每个 token 触发一次 setState，等于把**全部历史轮次**
+// 重解析一遍——回答越长、会话越长就越卡，所以历史与流式块都走这个 memo 组件。
+const MarkdownBlock = memo(function MarkdownBlock({ source }: { source: string }) {
+  return (
+    <div className="ai-markdown">
+      <ReactMarkdown remarkPlugins={MARKDOWN_REMARK} rehypePlugins={MARKDOWN_REHYPE}>
+        {source}
+      </ReactMarkdown>
+    </div>
+  );
+});
+
+function formatSessionTime(value?: string | null): string {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getMonth() + 1}/${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// display 每轮都由后端整体替换，只按下标做 key 会让 React 复用错位的 DOM 节点。
+function turnKey(turn: AiDisplayTurn, index: number): string {
+  return `${index}-${turn.role}-${turn.ts ?? turn.content.slice(0, 32)}`;
+}
+
 export function AiAssistantPanel({
   open,
   baseUrl,
@@ -67,6 +105,8 @@ export function AiAssistantPanel({
   const [streamingText, setStreamingText] = useState("");
   const [pendingSteps, setPendingSteps] = useState<AiToolStep[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<AiSessionMeta[]>([]);
+  const [historyBusy, setHistoryBusy] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -82,6 +122,13 @@ export function AiAssistantPanel({
   const streamingRef = useRef(false);
   const pendingTaskRef = useRef<AiTask | null>(null);
   const streamingTextRef = useRef("");
+  // 当前会话 id 的同步真相：sendMessage 常在 effect 闭包里执行，读 state 会拿到旧值。
+  const sessionIdRef = useRef<string | null>(null);
+  // 历史回读未完成前不允许开新一轮，否则会带着空 session_id 开出第二条会话。
+  const restoreRef = useRef<Promise<void> | null>(null);
+  const restoredRef = useRef(false);
+  // 分片可能比一帧还密：合帧 setState，避免流式块被重解析几十次。
+  const streamFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!open || !baseUrl) {
@@ -117,11 +164,44 @@ export function AiAssistantPanel({
   }, [open, baseUrl, onInsightsShown]);
 
   useEffect(() => {
+    if (!open || !baseUrl || restoredRef.current) {
+      return;
+    }
+    restoredRef.current = true;
+    const restore = async () => {
+      try {
+        const list = await loadAiSessions(baseUrl);
+        const history = list.items.filter((item) => item.message_count > 0);
+        setSessions(history);
+        const latest = history[0];
+        if (!latest || sessionIdRef.current) {
+          return;
+        }
+        const detail = await loadAiSession(baseUrl, latest.session_id);
+        if (detail.display.length === 0 || streamingRef.current) {
+          return;
+        }
+        sessionIdRef.current = detail.session_id;
+        setSessionId(detail.session_id);
+        setTurns(detail.display);
+      } catch {
+        // 回读失败不影响开新对话：服务未就绪或会话已被清理时从空白开始即可。
+      }
+    };
+    restoreRef.current = restore();
+  }, [open, baseUrl]);
+
+  useEffect(() => {
     if (!open) {
       return;
     }
     const node = scrollRef.current;
-    if (node) {
+    if (!node) {
+      return;
+    }
+    // 只在用户本来就贴着底部时跟随，否则流式期间根本翻不上去看前面的内容。
+    const pinnedToBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 80;
+    if (pinnedToBottom) {
       node.scrollTop = node.scrollHeight;
     }
   }, [turns, streamingText, pendingSteps, phase, open]);
@@ -132,17 +212,83 @@ export function AiAssistantPanel({
     };
   }, []);
 
+  const refreshSessions = async () => {
+    if (!baseUrl) {
+      return;
+    }
+    try {
+      const list = await loadAiSessions(baseUrl);
+      setSessions(list.items.filter((item) => item.message_count > 0));
+    } catch {
+      // 列表刷新失败不打断对话：下一次打开抽屉还会再读。
+    }
+  };
+
+  const startNewChat = () => {
+    if (streamingRef.current) {
+      return;
+    }
+    sessionIdRef.current = null;
+    setSessionId(null);
+    setTurns([]);
+    setLastChart(null);
+    setLastStrategy(null);
+    setError(null);
+  };
+
+  const openHistorySession = async (target: AiSessionMeta) => {
+    if (!baseUrl || streamingRef.current || target.session_id === sessionIdRef.current) {
+      return;
+    }
+    setHistoryBusy(target.session_id);
+    try {
+      const detail = await loadAiSession(baseUrl, target.session_id);
+      sessionIdRef.current = detail.session_id;
+      setSessionId(detail.session_id);
+      setTurns(detail.display);
+      // 上一轮的图表/策略工件属于刚才那条会话，切过来后不能再挂在末尾。
+      setLastChart(null);
+      setLastStrategy(null);
+      setError(null);
+    } catch (caught) {
+      setError(translateAiError(caught));
+    } finally {
+      setHistoryBusy(null);
+    }
+  };
+
+  const removeHistorySession = async (target: AiSessionMeta) => {
+    if (!baseUrl) {
+      return;
+    }
+    setHistoryBusy(target.session_id);
+    try {
+      await deleteAiSession(baseUrl, target.session_id);
+      setSessions((prev) => prev.filter((item) => item.session_id !== target.session_id));
+      if (target.session_id === sessionIdRef.current) {
+        startNewChat();
+      }
+    } catch (caught) {
+      setError(translateAiError(caught));
+    } finally {
+      setHistoryBusy(null);
+    }
+  };
+
   useEffect(() => {
     if (!open || !task) {
       return;
     }
     onTaskConsumed();
-    if (streamingRef.current) {
-      // 流式回答期间到达的场景任务先排队，当前轮结束后自动发送，避免静默丢弃。
-      pendingTaskRef.current = task;
-      return;
-    }
-    void sendMessage(task.message, task.context ?? null);
+    const fire = () => {
+      if (streamingRef.current) {
+        // 流式回答期间到达的场景任务先排队，当前轮结束后自动发送，避免静默丢弃。
+        pendingTaskRef.current = task;
+        return;
+      }
+      void sendMessage(task.message, task.context ?? null);
+    };
+    void (restoreRef.current ?? Promise.resolve()).then(fire);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, task]);
 
@@ -154,6 +300,7 @@ export function AiAssistantPanel({
     streamingRef.current = true;
     const controller = new AbortController();
     abortRef.current = controller;
+    setInput("");
     setTurns((prev) => [...prev, { role: "user", content: trimmed }]);
     setStreaming(true);
     setStreamingText("");
@@ -162,15 +309,27 @@ export function AiAssistantPanel({
     setPhase("准备请求");
     setError(null);
     try {
+      // 历史回读结束后才能确定"这是哪条会话的追问"，否则会另开一条空会话。
+      if (restoreRef.current) {
+        await restoreRef.current;
+      }
       await runAiChatStream(
         baseUrl,
-        { message: trimmed, session_id: sessionId, context },
+        { message: trimmed, session_id: sessionIdRef.current, context },
         {
-          onSession: (event) => setSessionId(event.session_id),
+          onSession: (event) => {
+            sessionIdRef.current = event.session_id;
+            setSessionId(event.session_id);
+          },
           onPhase: setPhase,
           onToken: (text) => {
             streamingTextRef.current += text;
-            setStreamingText((prev) => prev + text);
+            if (streamFrameRef.current == null) {
+              streamFrameRef.current = requestAnimationFrame(() => {
+                streamFrameRef.current = null;
+                setStreamingText(streamingTextRef.current);
+              });
+            }
           },
           onToolCall: (event) =>
             setPendingSteps((prev) => [...prev, { id: event.id, name: event.name }]),
@@ -184,6 +343,7 @@ export function AiAssistantPanel({
             ),
           onResult: (event) => {
             setTurns(event.display ?? []);
+            sessionIdRef.current = event.session_id;
             setSessionId(event.session_id);
             setLastChart(event.chart ?? null);
             if (event.strategy) {
@@ -207,6 +367,10 @@ export function AiAssistantPanel({
       if (abortRef.current === controller) {
         abortRef.current = null;
         streamingRef.current = false;
+        if (streamFrameRef.current != null) {
+          cancelAnimationFrame(streamFrameRef.current);
+          streamFrameRef.current = null;
+        }
         setStreaming(false);
         setPhase(null);
         setStreamingText("");
@@ -305,6 +469,16 @@ export function AiAssistantPanel({
           </div>
         </div>
         <div className="ai-drawer-actions">
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="新建对话"
+            title="开始一条全新会话"
+            disabled={streaming}
+            onClick={startNewChat}
+          >
+            <MessageSquarePlus size={17} aria-hidden="true" />
+          </button>
           <button className="icon-button" type="button" aria-label="AI 服务设置" onClick={() => void openSettings()}>
             <Settings2 size={17} aria-hidden="true" />
           </button>
@@ -325,6 +499,51 @@ export function AiAssistantPanel({
             </button>
           </div>
         </div>
+      ) : null}
+
+      {sessions.length > 0 ? (
+        <details
+          className="ai-insights ai-history"
+          onToggle={(event) => {
+            // 展开时才刷新：list_sessions 会全量读一遍会话 JSON，不该挂在每轮响应上。
+            if (event.currentTarget.open) {
+              void refreshSessions();
+            }
+          }}
+        >
+          <summary>历史对话（{sessions.length}）</summary>
+          <ul>
+            {sessions.map((item) => (
+              <li
+                key={item.session_id}
+                className={`ai-insight ai-session-item${item.session_id === sessionId ? " current" : ""}`}
+              >
+                <button
+                  type="button"
+                  className="ai-session-open"
+                  aria-current={item.session_id === sessionId ? "true" : undefined}
+                  disabled={streaming || historyBusy !== null}
+                  onClick={() => void openHistorySession(item)}
+                >
+                  <strong>{item.title}</strong>
+                  <small>
+                    {item.message_count} 条 · {formatSessionTime(item.updated_at)}
+                  </small>
+                </button>
+                <button
+                  type="button"
+                  className="ai-reveal-button"
+                  aria-label={`删除会话 ${item.title}`}
+                  disabled={historyBusy !== null}
+                  onClick={() => void removeHistorySession(item)}
+                >
+                  <Trash2 size={13} aria-hidden="true" />
+                  删除
+                </button>
+              </li>
+            ))}
+          </ul>
+        </details>
       ) : null}
 
       {insights.length > 0 ? (
@@ -380,7 +599,7 @@ export function AiAssistantPanel({
         ) : null}
 
         {turns.map((turn, index) => (
-          <article key={`${turn.role}-${index}`} className={`ai-msg ${turn.role}`}>
+          <article key={turnKey(turn, index)} className={`ai-msg ${turn.role}`}>
             {turn.role === "assistant" && turn.tool_steps && turn.tool_steps.length > 0 ? (
               <details className="ai-steps">
                 <summary>
@@ -413,11 +632,7 @@ export function AiAssistantPanel({
                 应用到策略工作台
               </button>
             ) : null}
-            <div className="ai-markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
-                {turn.content}
-              </ReactMarkdown>
-            </div>
+            <MarkdownBlock source={turn.content} />
           </article>
         ))}
 
@@ -434,13 +649,7 @@ export function AiAssistantPanel({
                 ))}
               </ul>
             ) : null}
-            {streamingText ? (
-              <div className="ai-markdown">
-                <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
-                  {streamingText}
-                </ReactMarkdown>
-              </div>
-            ) : null}
+            {streamingText ? <MarkdownBlock source={streamingText} /> : null}
           </article>
         ) : null}
 

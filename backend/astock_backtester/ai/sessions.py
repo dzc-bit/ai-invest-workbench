@@ -3,6 +3,11 @@
 Sessions hold protocol messages (tool contents are digests only) plus display
 turns for the frontend; full tool payloads stay in the in-memory
 :class:`ToolResultStore` and are never persisted.
+
+Format evolution follows **adjacent migration**: a new version may add fields
+but never moves, rewrites or destroys generations already on disk, and the read
+side keeps tolerating older generations (files predating ``schema_version`` are
+treated as v1).
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from pathlib import Path
 from uuid import uuid4
 
 SESSIONS_DIR_NAME = "AI对话"
+SESSION_SCHEMA_VERSION = 1
 MAX_PERSISTED_MESSAGES = 400
 _SESSION_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -41,6 +47,7 @@ class SessionStore:
         now = datetime.now(UTC).isoformat()
         session = {
             "session_id": uuid4().hex,
+            "schema_version": SESSION_SCHEMA_VERSION,
             "title": title[:40] or "新会话",
             "created_at": now,
             "updated_at": now,
@@ -63,7 +70,10 @@ class SessionStore:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("schema_version", SESSION_SCHEMA_VERSION)
+        return payload
 
     def save(self, session: dict) -> None:
         safe = _safe_session_id(str(session.get("session_id", "")))

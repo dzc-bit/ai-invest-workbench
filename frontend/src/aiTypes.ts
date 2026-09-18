@@ -6,6 +6,8 @@ export type AiToolStep = {
   ok?: boolean;
   summary?: string;
   duration_ms?: number;
+  /** 失败类别（bad_arguments / no_data / tool_error / interrupted …），随会话落盘。 */
+  code?: string;
 };
 
 export type AiDisplayTurn = {
@@ -132,6 +134,7 @@ export type AiConfigView = {
   research_style: AiResearchStyle;
   api_key_masked: string;
   temperature: number;
+  max_tokens: number;
   max_steps: number;
   insights_enabled: boolean;
   insight_max_per_hour: number;
@@ -152,6 +155,7 @@ export type AiConfigUpdatePayload = {
   api_style: AiApiStyle;
   research_style: AiResearchStyle;
   temperature: number;
+  max_tokens: number;
   max_steps: number;
   insights_enabled: boolean;
   insight_max_per_hour: number;
@@ -221,6 +225,25 @@ export type AiTask = {
   context?: AiChatContext | null;
 };
 
+export type AiSessionMeta = {
+  session_id: string;
+  title: string;
+  updated_at?: string | null;
+  message_count: number;
+};
+
+export type AiSessionsResponse = {
+  items: AiSessionMeta[];
+};
+
+export type AiSessionDetail = {
+  session_id: string;
+  title: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  display: AiDisplayTurn[];
+};
+
 export type AiConditionParseResult = {
   entry: ConditionNode[];
   exit: ConditionNode[];
@@ -246,7 +269,16 @@ export function translateAiError(error: unknown): string {
       return "上一轮回答还在生成中，请等它结束（或点击停止）后再发送。";
     }
     if (error.message.includes("ai_upstream_error") || error.message.includes("模型服务调用失败")) {
-      return "模型服务调用失败，请检查网络、API Key 与服务商状态后重试。";
+      // 后端 detail 里带着真正的病因（上下文超长 / 401 / 429 / 超时），
+      // 整句换成固定文案等于让用户照着“检查网络”盲猜。
+      const detail = error.message
+        .replace(/^模型服务调用失败/u, "")
+        .replace(/^[\s（）:：-]+/u, "")
+        .trim();
+      const tail = detail.length > 160 ? `${detail.slice(0, 160)}…` : detail;
+      return `模型服务调用失败，请检查网络、API Key 与服务商状态后重试${
+        tail ? `。服务商返回：${tail}` : ""
+      }若是回答过长或上下文超限，请新建对话后拆小问题再问。`;
     }
     return error.message;
   }

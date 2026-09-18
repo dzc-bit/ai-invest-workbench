@@ -427,6 +427,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=stock_valuation,
             summarizer=summarize_valuation,
+            digest_chars=2_600,
         ),
         AiTool(
             name="stock_research_reports",
@@ -441,6 +442,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=stock_research_reports,
             summarizer=summarize_reports,
+            digest_chars=2_600,
         ),
         AiTool(
             name="dragon_tiger_board",
@@ -456,6 +458,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=dragon_tiger_board,
             summarizer=summarize_dragon_tiger,
+            digest_chars=2_600,
         ),
         AiTool(
             name="limit_up_pool",
@@ -469,6 +472,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=limit_up_pool,
             summarizer=summarize_limit_up,
+            digest_chars=3_000,
         ),
         AiTool(
             name="compare_stocks",

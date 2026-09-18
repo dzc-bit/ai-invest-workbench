@@ -149,6 +149,54 @@ def test_chat_anthropic_parses_sse_stream():
     assert not payload.get("system")
     assert payload["tools"][0]["input_schema"]["type"] == "object"
     assert payload["messages"][0]["role"] == "user"
+    assert final["truncated"] is False
+    assert payload["max_tokens"] == 4096
+
+
+def test_truncated_flag_maps_per_protocol():
+    """被输出上限截断的回答必须带 truncated，不能被当完整结论交付。"""
+
+    def sse(payload: dict) -> str:
+        return "data: " + json.dumps(payload, ensure_ascii=False)
+
+    anthropic_client = OpenAiCompatibleClient(
+        lambda: AiConfig(base_url="https://api.anthropic.com", api_key="k", model="claude-x", api_style="anthropic"),
+        anthropic_post=lambda config, payload: iter(
+            [
+                sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "只写到一半"}}),
+                sse({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+            ]
+        ),
+    )
+    anthropic_final = list(anthropic_client.chat([{"role": "user", "content": "hi"}]))[-1][1]
+    assert anthropic_final["truncated"] is True
+
+    events = [
+        SimpleNamespace(type="response.output_text.delta", delta="半截"),
+        SimpleNamespace(type="response.incomplete"),
+    ]
+    responses_client = OpenAiCompatibleClient(
+        lambda: AiConfig(base_url="http://x", api_key="k", model="m", api_style="responses"),
+        client_factory=lambda config: SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: iter(events))),
+    )
+    responses_final = list(responses_client.chat([{"role": "user", "content": "hi"}]))[-1][1]
+    assert responses_final["truncated"] is True
+    assert responses_final["content"] == "半截"
+
+
+def test_chat_anthropic_error_event_raises_instead_of_passing_silently():
+    """SSE 里的 error 事件（如 overloaded_error）以前落进分支空档被静默忽略。"""
+
+    def fake_post(config: AiConfig, payload: dict):
+        yield 'data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "写到这"}}'
+        yield 'data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}'
+
+    client = OpenAiCompatibleClient(
+        lambda: AiConfig(base_url="https://api.anthropic.com", api_key="k", model="claude-x", api_style="anthropic"),
+        anthropic_post=fake_post,
+    )
+    with pytest.raises(AiUpstreamError, match="Overloaded"):
+        list(client.chat([{"role": "user", "content": "hi"}]))
 
 
 def test_chat_anthropic_maps_http_error_to_upstream():

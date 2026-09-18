@@ -437,6 +437,10 @@ class DataServiceServer(ThreadingHTTPServer):
 class DataServiceHandler(BaseHTTPRequestHandler):
     server: DataServiceServer
 
+    # NDJSON 流是逐事件 write+flush 的小包；默认开着 Nagle 会让 Windows 回环
+    # 把它们攒起来等延迟 ACK，表现为 AI 出字一顿一顿。
+    disable_nagle_algorithm = True
+
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
@@ -816,6 +820,20 @@ class DataServiceHandler(BaseHTTPRequestHandler):
         if self.path == "/ai/events/stream":
             self._run_ai_events_stream()
             return
+        if self.path == "/ai/sessions":
+            self._send_json({"items": self.server.state.ai_service().list_sessions()})
+            return
+        if self.path.startswith("/ai/session"):
+            query = parse_qs(urlsplit(self.path).query)
+            session_id = str((query.get("session_id") or [""])[0])
+            try:
+                self._send_json(self.server.state.ai_service().session_view(session_id))
+            except AiError as exc:
+                self._send_json({"code": exc.code, "message": str(exc)}, HTTPStatus.NOT_FOUND)
+            except Exception as exc:
+                self.server.state.log("error", f"ai session read failed: {exc}")
+                self._send_json({"code": "request_failed", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if self.path == "/ai/reports":
             try:
                 self._send_json(self.server.state.ai_service().list_reports())
@@ -1032,6 +1050,13 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/ai/optimize":
                 self._run_ai_optimize_stream(payload)
+                return
+            if self.path == "/ai/session/delete":
+                session_id = str(payload.get("session_id", "")).strip()
+                if not session_id:
+                    raise ValueError("缺少要删除的 session_id。")
+                deleted = self.server.state.ai_service().delete_session(session_id)
+                self._send_json({"session_id": session_id, "deleted": deleted})
                 return
             if self.path == "/ai/chat/stream":
                 self._run_ai_chat_stream(payload)

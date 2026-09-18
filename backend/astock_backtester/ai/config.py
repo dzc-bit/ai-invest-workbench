@@ -59,6 +59,9 @@ class AiConfig:
     api_style: str = "chat-completions"
     research_style: str = "balanced"
     temperature: float = 0.3
+    # 单次回答的输出长度上限。之前只以硬编码常量存在于 anthropic 分支，
+    # 另外两种协议干脆不传；被截断的回答因此无从调整。
+    max_tokens: int = 4096
     max_steps: int = 8
     insights_enabled: bool = True
     insight_max_per_hour: int = 6
@@ -84,6 +87,7 @@ class AiConfig:
         if cfg.research_style not in SUPPORTED_RESEARCH_STYLES:
             cfg.research_style = "balanced"
         cfg.temperature = min(max(cfg.temperature, 0.0), 2.0)
+        cfg.max_tokens = max(256, min(int(cfg.max_tokens), 32_000))
         cfg.max_steps = max(1, min(int(cfg.max_steps), 16))
         cfg.insight_max_per_hour = max(0, min(int(cfg.insight_max_per_hour), 60))
         cfg.report_time = normalize_hhmm(cfg.report_time, "15:30")
@@ -171,6 +175,7 @@ class AiConfigStore:
             "research_style": config.research_style,
             "api_key_masked": masked_key(config.api_key),
             "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
             "max_steps": config.max_steps,
             "insights_enabled": config.insights_enabled,
             "insight_max_per_hour": config.insight_max_per_hour,

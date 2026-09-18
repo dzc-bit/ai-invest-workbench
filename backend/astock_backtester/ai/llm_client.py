@@ -31,8 +31,6 @@ from astock_backtester.ai.errors import AiNotConfigured, AiUpstreamError
 ChatEvent = tuple[str, Any]
 """("text", delta) while streaming content, then ("final", turn dict)."""
 
-DEFAULT_MAX_TOKENS = 4096
-
 
 class ChatModel(Protocol):
     """The Agent loop only depends on this protocol; tests swap in a fake."""
@@ -219,6 +217,7 @@ class OpenAiCompatibleClient:
             "model": config.model,
             "messages": messages,
             "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
             "stream": True,
         }
         if tools:
@@ -230,11 +229,13 @@ class OpenAiCompatibleClient:
 
         content_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
         try:
             for chunk in stream:
                 if not getattr(chunk, "choices", None):
                     continue
                 delta = chunk.choices[0].delta
+                finish_reason = getattr(chunk.choices[0], "finish_reason", None) or finish_reason
                 text = getattr(delta, "content", None) if delta is not None else None
                 if text:
                     content_parts.append(text)
@@ -260,7 +261,14 @@ class OpenAiCompatibleClient:
         for index, call in enumerate(ordered):
             if not call["id"]:
                 call["id"] = f"call_{index}"
-        yield ("final", {"content": "".join(content_parts) or None, "tool_calls": ordered or None})
+        yield (
+            "final",
+            {
+                "content": "".join(content_parts) or None,
+                "tool_calls": ordered or None,
+                "truncated": finish_reason == "length",
+            },
+        )
 
     # ------------------------------------------------------------ responses
     def _chat_responses(
@@ -272,6 +280,8 @@ class OpenAiCompatibleClient:
             "model": config.model,
             "instructions": instructions or None,
             "input": items,
+            "temperature": config.temperature,
+            "max_output_tokens": config.max_tokens,
             "stream": True,
         }
         if tools:
@@ -283,6 +293,7 @@ class OpenAiCompatibleClient:
 
         content_parts: list[str] = []
         calls: list[dict[str, Any]] = []
+        truncated = False
         try:
             for event in stream:
                 event_type = getattr(event, "type", "")
@@ -291,8 +302,16 @@ class OpenAiCompatibleClient:
                     if delta:
                         content_parts.append(delta)
                         yield ("text", delta)
+                elif event_type == "response.incomplete":
+                    # 半截答案不能当完整结论交付
+                    truncated = True
+                elif event_type in {"response.failed", "error"}:
+                    detail = getattr(getattr(event, "response", None), "error", None) or getattr(event, "error", None)
+                    raise AiUpstreamError(f"模型服务返回失败：{detail or event_type}")
                 elif event_type == "response.completed":
                     response = getattr(event, "response", None)
+                    if getattr(response, "status", "") == "incomplete":
+                        truncated = True
                     for item in getattr(response, "output", None) or []:
                         if getattr(item, "type", "") == "function_call":
                             calls.append(
@@ -305,9 +324,14 @@ class OpenAiCompatibleClient:
                                     },
                                 }
                             )
+        except AiUpstreamError:
+            raise
         except Exception as exc:
             raise _map_provider_error(exc) from exc
-        yield ("final", {"content": "".join(content_parts) or None, "tool_calls": calls or None})
+        yield (
+            "final",
+            {"content": "".join(content_parts) or None, "tool_calls": calls or None, "truncated": truncated},
+        )
 
     # ------------------------------------------------------------- anthropic
     def _default_anthropic_post(self, config: AiConfig, payload: dict[str, Any]) -> Iterator[str]:
@@ -339,7 +363,7 @@ class OpenAiCompatibleClient:
         system, converted = anthropic_messages(messages)
         payload: dict[str, Any] = {
             "model": config.model,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            "max_tokens": config.max_tokens,
             "temperature": config.temperature,
             "stream": True,
             "messages": converted,
@@ -351,6 +375,7 @@ class OpenAiCompatibleClient:
 
         content_parts: list[str] = []
         tool_blocks: dict[int, dict[str, Any]] = {}
+        truncated = False
         try:
             for line in self._anthropic_post(config, payload):
                 if not line.startswith("data:"):
@@ -377,13 +402,27 @@ class OpenAiCompatibleClient:
                         slot = tool_blocks.get(int(event.get("index", 0)))
                         if slot is not None:
                             slot["function"]["arguments"] += str(delta.get("partial_json") or "")
+                elif event_type == "message_delta":
+                    if (event.get("delta") or {}).get("stop_reason") == "max_tokens":
+                        truncated = True
+                elif event_type == "error":
+                    # 以前 error 事件落进分支空档被静默忽略，半截答案当成正常结束
+                    detail = (event.get("error") or {}).get("message") or "未知上游错误"
+                    raise AiUpstreamError(f"模型服务返回失败：{detail}")
         except AiUpstreamError:
             raise
         except Exception as exc:
             raise _map_provider_error(exc) from exc
 
         ordered = [tool_blocks[index] for index in sorted(tool_blocks)]
-        yield ("final", {"content": "".join(content_parts) or None, "tool_calls": ordered or None})
+        yield (
+            "final",
+            {
+                "content": "".join(content_parts) or None,
+                "tool_calls": ordered or None,
+                "truncated": truncated,
+            },
+        )
 
     # -------------------------------------------------------------- embed
     def embed(self, texts: list[str]) -> list[list[float]]:

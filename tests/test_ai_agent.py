@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from astock_backtester.ai.agent import SHORT_TERM_MAX_CHARS, AgentRunner
@@ -100,6 +101,51 @@ def test_agent_runs_tool_then_answers():
     assert tool_messages_in_request[0]["content"].startswith("value=7")
 
 
+def test_agent_runs_read_only_tool_batch_concurrently_in_order():
+    """只读工具批次并发执行，但协议消息仍按 tool_calls 原顺序落盘。
+
+    Barrier 是并发的硬证明：两个执行器没有同时在跑就会 BrokenBarrierError，被
+    registry 吞成 ok=False，下面的 value 断言随即变红——不需要脆弱的计时断言。
+    顺序部分保护的是 _repair_interrupted_turn 依赖的 assistant(tool_calls)→tool 配对。
+    """
+    gate = threading.Barrier(2, timeout=5)
+
+    def executor(args: dict[str, Any]) -> dict[str, Any]:
+        gate.wait()
+        return {"ok": True, "value": args.get("x"), "diagnostics": []}
+
+    registry = ToolRegistry()
+    registry.register(
+        AiTool(
+            name="barrier_tool",
+            description="blocks until both calls run",
+            parameters={"type": "object", "properties": {}},
+            executor=executor,
+            summarizer=lambda payload: f"value={payload.get('value')}",
+        )
+    )
+    model = FakeModel(
+        [
+            [
+                _final(
+                    tool_calls=[
+                        _tool_call("t1", "barrier_tool", '{"x": 1}'),
+                        _tool_call("t2", "barrier_tool", '{"x": 2}'),
+                    ]
+                )
+            ],
+            [_final(content="并发结论")],
+        ]
+    )
+    runner = AgentRunner(model, registry, ToolResultStore(), ContextBudget())
+    session = _session()
+    runner.run(session=session, user_message="并发看看", system_prompt="SYS", max_steps=2, on_event=lambda _: None)
+
+    tool_messages = [message for message in session["messages"] if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == ["t1", "t2"]
+    assert [message["content"] for message in tool_messages] == ["value=1", "value=2"]
+
+
 def test_agent_stops_at_max_steps():
     model = FakeModel([[_final(tool_calls=[_tool_call("t1", "echo_tool", '{"x": 1}')])] for _ in range(4)])
     runner = AgentRunner(model, _registry(), ToolResultStore(), ContextBudget())
@@ -113,7 +159,10 @@ def test_agent_stops_at_max_steps():
 def test_agent_max_steps_still_delivers_final_answer():
     """步数耗尽时不再空手中断：强制做一次无工具收尾回答。"""
     tool_only = [_final(tool_calls=[_tool_call("t1", "echo_tool", '{"x": 1}')])]
-    model = FakeModel([tool_only, tool_only, [_final(content="基于已有结果的最终结论")]])
+    # 真实客户端收尾时会先发 text 分片、再发 final，且 final.content 就是分片拼接；
+    # 只发 final 的脚本会漏掉"分片+final 双写"这类膨胀 bug。
+    closing = [("text", "基于已有"), ("text", "结果的最终结论"), _final(content="基于已有结果的最终结论")]
+    model = FakeModel([tool_only, tool_only, closing])
     runner = AgentRunner(model, _registry(), ToolResultStore(), ContextBudget())
     events: list[dict[str, Any]] = []
     session = _session()

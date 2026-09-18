@@ -5,9 +5,9 @@ description: A股策略回测工作台项目开发技能。改后端数据/回�
 
 # A股策略回测工作台 · 开发技能
 
-先读 `AGENT必读.md`（不变量与红线）与 `AGENTS.md`（门禁）。本技能只回答"改了什么代码就跑哪个测试"和"怎么预览"。
+先读 `AGENTS.md`：§2 与 §15 是红线和架构不变量，§13 是验证命令。本技能只回答"改了什么代码就跑哪个测试"和"怎么预览"。
 
-## 分域测试映射（照抄 AGENT必读 §13）
+## 分域测试映射（与 AGENTS.md §13 一致）
 
 | 改动范围 | 测试命令 |
 | --- | --- |
@@ -17,9 +17,11 @@ description: A股策略回测工作台项目开发技能。改后端数据/回�
 | AI 子系统（agent/路由/工具） | `python -m pytest tests/test_ai_routes_v150.py tests/test_ai_service_http.py tests/test_ai_agent.py -q` |
 | 全量后端门禁 | `python -m pytest tests -q`（≥700 通过） |
 | 前端全量 | `.\.tools\node-v20.18.1-win-x64\npm.cmd run test:ui -- --run`（≥250 通过） |
-| Rust 壳 | `cargo test --manifest-path src-tauri\Cargo.toml`（先设 CARGO_HOME/RUSTUP_HOME，见 AGENT必读 §13） |
+| Rust 壳 | `cargo test --manifest-path src-tauri\Cargo.toml`（先设 CARGO_HOME/RUSTUP_HOME，见 AGENTS.md §13） |
 
 ## AI 模块注意事项
+
+目录地图、事件协议与会话历史细节见 `docs/ai-subsystem.md`（本地留存，不入库）；这里只留踩坑清单。
 
 - `ai/` 是独立子包：不新增第二个写工具；LLM 配置只存 `运行产物/AI配置/`；`/ai/config` 只回掩码。
 - 提示词模板含字面 JSON 必须用 `{{ }}` 转义（`str.format` 会把 `{"content": ...}` 当占位符，曾踩坑）。

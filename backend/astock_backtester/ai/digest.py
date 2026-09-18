@@ -5,7 +5,7 @@ a structured briefing, stored under 运行产物/AI简报 and exposed via ``GET
 Sources are the existing read-only tools (news providers, limit-up pool,
 yesterday-limit performance, realtime snapshot, fupan/zaopan) — richer than the
 raw news list alone, and every synthesized item is labelled ``ai-agent`` so it
-can never be mistaken for a raw market-data module (AGENT必读 module boundary).
+can never be mistaken for a raw market-data module (AGENTS.md module boundary).
 Runs automatically once per service start (when an LLM is configured) and then
 on a fixed interval; failures are logged and never fatal.
 """
@@ -169,9 +169,16 @@ class DigestEngine:
 
     def _loop(self) -> None:
         # 启动即先跑一次（服务启动触发），之后按固定间隔刷新。
-        self.run_once()
-        while not self._stop.wait(self._interval):
-            self.run_once()
+        while True:
+            try:
+                self.run_once()
+            except Exception as exc:  # noqa: BLE001 - the engine must never crash the service
+                try:
+                    self._backend.log("warning", f"ai digest engine run failed: {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._stop.wait(self._interval):
+                break
 
     # ------------------------------------------------------------------ run
     def run_once(self, *, force: bool = False) -> dict[str, Any]:

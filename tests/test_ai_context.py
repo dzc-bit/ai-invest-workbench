@@ -16,7 +16,13 @@ def test_truncate_text_marks_dropped_chars():
     text = "a" * 500
     result = truncate_text(text, 100)
     assert result.startswith("a" * 100)
-    assert "已截断 400 字符" in result
+    assert "后续 400 字符未提供" in result
+
+    # 截断只能落在行边界：把"收盘价 12.34"切成"收盘价 12."会让模型读到格式
+    # 合法但数值错误的价格，比整行丢弃危险得多。
+    lines = truncate_text("\n".join(["收盘价 12.34"] * 30), 100)
+    kept = lines.split("\n...[已截断")[0]
+    assert all(line == "收盘价 12.34" for line in kept.splitlines())
 
 
 def test_truncate_text_keeps_short_text():

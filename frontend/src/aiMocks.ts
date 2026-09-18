@@ -4,10 +4,13 @@ import type {
   AiConditionParseResult,
   AiConfigUpdatePayload,
   AiConfigView,
+  AiDisplayTurn,
   AiEventStreamEvent,
   AiInsightScene,
   AiNewsDigest,
   AiReportsResponse,
+  AiSessionDetail,
+  AiSessionsResponse,
   AiStatus
 } from "./aiTypes";
 import type { BacktestSettingsConfig, OptimizeCombination, StrategyConfig } from "./types";
@@ -34,6 +37,7 @@ export function mockAiConfig(): AiConfigView {
     embedding_api_key_masked: "",
     api_style: "chat-completions",
     research_style: "balanced",
+    max_tokens: 4096,
     api_key_masked: "sk-****demo",
     temperature: 0.3,
     max_steps: 8,
@@ -142,6 +146,7 @@ const DEMO_STRATEGY: StrategyConfig = {
 };
 
 export function mockAiChatEvents(request: AiChatRequest): AiChatEvent[] {
+  const sessionKey = request.session_id ?? MOCK_CURRENT_SESSION;
   const reply = request.context?.kind === "backtest_result"
     ? "本次回测总收益 12.4%，最大回撤 5.2%，胜率 58.3%，共 24 笔交易。收益主要由 3 月上旬的量能放大阶段贡献；回撤集中在 4 月中旬的连续止损。建议关注止盈参数的敏感性。以上为 AI 生成内容，仅供辅助观察，不构成投资建议。"
     : "市场当前红盘 3200 / 全市场 5120，上证指数 3100 点（+0.65%）。半导体板块领涨 3.8%。整体情绪偏暖，但宽度尚未过热。以上为 AI 生成内容，仅供辅助观察，不构成投资建议。";
@@ -152,8 +157,24 @@ export function mockAiChatEvents(request: AiChatRequest): AiChatEvent[] {
     market_value: 600_000 * (1 + index * 0.008),
     drawdown_pct: -0.01 - (index % 4) * 0.004
   }));
+  const ts = new Date().toISOString();
+  const nextTurns: AiDisplayTurn[] = [
+    { role: "user", content: request.message, ts },
+    {
+      role: "assistant",
+      content: reply,
+      tool_steps: [
+        { id: "t1", name: "realtime_market_snapshot", ok: true, summary: "状态 live / 来源 mock", duration_ms: 320 },
+        { id: "t2", name: "recent_daily_bars", ok: true, summary: "600519 最近 30 日区间 +5.20%", duration_ms: 210 }
+      ],
+      ts
+    }
+  ];
+  const prior = mockSessionDisplays.get(sessionKey) ?? (sessionKey === MOCK_CURRENT_SESSION ? [] : demoDisplayFor(sessionKey));
+  const display = [...prior, ...nextTurns];
+  mockSessionDisplays.set(sessionKey, display);
   return [
-    { type: "session", session_id: "mock-session", title: "演示会话" },
+    { type: "session", session_id: sessionKey, title: "演示会话" },
     { type: "phase", phase: "思考中（第 1/8 步）" },
     { type: "tool_call", id: "t1", name: "realtime_market_snapshot", args: {} },
     { type: "tool_result", id: "t1", name: "realtime_market_snapshot", ok: true, summary: "状态 live / 来源 mock；上证指数 3100 (+0.65%)", duration_ms: 320 },
@@ -164,18 +185,8 @@ export function mockAiChatEvents(request: AiChatRequest): AiChatEvent[] {
     { type: "token", text: reply.slice(20) },
     {
       type: "result",
-      session_id: "mock-session",
-      display: [
-        { role: "user", content: request.message },
-        {
-          role: "assistant",
-          content: reply,
-          tool_steps: [
-            { id: "t1", name: "realtime_market_snapshot", ok: true, summary: "状态 live / 来源 mock", duration_ms: 320 },
-            { id: "t2", name: "recent_daily_bars", ok: true, summary: "600519 最近 30 日区间 +5.20%", duration_ms: 210 }
-          ]
-        }
-      ],
+      session_id: sessionKey,
+      display,
       strategy: request.context?.kind === "none" || !request.context ? DEMO_STRATEGY : null,
       chart: { type: "equity_curve", title: "回测权益曲线（演示）", points: demoCurve }
     }
@@ -183,6 +194,82 @@ export function mockAiChatEvents(request: AiChatRequest): AiChatEvent[] {
 }
 
 let mockEventStreamEmitted = false;
+
+const MOCK_CURRENT_SESSION = "mock-session";
+
+// 生产端 result.display 是"整条会话累积的转录"，预览 mock 按同样的语义累计，
+// 否则一次问答就会把刚回读出来的历史顶掉，预览看不到历史续用的真实效果。
+const mockSessionDisplays = new Map<string, AiDisplayTurn[]>();
+
+function demoDisplayFor(sessionId: string): AiDisplayTurn[] {
+  const ts = new Date().toISOString();
+  return sessionId === MOCK_CURRENT_SESSION
+    ? [
+        { role: "user", content: "帮我看看 600519，结合技术面、资金面和估值给个诊断。", ts },
+        {
+          role: "assistant",
+          content:
+            "600519 贵州茅台近 30 日区间 +5.20%，主力净流入连续 3 日为正但估值分位仍处近三年中位以上（来源：recent_daily_bars / tencent_valuation）。以上为 AI 生成内容，仅供辅助观察，不构成投资建议。",
+          tool_steps: [
+            { id: "h1", name: "recent_daily_bars", ok: true, summary: "600519 最近 30 日区间 +5.20%", duration_ms: 210 },
+            { id: "h2", name: "tencent_valuation", ok: true, summary: "PE-TTM 32.4，近三年分位 61%", duration_ms: 140 }
+          ],
+          ts
+        }
+      ]
+    : [
+        { role: "user", content: "结合当前实时行情和最新新闻，做一次大盘快评。", ts },
+        {
+          role: "assistant",
+          content:
+            "红盘 3200 / 全市场 5120，上证指数 3100 点（+0.65%），半导体板块领涨 3.8%；宽度偏暖但未过热（来源：realtime_market_snapshot / market_news）。以上为 AI 生成内容，仅供辅助观察，不构成投资建议。",
+          tool_steps: [
+            { id: "h3", name: "realtime_market_snapshot", ok: true, summary: "状态 live / 上证指数 3100 (+0.65%)", duration_ms: 320 }
+          ],
+          ts
+        }
+      ];
+}
+
+export function mockAiSessions(): AiSessionsResponse {
+  const now = Date.now();
+  return {
+    items: [
+      {
+        session_id: MOCK_CURRENT_SESSION,
+        title: "600519 个股诊断（演示）",
+        updated_at: new Date(now - 60_000).toISOString(),
+        message_count: 2
+      },
+      {
+        session_id: "mock-session-older",
+        title: "大盘快评（演示）",
+        updated_at: new Date(now - 86_400_000).toISOString(),
+        message_count: 2
+      }
+    ]
+  };
+}
+
+export function mockAiSessionDetail(sessionId: string): AiSessionDetail {
+  const isStock = sessionId === MOCK_CURRENT_SESSION;
+  if (!mockSessionDisplays.has(sessionId)) {
+    mockSessionDisplays.set(sessionId, demoDisplayFor(sessionId));
+  }
+  const display = mockSessionDisplays.get(sessionId) ?? [];
+  const ts = new Date().toISOString();
+  return {
+    session_id: sessionId,
+    title: isStock ? "600519 个股诊断（演示）" : "大盘快评（演示）",
+    created_at: ts,
+    updated_at: ts,
+    display
+  };
+}
+
+export function mockAiSessionDelete(sessionId: string): boolean {
+  return sessionId.length > 0;
+}
 
 export function mockAiConditionParse(text: string): AiConditionParseResult {
   const trimmed = text.trim() || "近5天放量上涨，破20日线卖";

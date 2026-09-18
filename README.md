@@ -6,54 +6,13 @@
 
 当前版本：`1.5.1`
 
-## 1.5.1 当前发布内容
-
-本轮聚焦"数据仓在多进程下不再写坏、缺口能说清楚、AI 能定时出报告"：
-
-- **数据仓跨进程写锁**：新增 `data/filelock.py`（`CrossProcessFileLock`），桌面端 sidecar 与外部补齐脚本同时写同一数据仓时串行化写入，修复并发写入导致的 parquet 分区损坏。
-- **批量写入从 O(n²) 降到线性**：日线/市值/资金流批量写入不再每个批次重扫已写分区，全市场同步的写入耗时随批次数线性增长。
-- **损坏分区不再静默**：读取失败的分区被记录并通过 `Warehouse.corrupt_partitions()` 暴露，数据中心可见，不再表现为"数据凭空缺失"。
-- **覆盖缺口改为累计真实缺口口径**：日线缺失 = 每只股票 `[首行日期, min(最新数据日, 退市日)]` 窗口内的期望交易日数 − 实有行数（内部空洞与停更尾部都计入）；市值/资金流在"已有行但字段为空"的统计之外再叠加停更尾部。多日未同步时缺失行数会到数十万级，这是真实缺口而不是异常，唯一补齐手段仍是全市场同步。
-- **缺口画像与"缺失数据监控"**：`GET /diagnostics/data-gaps` 与 `Warehouse.data_gap_profile()` 给出停更分布、疑似写入失败日、市值与资金流停更尾部；数据中心折叠区按缺口降序列逐股明细，AI 助手的 `data_health_report` 工具消费同一份明细，保证 UI 与 AI 看到一致的"具体缺什么"。
-- **AI 定时报告**：`ai/reports.py` 用单一调度线程按本地时间运行——收盘复盘报告（无模型时退化为数据摘要版）与策略库自动体检（重跑已存策略近 180 天 + 4 变体小网格 + 过拟合检测 + 与上次体检的漂移，不改写用户保存的策略）；报告落盘 `运行产物/AI报告/`，AI 助手面板内可列出并下载（`GET /ai/reports`、`GET /ai/report/file?name=`）。
-- **回测过拟合检测**：`POST /ai/overfit/check` 对交易数、胜率、收益结构、网格离散度做确定性检测（无需模型）；回测完成后收益概览出现过拟合卡，分"轻微提示 / 存在疑点 / 高"三档。
-- **实时行情降级重试**：快照缺红绿家数（或强势板块）时不再等满整个正常周期，短暂等待后重试一次；本轮确实缺红绿家数时沿用最近一次有数据的宽度并明确标注"沿用"，不伪装成已返回。
-- **AI 助手交互修正**：抽屉打开时隐藏悬浮球（原先正好压住输入区发送按钮）；上一轮回答仍在生成时明确提示"等待或先停止"，不再静默吞掉输入。
-- **embedding 独立供应商**：可为向量检索单独配置 Base URL 与 API Key，留空则跟随上方主配置。
-- **知识库**：RAG 语料新增异动/监管/量能一篇。
-
-## 1.5.0 发布内容（历史）
-
-本轮以"有专业投研深度、UI 有设计品质、数据模型正确"为目标，包含七块内容（设计决策见 [`design.md`](design.md)）：
-
-- **策略条件编辑器 AI 化瘦身**：策略配置页顶部新增"AI 条件理解"自然语言输入框——写"近5天放量上涨、主力净流入为正，破20日线卖"，点"AI 理解并写入"，后端 `POST /ai/conditions/parse` 用 LLM 生成候选条件 DSL、逐条本地校验、校验失败自动带报错重试（≤2 次），返回可勾选的条件清单（带"近似说明"角标与未识别提示），确认后一键写入策略。原三段式手工编辑器（校验→添加→模板面板）收进"高级模式"折叠区，默认收起，AI 未配置时输入框置灰但不影响高级模式。
-- **AI 点评全覆盖**（统一走 `POST /ai/insight/oneshot` 轻路由，失败静默）：回测完成后收益概览指标条下自动出现 ≤80 字 AI 短评；数据中心新增"AI 诊断缺失"按钮（分析覆盖缺失模式并指路补齐按钮）；风险股票清单弹窗顶部新增 AI 一句话解读。
-- **数据股票池动态化（新上市/退市感知）**：本地仓 metadata 新增 `symbol_lifecycle` 表（上市日/退市日/状态）。覆盖计算的期望交易日截断到每只股票的上市–退市窗口内——新上市股票上市前的交易日不再记为"缺失"，已退市股票退市后的日期也不再永远缺失；全市场同步股票池自动剔除已退市股票（数据源完整性不足时保守跳过，绝不误杀）；逐股覆盖明细带"未上市（YYYY-MM-DD 起）/ 已退市"徽标。上市日期来自 adata 股票列表与抓取行的 `listing_days` 字段，全市场同步时顺带刷新。
-- **策略参数寻优 Agent**：`POST /ai/optimize` 对当前策略的数值参数（持仓天数/止盈止损/仓位/挂牌数等白名单键）做网格搜索，最多 48 个组合，NDJSON 流式返回逐组合收益/回撤/胜率对比表，结束后附 AI 解读（最优区间 + 过拟合警告）；前端策略配置页新增"AI 参数寻优"面板（参数行可增删、候选值可编辑、最优组合高亮）。
-- **回测报告 HTML 导出**：回测完成后点"导出报告"即可下载单文件 HTML（权益曲线 SVG、指标卡、策略参数、交易明细、AI 解读），纯前端 Blob 生成，无新后端依赖。
-- **数据源健康监控**：`GET /diagnostics/sources` 聚合实时行情/市场新闻/财联社看盘三个数据源最近一次成功状态与距今年代（含诊断文本），数据中心折叠卡片"数据源健康监控"展示，帮助排查"大盘评分不可用"一类问题。
-- **前端设计系统（Hallmark 重构）**：`styles.css`/`ai-panel.css` 全部落到命名 token（`:root` 设计令牌块），token 之外 0 处硬编码色值、装饰渐变清零；左侧实色边条统一为顶部 accent 条；数字容器统一 `tabular-nums`（A 股红涨绿跌语义不变）；全局 `:focus-visible` 焦点环；320/375/768/1280 宽度实测无页面级横向滚动。信息架构、中文文案与 aria 标注不变。
-
-## 1.4.0 发布内容（历史）
-
-本轮新增 AI 投研助手模块（`backend/astock_backtester/ai/`，独立子包，对存量模块只读）：
-
-- **评股 Agent**：`POST /ai/chat/stream` NDJSON 流式对话。Agent 通过 17 个工具（实时行情、新闻、复盘、风险清单、本地日线+均线、条件校验、受控回测、腾讯估值、东财研报、龙虎榜、涨停池、DuckDB 只读 SQL、统计函数、受控数据补齐、知识检索、多股对比、AI 聚合要点）完成个股诊断与行情问答；正文流式输出，工具调用过程可视化，所有数字要求标注来源工具。其中 `update_stock_data` 是唯一写工具（走数据中心同款补齐链路）。
-- **多协议接入**：设置里可选 API 协议格式——`chat-completions`（OpenAI 兼容，默认）、`responses`（OpenAI Responses API）、`anthropic`（Anthropic Messages API，含 tool_use/tool_result 流式映射）；密钥/协议等配置仅存本地。
-- **启动 AI 资讯聚合**：服务启动时（已配置模型）Agent 自动汇总新闻/涨停池/昨日涨停表现/实时行情/复盘等多源数据，生成 3-6 条结构化"AI 聚合要点"，展示在资讯面板顶部（标注 ai-agent，与原始资讯模块严格分离），也可通过 `GET /ai/news` 与 `latest_market_digest` 工具消费；之后按固定间隔自动刷新。
-- **NL→策略 DSL**：自然语言生成条件 DSL → 先校验（校验失败带模板示例自我修正）→ 受控运行本地回测 → 结果可一键"应用到策略工作台"。
-- **上下文工程与分层记忆**（参考 MemGPT/Letta、mem0 的分层思路，本地化裁剪）：短期上下文窗口硬性保留最近 10 条协议消息，溢出部分归档并压缩为会话滚动纪要；长期记忆由模型在每轮结束后提取持久事实（关注标的/策略偏好/参数习惯），去重合并进 `运行产物/AI记忆/memory.json`，并按更新时间注入后续 system prompt。工具全量结果留在后端 `ToolResultStore`，进上下文的只有每工具摘要；爬取内容以不可信分隔符包裹（提示词注入防御）。
-- **真实执行能力（NL→SQL + 计算函数 + 受控写入）**：Agent 可对本地日线数据仓发起 DuckDB 只读 SQL 查询（`query_warehouse_sql`，hive 分区 parquet 直查，强制 SELECT/WITH、自动 LIMIT 500），可调用统计函数（`compute_stock_stats`：区间收益/年化波动/最大回撤/资金合计），可通过 `update_stock_data` 用数据中心同款补齐链路把指定股票区间数据写回仓库——这是唯一的写路径，SQL 层禁止任何写语句。
-- **本地知识检索（RAG）**：投研方法论 / 条件 DSL 语法 / 数据字段规则三份语料，langchain-text-splitters 分块 + OpenAI 兼容 embedding（磁盘缓存）+ numpy 余弦 Top-K，以 `retrieve_knowledge` 工具挂给 Agent。
-- **AI 快讯推送**：`GET /ai/events/stream` 长连接。规则触发器（新闻更新 / 市场宽度异动 / 风险清单变化）发出 `data_fresh` 信号，前端立即刷新对应模块（推拉结合，替代死等轮询）；配置模型后按小时级配额生成 AI 快讯（`insight`，强制标注 ai-insight，不构成投资建议）。
-- **配置与安全**：LLM 配置存于 `运行产物/AI配置/ai-config.json`（不进 Git；设置弹窗可显示/隐藏自己的 API Key，接口默认只回掩码）；AI 模块对数据仓默认只读，唯一写路径是 `update_stock_data` 补齐链路；AI 生成的策略/结论不进入 `latest_strategy_matches` 候选管线；评测集见 `scripts/ai_eval.py`（20 条 NL→DSL 用例，本地跑，不进 CI）。
-
-LLM 客户端复用官方 `openai` SDK（任何 OpenAI 兼容服务商均可，配置默认留空，由用户在应用内"AI 助手 → 设置"填写）。
+本轮与历轮发布内容统一记在 [`CHANGELOG.md`](CHANGELOG.md)；本文件只描述“现在能做什么”，不堆发布流水账。
 
 ## 面向用户
 
 - 策略条件一句话生成：在"策略配置 → AI 条件理解"里用口语描述买卖规则，AI 解析成可勾选的条件清单（含近似说明），确认后写入策略；需要精细控制时展开"高级模式"手工编辑。
 - AI 助手：右上角"AI 助手"唤起右侧抽屉，支持个股诊断（技术/资金/估值/消息四维）、大盘快评、自然语言生成策略并一键回测、回测结果解读；工具调用过程与数据来源全部可见。
+- AI 对话历史：关掉抽屉或重启应用后再打开，会自动续上最近一条对话；"历史对话"折叠区列出全部会话，可切换、删除或新建一条。追问仍在同一会话里，更早的内容（含压缩后的会话纪要）会继续被引用。
 - AI 参数寻优：策略配置页底部"AI 参数寻优"面板，选 2–4 个参数给候选值（最多 48 组合），一键网格回测出对比表 + AI 解读最优区间与过拟合警告。
 - 回测报告导出：回测完成后"导出报告"一键下载单文件 HTML（权益曲线、指标、交易明细、AI 解读），可直接存档或分享。
 - 数据中心：维护 A 股日线、资金流、市值和覆盖信息，支持导入、全市场同步、指定股票补齐和资金流补齐；"AI 诊断缺失"按钮分析覆盖缺口并指路补齐操作；"数据源健康监控"折叠卡实时展示各数据源最近成功状态。
@@ -116,8 +75,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 | 风险与策略 | `GET /risk/alerts`、`GET /strategy/recommended`、`POST /strategy/conditions/validate` |
 | 回测 | `POST /run/backtest/stream` |
 | AI 助手 | `GET /ai/status`、`GET /ai/news`、`GET /ai/config`、`POST /ai/config`、`GET /ai/config/reveal`（仅限本机桌面端，带 Host/Origin 校验）、`POST /ai/chat/stream`、`GET /ai/events/stream` |
-| AI 轻路由（v1.5.0） | `POST /ai/conditions/parse`（自然语言→条件 DSL，自愈校验）、`POST /ai/insight/oneshot`（场景化单段点评）、`POST /ai/optimize`（参数网格寻优，NDJSON 流式） |
-| AI 报告与过拟合（v1.5.1） | `GET /ai/reports`、`GET /ai/report/file?name=`、`POST /ai/overfit/check` |
+| AI 会话历史 | `GET /ai/sessions`（会话列表）、`GET /ai/session?session_id=`（回读展示转录）、`POST /ai/session/delete`（删除会话） |
+| AI 轻路由 | `POST /ai/conditions/parse`（自然语言→条件 DSL，自愈校验）、`POST /ai/insight/oneshot`（场景化单段点评）、`POST /ai/optimize`（参数网格寻优，NDJSON 流式） |
+| AI 报告与过拟合 | `GET /ai/reports`、`GET /ai/report/file?name=`、`POST /ai/overfit/check` |
 
 `/run/backtest/stream` 与 `/ai/chat/stream` 返回 NDJSON，需要逐行解析；`/ai/chat/stream` 的最后一个事件为 `{"type":"result", ...}`（错误时为 `error`）。`/ai/events/stream` 为长连接（insight / data_fresh / heartbeat）。
 
@@ -162,6 +122,14 @@ npm run tauri -- dev
 npm run tauri -- build --ci
 ```
 
-Windows 发布使用项目内固定的 Node、Python、Rust、MSVC 和 NSIS 工具，完成签名、覆盖安装、sidecar 哈希与 HTTP 探针流程后再上传安装包。
+## 文档
 
-发布前请确认生成的安装包、签名文件、临时更新清单、日志和运行数据没有提交到 Git 仓库。
+| 文件 | 内容 |
+| --- | --- |
+| [`AGENTS.md`](AGENTS.md) | 贡献者与 AI agent 的红线、架构不变量、门禁命令 |
+| [`design.md`](design.md) | 视觉系统的锁（命名 token 表） |
+| [`CHANGELOG.md`](CHANGELOG.md) | 各版本发布记录 |
+
+更细的模块手册（AI 子系统目录与事件协议、Windows 构建签名流程、前端 token 纪律）放在维护者本地的 `docs/` 目录；该目录整体被 `.gitignore` 排除、不入库，需要时按 `AGENTS.md` 对应章节的摘要与红线行事。
+
+Windows 发布使用项目内固定的 Node、Python、Rust、MSVC 和 NSIS 工具。发布前确认生成的安装包、签名文件、临时更新清单、日志和运行数据没有提交到 Git 仓库。

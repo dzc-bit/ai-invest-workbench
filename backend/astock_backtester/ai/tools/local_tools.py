@@ -14,6 +14,7 @@ from typing import Any, Protocol
 import pandas as pd
 from pydantic import ValidationError
 
+from astock_backtester.ai.context import retain_rows
 from astock_backtester.ai.tools.registry import AiTool
 from astock_backtester.backtest_runner import run_configured_backtest
 from astock_backtester.condition_parser import validate_condition_text, validate_exit_condition_text
@@ -215,10 +216,20 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
         first_close = rows[0]["close"] or 0
         last_close = last["close"] or 0
         range_pct = (last_close - first_close) / first_close * 100 if first_close else 0
+        # 摘要行之外还要给真实逐日数据：只报首末两点的话，"近 5 日走势""哪天放量"
+        # 这类问题模型根本无从回答（原来是把最多 120 天塌成一行）。
+        retained = retain_rows(
+            rows,
+            columns=["trade_date", "close", "change_pct", "volume", "turnover_rate", "main_net_inflow", "ma5", "ma10", "ma20"],
+            max_rows=16,
+            keep="tail",
+        )
+        payload["shown_rows"] = retained.kept
+        payload["more_rows"] = retained.omitted
         return (
             f"{payload.get('symbol')} {payload.get('name')} 最近 {len(rows)} 个交易日："
             f"最新收盘 {last_close}，MA5 {last.get('ma5')} / MA10 {last.get('ma10')} / MA20 {last.get('ma20')}，"
-            f"区间 {range_pct:+.2f}%"
+            f"区间 {range_pct:+.2f}%\n{retained.text}"
         )
 
     def validate_strategy_conditions(args: dict[str, Any]) -> dict[str, Any]:
@@ -388,6 +399,7 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
             },
             executor=recent_daily_bars,
             summarizer=summarize_bars,
+            digest_chars=2_600,
         ),
         AiTool(
             name="validate_strategy_conditions",

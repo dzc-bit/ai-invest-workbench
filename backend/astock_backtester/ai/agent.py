@@ -11,8 +11,9 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from astock_backtester.ai.context import (
     ContextBudget,
@@ -41,10 +42,40 @@ CONSOLIDATE_MIN_CHARS = 6_000
 # 这是长久的内存/落盘膨胀风险，按条数兜底裁剪。
 ARCHIVE_MAX_ENTRIES = 400
 
-# 摘要里含爬取正文的工具：digest 进入上下文前必须套不可信分隔符（AGENT必读 §15-8）
+# 摘要里含爬取正文的工具：digest 进入上下文前必须套不可信分隔符（AGENTS.md §15-8）
 UNTRUSTED_DIGEST_TOOLS = frozenset(
     {"market_news", "market_briefing", "stock_research_reports", "dragon_tiger_board", "limit_up_pool"}
 )
+
+# 必须独占执行、不与其他工具并发的两个工具：update_stock_data 是唯一写路径（并发写
+# 同一数据仓会撞 parquet 分区），run_strategy_backtest 把整表读进 pandas（并发等于
+# 双份内存 + 磁盘 IO 抢占）。其余都是只读查询，可以并发。
+SERIAL_TOOLS = frozenset({"update_stock_data", "run_strategy_backtest"})
+MAX_PARALLEL_TOOLS = 4
+
+
+class _ToolCall(NamedTuple):
+    """一个已解析的 tool_call；``arguments`` 保留原文，registry 要靠它回传参数提示。"""
+
+    call_id: str
+    name: str
+    arguments: str
+    args: dict[str, Any]
+
+    @staticmethod
+    def of(call: dict[str, Any]) -> _ToolCall:
+        function = call.get("function", {})
+        arguments = str(function.get("arguments", ""))
+        try:
+            parsed = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        return _ToolCall(
+            call_id=str(call.get("id", "")),
+            name=str(function.get("name", "")),
+            arguments=arguments,
+            args=parsed if isinstance(parsed, dict) else {},
+        )
 
 
 class AgentRunner:
@@ -53,7 +84,6 @@ class AgentRunner:
         self._registry = registry
         self._result_store = result_store
         self._budget = budget
-        self._artifacts: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ run
     def run(
@@ -68,7 +98,9 @@ class AgentRunner:
     ) -> dict[str, Any]:
         """Run one user turn to completion; returns UI artifacts (e.g. a
         runnable strategy JSON produced by a successful backtest tool call)."""
-        self._artifacts = {}
+        # 实例属性会把并发运行的两个会话的工件串在一起（A 拿到 B 的回测策略），
+        # 所以 artifacts 只活在单次 run 的作用域里。
+        artifacts: dict[str, Any] = {}
         now = datetime.now(UTC).isoformat()
         # 上一次运行可能被中断（客户端断开/进程退出/模型异常），先修复悬空的
         # tool_calls——否则下次请求会被上游 API 以协议错误拒绝，表现为“失忆”。
@@ -103,13 +135,17 @@ class AgentRunner:
             session["messages"].append(assistant_message)
 
             if not tool_calls:
+                answer = turn.get("content") or ""
+                if turn.get("truncated"):
+                    # 只加在展示层：协议消息保留模型原文，不把 UI 提示回灌进后续上下文。
+                    answer = f"{answer}\n\n（本回答因输出长度上限被截断，可回复“继续”或在设置里调大 max_tokens。）"
                 session["display"].append(
-                    {"role": "assistant", "content": turn.get("content") or "", "tool_steps": [], "ts": datetime.now(UTC).isoformat()}
+                    {"role": "assistant", "content": answer, "tool_steps": [], "ts": datetime.now(UTC).isoformat()}
                 )
                 session["updated_at"] = datetime.now(UTC).isoformat()
-                return dict(self._artifacts)
+                return artifacts
 
-            steps = self._execute_tool_calls(session, tool_calls, on_event)
+            steps = self._execute_tool_calls(session, tool_calls, on_event, artifacts)
             session["display"].append(
                 {
                     "role": "assistant",
@@ -122,44 +158,43 @@ class AgentRunner:
         # 步数耗尽时绝不“空手中断”：强制做一次不带工具的收尾回答，
         # 把已收集的工具结果整理成结论交给用户。
         if self._forced_final_answer(session, system_prompt, on_event):
-            return dict(self._artifacts)
+            return artifacts
         note = "（已达到单次问题的工具调用上限，且收尾回答生成失败；请拆小问题后重试。）"
         session["messages"].append({"role": "assistant", "content": note})
         session["display"].append({"role": "assistant", "content": note, "tool_steps": [], "ts": datetime.now(UTC).isoformat()})
         on_event({"type": "phase", "phase": "已达工具调用上限"})
-        return dict(self._artifacts)
+        return artifacts
 
     # --------------------------------------------------------------- tools
     def _execute_tool_calls(
-        self, session: dict[str, Any], tool_calls: list[dict[str, Any]], on_event: EventHandler
+        self,
+        session: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        on_event: EventHandler,
+        artifacts: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        plans = [_ToolCall.of(call) for call in tool_calls]
+        for plan in plans:
+            on_event({"type": "tool_call", "id": plan.call_id, "name": plan.name, "args": plan.args})
+        executions = self._invoke(plans)
+
         steps: list[dict[str, Any]] = []
-        for call in tool_calls:
-            function = call.get("function", {})
-            name = str(function.get("name", ""))
-            arguments = str(function.get("arguments", ""))
-            call_id = str(call.get("id", ""))
-            try:
-                args = json.loads(arguments) if arguments.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-            on_event({"type": "tool_call", "id": call_id, "name": name, "args": args})
-            execution = self._registry.execute(name, arguments)
+        for plan, execution in zip(plans, executions, strict=True):
             self._result_store.put(
                 ToolResult(
-                    call_id=call_id,
-                    name=name,
-                    arguments=args,
+                    call_id=plan.call_id,
+                    name=plan.name,
+                    arguments=plan.args,
                     payload=execution.payload,
                     summary=execution.summary,
                 )
             )
-            if name == "run_strategy_backtest" and execution.ok:
+            if plan.name == "run_strategy_backtest" and execution.ok:
                 if isinstance(execution.payload.get("strategy"), dict):
-                    self._artifacts["strategy"] = execution.payload["strategy"]
+                    artifacts["strategy"] = execution.payload["strategy"]
                 curve = execution.payload.get("equity_curve_downsampled")
                 if curve:
-                    self._artifacts["chart"] = {
+                    artifacts["chart"] = {
                         "type": "equity_curve",
                         "title": "回测权益曲线",
                         "points": curve,
@@ -167,8 +202,8 @@ class AgentRunner:
             on_event(
                 {
                     "type": "tool_result",
-                    "id": call_id,
-                    "name": name,
+                    "id": plan.call_id,
+                    "name": plan.name,
                     "ok": execution.ok,
                     "summary": execution.summary,
                     "duration_ms": execution.duration_ms,
@@ -177,22 +212,49 @@ class AgentRunner:
             )
             steps.append(
                 {
-                    "id": call_id,
-                    "name": name,
+                    "id": plan.call_id,
+                    "name": plan.name,
                     "ok": execution.ok,
                     "summary": execution.summary,
                     "duration_ms": execution.duration_ms,
+                    "code": execution.code,
                 }
             )
             session_tool_content = execution.summary
+            if execution.code:
+                # 失败类别跟着摘要进协议消息与会话文件：中断恢复和回放后要能区分
+                # "改参数重试"/"换工具"/"先补数据"，而不是只留一句人读文案。
+                session_tool_content = f"[code={execution.code}] {session_tool_content}"
             if execution.diagnostics:
                 session_tool_content += "\n诊断: " + "；".join(execution.diagnostics[:3])
-            if name in UNTRUSTED_DIGEST_TOOLS:
+            payload = execution.payload if isinstance(execution.payload, dict) else {}
+            more_rows = payload.get("more_rows")
+            if more_rows:
+                session_tool_content += (
+                    f"\n（另有 {more_rows} 行未展开，可调用 "
+                    f'read_tool_result(call_id="{plan.call_id}", offset={payload.get("shown_rows", 0)}) 续读）'
+                )
+            if plan.name in UNTRUSTED_DIGEST_TOOLS:
                 session_tool_content = wrap_untrusted(session_tool_content)
-            session_tool_content = self._budget.digest(session_tool_content)
-            session_tool = {"role": "tool", "tool_call_id": call_id, "content": session_tool_content}
+            session_tool_content = self._budget.digest(session_tool_content, execution.digest_chars)
+            session_tool = {"role": "tool", "tool_call_id": plan.call_id, "content": session_tool_content}
             self._session_messages_target(session).append(session_tool)
         return steps
+
+    def _invoke(self, plans: list[_ToolCall]) -> list[Any]:
+        """Execute one batch of tool calls, returning results in request order.
+
+        Read-only batches fan out on a bounded pool; a batch containing a
+        write or a full-frame backtest stays serial, and ordering is what keeps
+        the assistant(tool_calls)->tool pairing ``_repair_interrupted_turn``
+        relies on intact.
+        """
+        if len(plans) > 1 and not any(plan.name in SERIAL_TOOLS for plan in plans):
+            with ThreadPoolExecutor(
+                max_workers=min(MAX_PARALLEL_TOOLS, len(plans)), thread_name_prefix="ai-tool"
+            ) as pool:
+                return list(pool.map(lambda plan: self._registry.execute(plan.name, plan.arguments), plans))
+        return [self._registry.execute(plan.name, plan.arguments) for plan in plans]
 
     # ----------------------------------------------------------- messages
     def _build_request_messages(self, session: dict[str, Any], system_prompt: str) -> list[dict[str, Any]]:
@@ -239,7 +301,10 @@ class AgentRunner:
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": f"（上一次运行在调用 {name or '工具'} 时被中断，没有返回结果；如需该数据请重新调用。）",
+                        "content": (
+                            f"[code=interrupted] （上一次运行在调用 {name or '工具'} 时被中断，没有返回结果；"
+                            "如需该数据请重新调用。）"
+                        ),
                     }
                 )
                 changed = True
@@ -251,21 +316,36 @@ class AgentRunner:
         on_event({"type": "phase", "phase": "工具步数已达上限，正在整理已有结果作答"})
         messages = self._build_request_messages(session, system_prompt)
         try:
-            content_parts: list[str] = []
+            streamed: list[str] = []
+            final_content = ""
+            truncated = False
             for event in self._model.chat(build_final_answer_messages(messages), tools=None):
                 if event[0] == "text":
-                    content_parts.append(event[1])
+                    # 只用于给前端实时出字：三协议的 final.content 就是这些分片的拼接，
+                    # 两处都收会让落盘的收尾回答整段翻倍。
+                    streamed.append(event[1])
                     on_event({"type": "token", "text": event[1]})
                 elif event[0] == "final":
-                    content_parts.append(str((event[1] or {}).get("content") or ""))
-            answer = "".join(content_parts).strip()
+                    payload = event[1] or {}
+                    final_content = str(payload.get("content") or "")
+                    truncated = bool(payload.get("truncated"))
+            answer = (final_content or "".join(streamed)).strip()
         except Exception:  # noqa: BLE001 - 收尾失败时回退到提示文案
             return False
         if not answer:
             return False
         session["messages"].append({"role": "assistant", "content": answer})
         session["display"].append(
-            {"role": "assistant", "content": answer, "tool_steps": [], "ts": datetime.now(UTC).isoformat()}
+            {
+                "role": "assistant",
+                "content": (
+                    f"{answer}\n\n（本回答因输出长度上限被截断，可回复“继续”或在设置里调大 max_tokens。）"
+                    if truncated
+                    else answer
+                ),
+                "tool_steps": [],
+                "ts": datetime.now(UTC).isoformat(),
+            }
         )
         session["updated_at"] = datetime.now(UTC).isoformat()
         return True

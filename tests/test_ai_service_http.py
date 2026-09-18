@@ -240,6 +240,128 @@ def test_ai_chat_stream_with_stubbed_model(tmp_path, monkeypatch):
         thread.join(timeout=5)
 
 
+class _RecordingStubAgent:
+    """按真实 agent 的方式写会话，并记录每一轮"开始前看到多少历史"。
+
+    续用历史的关键证据就是这些计数：只有 session_id 被正确回读并传回
+    /ai/chat/stream，第二轮的 agent 才会看到第一轮的协议消息与展示轮次。
+    """
+
+    def __init__(self) -> None:
+        self.turns: list[dict[str, int]] = []
+
+    def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+        self.turns.append(
+            {
+                "protocol": len(session.get("messages") or []),
+                "display": len(session.get("display") or []),
+            }
+        )
+        session["messages"].append({"role": "user", "content": user_message})
+        session["display"].append({"role": "user", "content": user_message, "ts": "now"})
+        session["display"].append({"role": "assistant", "content": f"已收到：{user_message}", "tool_steps": [], "ts": "now"})
+        return {}
+
+
+def test_ai_session_history_routes(tmp_path, monkeypatch):
+    server, thread, port = _start_server(tmp_path)
+    base = f"http://127.0.0.1:{port}"
+    _request_json(
+        "POST",
+        f"{base}/ai/config",
+        {"base_url": "http://127.0.0.1:9", "api_key": "sk-test", "model": "demo"},
+    )
+    stub = _RecordingStubAgent()
+    ai_service = server.state.ai_service()
+    monkeypatch.setattr(ai_service, "_agent", stub)
+    try:
+        assert _request_json("GET", f"{base}/ai/sessions") == {"items": []}
+
+        events = _request_ndjson(f"{base}/ai/chat/stream", {"message": "帮我看看 600519"})
+        session_id = events[0]["session_id"]
+
+        items = _request_json("GET", f"{base}/ai/sessions")["items"]
+        assert [item["session_id"] for item in items] == [session_id]
+        assert items[0]["message_count"] == 2
+        assert items[0]["title"] == "帮我看看 600519"
+
+        detail = _request_json("GET", f"{base}/ai/session?session_id={session_id}")
+        assert detail["session_id"] == session_id
+        assert [turn["role"] for turn in detail["display"]] == ["user", "assistant"]
+        # 协议消息、待压缩归档与滚动纪要都不出网络边界
+        assert "messages" not in detail
+        assert "pending_archive" not in detail
+        assert "rolling_summary" not in detail
+
+        # 带着回读到的 session_id 续问：历史必须回到 agent 上下文
+        _request_ndjson(f"{base}/ai/chat/stream", {"message": "再看下资金面", "session_id": session_id})
+        assert stub.turns[1] == {"protocol": 1, "display": 2}
+
+        status, payload = _request_json_allow_error("GET", f"{base}/ai/session?session_id=never-existed")
+        assert status == 404
+        assert payload["code"] == "ai_session_not_found"
+
+        assert _request_json("POST", f"{base}/ai/session/delete", {"session_id": session_id}) == {
+            "session_id": session_id,
+            "deleted": True,
+        }
+        assert _request_json("GET", f"{base}/ai/sessions")["items"] == []
+
+        status, payload = _request_json_allow_error("POST", f"{base}/ai/session/delete", {})
+        assert status == 400
+        assert payload["code"] == "validation_error"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_ai_chat_stream_emits_heartbeat_while_tools_run(tmp_path, monkeypatch):
+    """长工具调用期间没有事件时，事件流必须自己保活。
+
+    否则前端 180 秒"没收到字节即超时"会把这一轮误杀成"回答中断"，而 worker 仍在
+    跑并持着会话锁，用户下一次发送要白等 90 秒。沿用同文件的 monkeypatch 范式，
+    把心跳间隔压到几十毫秒，整条测试跑在 1 秒内。
+    """
+    from astock_backtester.ai import facade
+
+    monkeypatch.setattr(facade, "AI_STREAM_HEARTBEAT_SECONDS", 0.05)
+    server, thread, port = _start_server(tmp_path)
+    base = f"http://127.0.0.1:{port}"
+    _request_json(
+        "POST",
+        f"{base}/ai/config",
+        {"base_url": "http://127.0.0.1:9", "api_key": "sk-test", "model": "demo"},
+    )
+
+    class _SlowToolAgent:
+        def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+            on_event({"type": "tool_call", "id": "t1", "name": "run_strategy_backtest", "args": {}})
+            time.sleep(0.4)  # 模拟一次跑几分钟的全市场回测
+            on_event(
+                {
+                    "type": "tool_result",
+                    "id": "t1",
+                    "name": "run_strategy_backtest",
+                    "ok": True,
+                    "summary": "完成",
+                    "duration_ms": 400,
+                }
+            )
+            session["display"].append({"role": "assistant", "content": "回测完成", "tool_steps": [], "ts": "now"})
+            return {}
+
+    ai_service = server.state.ai_service()
+    monkeypatch.setattr(ai_service, "_agent", _SlowToolAgent())
+    try:
+        events = _request_ndjson(f"{base}/ai/chat/stream", {"message": "跑一次全市场回测"})
+        types = [event["type"] for event in events]
+        assert "heartbeat" in types
+        assert types[-1] == "result"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_ai_events_stream_heartbeat_and_publish(tmp_path, monkeypatch):
     from astock_backtester.ai import facade
 

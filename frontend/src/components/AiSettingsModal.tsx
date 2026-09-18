@@ -25,6 +25,7 @@ export function AiSettingsModal({ open, config, isSaving = false, errorMessage, 
   const [researchStyle, setResearchStyle] = useState<AiResearchStyle>("balanced");
   const [temperature, setTemperature] = useState(0.3);
   const [maxSteps, setMaxSteps] = useState(8);
+  const [maxTokens, setMaxTokens] = useState(4096);
   const [insightsEnabled, setInsightsEnabled] = useState(true);
   const [insightMaxPerHour, setInsightMaxPerHour] = useState(6);
   const [reportEnabled, setReportEnabled] = useState(false);
@@ -47,6 +48,7 @@ export function AiSettingsModal({ open, config, isSaving = false, errorMessage, 
     setResearchStyle(config.research_style);
     setTemperature(config.temperature);
     setMaxSteps(config.max_steps);
+    setMaxTokens(config.max_tokens);
     setInsightsEnabled(config.insights_enabled);
     setInsightMaxPerHour(config.insight_max_per_hour);
     setReportEnabled(config.report_enabled);
@@ -86,6 +88,7 @@ export function AiSettingsModal({ open, config, isSaving = false, errorMessage, 
       research_style: researchStyle,
       temperature: Number.isFinite(temperature) ? temperature : 0.3,
       max_steps: Number.isFinite(maxSteps) ? maxSteps : 8,
+      max_tokens: Number.isFinite(maxTokens) ? maxTokens : 4096,
       insights_enabled: insightsEnabled,
       insight_max_per_hour: Number.isFinite(insightMaxPerHour) ? insightMaxPerHour : 6,
       report_enabled: reportEnabled,
@@ -257,6 +260,19 @@ export function AiSettingsModal({ open, config, isSaving = false, errorMessage, 
                 max={60}
                 value={insightMaxPerHour}
                 onChange={(event) => setInsightMaxPerHour(Number(event.target.value))}
+              />
+            </label>
+          </div>
+          <div className="ai-field-row">
+            <label className="ai-field">
+              <span>单次回答长度上限（tokens）</span>
+              <input
+                type="number"
+                min={256}
+                max={32000}
+                step={256}
+                value={maxTokens}
+                onChange={(event) => setMaxTokens(Number(event.target.value))}
               />
             </label>
           </div>
