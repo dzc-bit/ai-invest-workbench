@@ -32,6 +32,74 @@ class FakeProvider:
         )
 
 
+def test_daily_completeness_snapshot_is_lightweight_and_counter_is_vectorized(tmp_path):
+    """快照只保留 pair 索引与布尔向量（内存爆炸修复），计数语义与逐行版本一致。"""
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                # 000001：OHLC 完整但市值缺失；000002：完整行；000003：仓里没有。
+                "symbol": ["000001", "000002"],
+                "trade_date": ["2026-06-17", "2026-06-17"],
+                "open": [1.0, 1.0],
+                "high": [1.0, 1.0],
+                "low": [1.0, 1.0],
+                "close": [1.0, 1.0],
+                "volume": [1, 1],
+                "float_market_cap": [float("nan"), 100.0],
+                "total_market_cap": [float("nan"), 120.0],
+            }
+        )
+    )
+    manager = SyncJobManager(warehouse=warehouse, provider=FakeProvider())
+    snapshot = manager._daily_completeness_snapshot("2026-06-17", "2026-06-18")
+
+    assert isinstance(snapshot.existing_pairs, pd.MultiIndex)
+    assert len(snapshot.existing_pairs) == 2
+    assert snapshot.existing_ohlc_complete.all()
+    assert snapshot.existing_cap_null.tolist() == [True, False]
+
+    frame = pd.DataFrame(
+        {
+            "symbol": ["000001", "000002", "000003"],
+            "trade_date": ["2026-06-17", "2026-06-18", "2026-06-18"],
+            "open": [1.0, 1.0, 1.0],
+            "high": [1.0, 1.0, 1.0],
+            "low": [1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0],
+            "volume": [1, 1, 1],
+            "float_market_cap": [100.0, 100.0, 100.0],
+            "total_market_cap": [120.0, 120.0, 120.0],
+        }
+    )
+    filled = manager._count_full_market_filled_missing_rows(frame, "2026-06-17", "2026-06-18", snapshot)
+    # 000001 06-17：已有 OHLC、原市值缺、新行带市值 → 市值补缺；
+    # 000002 06-18 与 000003 06-18：快照中不存在该对且新行 OHLC 完整 → 日线补缺。
+    assert filled.daily_rows == 2
+    assert filled.market_cap_rows == 1
+    assert filled.total == 3
+
+
+def test_fill_counter_without_snapshot_counts_new_ohlc_rows(tmp_path):
+    manager = SyncJobManager(warehouse=Warehouse(tmp_path), provider=FakeProvider())
+    frame = pd.DataFrame(
+        {
+            "symbol": ["000001"],
+            "trade_date": ["2026-06-17"],
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1],
+            "float_market_cap": [100.0],
+            "total_market_cap": [120.0],
+        }
+    )
+    filled = manager._count_full_market_filled_missing_rows(frame, None, None, None)
+    assert filled.daily_rows == 1
+    assert filled.market_cap_rows == 0
+
+
 def test_full_market_job_counts_empty_provider_rows_as_failure(tmp_path):
     class EmptyProvider(FakeProvider):
         def fetch_daily_bars(self, symbol, start_date, end_date):

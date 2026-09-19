@@ -8,6 +8,7 @@ from threading import Lock, Thread
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 
 from astock_backtester.data.cache import LocalCache
@@ -54,7 +55,13 @@ def _lifecycle_clipped_required_dates(
 @dataclass
 class DailyCompletenessSnapshot:
     complete_symbols: set[str]
-    existing_by_pair: pd.DataFrame  # MultiIndex (symbol, _td_norm) DataFrame
+    # 只保留 (symbol, trade_date) 对的轻量索引与两个布尔向量：fill 统计只需要
+    # “这个对在不在、OHLC 是否完整、市值是否缺失”，不需要整行数据。旧实现
+    # 存整行 MultiIndex DataFrame，且每次 flush 用 iterrows 重建几十万到上千万
+    # 对的 dict——这是全市场同步内存爆炸（10.7GB）与速率慢 8 倍的共同根因。
+    existing_pairs: pd.MultiIndex
+    existing_ohlc_complete: np.ndarray  # bool，按 existing_pairs 顺序对齐
+    existing_cap_null: np.ndarray  # bool，按 existing_pairs 顺序对齐
 
 
 @dataclass
@@ -73,7 +80,7 @@ class SyncJobManager:
     provider: object
     cache: LocalCache | None = None
     capital_flow_fetcher: Callable[[list[str], str, str], dict[str, Any]] | None = None
-    full_market_batch_size: int = 25
+    full_market_batch_size: int = 100
     full_market_workers: int = 4
     full_market_write_batch_rows: int = 25_000
     capital_flow_batch_size: int = 50
@@ -341,25 +348,52 @@ class SyncJobManager:
     def _daily_completeness_snapshot(self, start_date: str, end_date: str) -> DailyCompletenessSnapshot:
         expected_dates = effective_a_share_date_range(start_date, end_date)
         if expected_dates is None:
-            return DailyCompletenessSnapshot(complete_symbols=set(), existing_by_pair=pd.DataFrame())
+            return DailyCompletenessSnapshot(
+                complete_symbols=set(),
+                existing_pairs=pd.MultiIndex.from_arrays([np.array([], dtype=object), np.array([], dtype="datetime64[ns]")]),
+                existing_ohlc_complete=np.zeros(0, dtype=bool),
+                existing_cap_null=np.zeros(0, dtype=bool),
+            )
         frame = self.warehouse.read_daily_bars(
             start_date=expected_dates[0],
             end_date=expected_dates[1],
             require_ohlc=True,
         )
         if frame.empty or not {"symbol", "trade_date"}.issubset(frame.columns):
-            return DailyCompletenessSnapshot(complete_symbols=set(), existing_by_pair=pd.DataFrame())
+            return DailyCompletenessSnapshot(
+                complete_symbols=set(),
+                existing_pairs=pd.MultiIndex.from_arrays([np.array([], dtype=object), np.array([], dtype="datetime64[ns]")]),
+                existing_ohlc_complete=np.zeros(0, dtype=bool),
+                existing_cap_null=np.zeros(0, dtype=bool),
+            )
         required_dates = a_share_trade_dates(expected_dates[0], expected_dates[1])
         normalized = frame.copy()
         normalized["symbol"] = normalized["symbol"].astype(str)
         normalized["trade_date"] = pd.to_datetime(normalized["trade_date"], errors="coerce")
         normalized = normalized.dropna(subset=["symbol", "trade_date"])
         if normalized.empty:
-            return DailyCompletenessSnapshot(complete_symbols=set(), existing_by_pair=pd.DataFrame())
+            return DailyCompletenessSnapshot(
+                complete_symbols=set(),
+                existing_pairs=pd.MultiIndex.from_arrays([np.array([], dtype=object), np.array([], dtype="datetime64[ns]")]),
+                existing_ohlc_complete=np.zeros(0, dtype=bool),
+                existing_cap_null=np.zeros(0, dtype=bool),
+            )
         normalized["_td_norm"] = normalized["trade_date"].dt.normalize()
-        # Always build existing DataFrame (needed for filled-missing-rows counting)
+        # Always build the pair index (needed for filled-missing-rows counting).
+        # 向量化快照：不再保留整行 DataFrame，也不在 flush 时重建 pair dict。
         deduped = normalized.drop_duplicates(["symbol", "_td_norm"], keep="last")
-        existing_df = deduped.set_index(["symbol", "_td_norm"]).sort_index()
+        existing_pairs = pd.MultiIndex.from_arrays(
+            [deduped["symbol"].astype(str).to_numpy(), deduped["_td_norm"].to_numpy()],
+            names=["symbol", "trade_date"],
+        )
+        if all(column in deduped.columns for column in OHLC_COLUMNS):
+            existing_ohlc_complete = deduped[OHLC_COLUMNS].notna().all(axis=1).to_numpy(dtype=bool)
+        else:
+            existing_ohlc_complete = np.zeros(len(deduped), dtype=bool)
+        if "float_market_cap" in deduped.columns:
+            existing_cap_null = deduped["float_market_cap"].isna().to_numpy(dtype=bool)
+        else:
+            existing_cap_null = np.ones(len(deduped), dtype=bool)
 
         lifecycle: dict[str, dict[str, str | None]] = {}
         try:
@@ -377,7 +411,12 @@ class SyncJobManager:
                 )
                 if symbol_required is not None and symbol_required.issubset(actual_dates):
                     complete.add(str(symbol))
-        return DailyCompletenessSnapshot(complete_symbols=complete, existing_by_pair=existing_df)
+        return DailyCompletenessSnapshot(
+            complete_symbols=complete,
+            existing_pairs=existing_pairs,
+            existing_ohlc_complete=existing_ohlc_complete,
+            existing_cap_null=existing_cap_null,
+        )
 
     def _flush_full_market_frames(
         self,
@@ -434,32 +473,38 @@ class SyncJobManager:
         if snapshot is None:
             snapshot = self._daily_completeness_snapshot(start_date, end_date) if start_date and end_date else None
 
-        # Convert DataFrame-based snapshot back to dict for row-level lookups
-        existing_df = snapshot.existing_by_pair if snapshot is not None and not snapshot.existing_by_pair.empty else pd.DataFrame()
-        existing_by_pair: dict[tuple[str, pd.Timestamp], pd.Series] = {}
-        if not existing_df.empty:
-            for idx_tuple, row in existing_df.iterrows():
-                existing_by_pair[(str(idx_tuple[0]), idx_tuple[1])] = row
+        # 向量化统计（语义与逐行版本一致）：
+        # - 新增行（快照里没有该 (symbol, date) 的完整 OHLC 行）且新行 OHLC 完整 → 日线补缺；
+        # - 已有行 OHLC 完整但市值缺失、新行带市值 → 市值补缺。
+        # 输入已按 (symbol, trade_date) 去重，逐对只出现一次，无顺序依赖。
+        has_new_ohlc = (
+            normalized[OHLC_COLUMNS].notna().all(axis=1).to_numpy(dtype=bool)
+            if all(column in normalized.columns for column in OHLC_COLUMNS)
+            else np.zeros(len(normalized), dtype=bool)
+        )
+        if "float_market_cap" in normalized.columns:
+            new_cap_present = normalized["float_market_cap"].notna().to_numpy(dtype=bool)
+        else:
+            new_cap_present = np.zeros(len(normalized), dtype=bool)
 
         filled = FilledMissingRows()
-        for _, row in normalized.iterrows():
-            pair = (str(row["symbol"]), pd.Timestamp(row["trade_date"]).normalize())
-            existing_row = existing_by_pair.get(pair)
-            has_new_ohlc = all(column in row.index and pd.notna(row[column]) for column in OHLC_COLUMNS)
-            new_market_cap = row.get("float_market_cap", pd.NA)
-            if existing_row is None:
-                if has_new_ohlc:
-                    filled.daily_rows += 1
-                    existing_by_pair[pair] = row
-                continue
-            has_existing_ohlc = all(column in existing_row.index and pd.notna(existing_row[column]) for column in OHLC_COLUMNS)
-            existing_market_cap = existing_row.get("float_market_cap", pd.NA)
-            if not has_existing_ohlc and has_new_ohlc:
-                filled.daily_rows += 1
-            if has_existing_ohlc and pd.isna(existing_market_cap) and pd.notna(new_market_cap):
-                filled.market_cap_rows += 1
-            if has_new_ohlc or pd.notna(new_market_cap):
-                existing_by_pair[pair] = row.combine_first(existing_row)
+        if snapshot is None or len(snapshot.existing_pairs) == 0:
+            filled.daily_rows += int(has_new_ohlc.sum())
+            return filled
+        new_pairs = pd.MultiIndex.from_arrays(
+            [normalized["symbol"].astype(str).to_numpy(), normalized["trade_date"].dt.normalize().to_numpy()],
+            names=["symbol", "trade_date"],
+        )
+        position = snapshot.existing_pairs.get_indexer(new_pairs)
+        present = position >= 0
+        filled.daily_rows += int(np.logical_and(~present, has_new_ohlc).sum())
+        if present.any():
+            located = position[present]
+            was_ohlc_complete = snapshot.existing_ohlc_complete[located]
+            was_cap_null = snapshot.existing_cap_null[located]
+            filled.market_cap_rows += int(
+                np.logical_and(np.logical_and(was_ohlc_complete, was_cap_null), new_cap_present[present]).sum()
+            )
         return filled
 
     def _run_capital_flow_job(self, job_id: str, symbols: list[str], start_date: str, end_date: str) -> None:
