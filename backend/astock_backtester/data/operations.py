@@ -96,10 +96,15 @@ def build_daily_bars_coverage(
     # Warehouse.coverage() 的累计缺口口径矛盾（覆盖表说没缺、同步却要补）。
     derived_window_end = requested_end_date
     if derived_window_end is None and warehouse is not None and used_warehouse:
-        for item in warehouse.coverage():
-            if item.dataset == "daily_bars" and item.end_date is not None:
-                derived_window_end = pd.Timestamp(item.end_date)
-                break
+        try:
+            for item in warehouse.coverage():
+                if item.dataset == "daily_bars" and item.end_date is not None:
+                    derived_window_end = pd.Timestamp(item.end_date)
+                    break
+        except Exception as exc:  # noqa: BLE001 - 损坏分区不应让整个覆盖端点失败
+            logger.warning(
+                "warehouse coverage scan failed; per-symbol coverage falls back to its own last row: %s", exc
+            )
     for symbol, frame in bars.groupby("symbol", sort=True):
         frame = frame.sort_values("trade_date")
         data_start_date = frame["trade_date"].min()
@@ -178,11 +183,15 @@ def fetch_daily_bars_into_cache(
     end_date: str,
     warehouse: Warehouse | None = None,
     capital_flow_fetcher: CapitalFlowFetcher | None = None,
+    refresh_coverage: bool = True,
 ) -> DataOperationResult:
+    """``refresh_coverage=False`` 供 AI 写路径使用：``coverage()`` 是全仓
+    60 秒级重扫，逐只循环补齐时 N 次调用就 N 次重扫；AI 侧改用
+    ``DataServiceState.start_coverage_refresh`` 的后台刷新，这里不再同步算。"""
     requested_symbols = [str(symbol) for symbol in symbols]
     effective_range = effective_a_share_date_range(start_date, end_date)
     if effective_range is None:
-        coverage = _safe_coverage(cache, warehouse)
+        coverage = _safe_coverage(cache, warehouse) if refresh_coverage else []
         return DataOperationResult(
             status="ok",
             imported_rows=0,
@@ -290,7 +299,7 @@ def fetch_daily_bars_into_cache(
                     message=f"Capital-flow crawler failed for symbols: {', '.join(failed_symbols)}",
                 )
             )
-    coverage = _safe_coverage(cache, warehouse)
+    coverage = _safe_coverage(cache, warehouse) if refresh_coverage else []
     return DataOperationResult(
         status="partial" if missing_symbols or failures else "ok",
         imported_rows=int(len(frame)),

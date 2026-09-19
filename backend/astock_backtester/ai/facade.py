@@ -10,7 +10,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ from astock_backtester.ai.condition_dsl import parse_conditions_with_llm
 from astock_backtester.ai.config import AiConfig, AiConfigStore, ai_base_dir_from_cache_dir
 from astock_backtester.ai.context import ContextBudget, ToolResultStore
 from astock_backtester.ai.digest import DigestEngine, DigestStore
-from astock_backtester.ai.errors import AiError, AiNotConfigured, AiSessionBusy, ai_error_code
+from astock_backtester.ai.errors import AiError, AiNotConfigured, AiSessionBusy, AiSessionNotFound, ai_error_code
 from astock_backtester.ai.insights import HEARTBEAT_INTERVAL_SECONDS, EventBroker, InsightEngine
 from astock_backtester.ai.llm_client import OpenAiCompatibleClient
 from astock_backtester.ai.memory import MemoryStore, plan_memory_ops
@@ -33,12 +33,28 @@ from astock_backtester.ai.sessions import SessionStore, sanitize_session_id
 from astock_backtester.ai.tools.astock_data_tools import build_astock_data_tools
 from astock_backtester.ai.tools.local_tools import build_local_tools
 from astock_backtester.ai.tools.query_tools import build_query_tools
-from astock_backtester.ai.tools.registry import ToolRegistry
+from astock_backtester.ai.tools.registry import ToolRegistry, build_read_result_tool
 
 # 同一会话上一轮仍在生成时，新一轮最多等待多久（用户点“停止”后 worker 仍在收尾）。
 AI_SESSION_LOCK_TIMEOUT_SECONDS = 90.0
+# 事件流静默多久就发一个 heartbeat 保活（前端空闲超时是 180 秒，留足余量）。
+AI_STREAM_HEARTBEAT_SECONDS = 15.0
 # 会话锁字典上限：超过后淘汰未被持有的锁，避免长跑进程内存只增不减。
 AI_MAX_SESSION_LOCKS = 512
+
+# 中国无夏令时，固定 +08:00 即可；不用 zoneinfo 是因为 Windows 上它依赖 tzdata 包。
+BEIJING_TZ = timezone(timedelta(hours=8))
+_WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def today_context(now: datetime | None = None) -> str:
+    """模型不看系统时钟：不给当天日期，"今天/近期"只能靠猜，猜错就查空再编数。"""
+    local = now or datetime.now(BEIJING_TZ)
+    return (
+        f"## 当前时间\n今天是 {local:%Y-%m-%d}（{_WEEKDAY_NAMES[local.weekday()]}，北京时间）。"
+        "“今天/昨天/近期”一律以此为基准；本地数据仓的最新交易日必须用工具确认"
+        "（realtime_market_snapshot 或 query_warehouse_sql），不要凭日期推断行情。"
+    )
 
 
 class _SessionLockEntry:
@@ -78,6 +94,7 @@ class AiService:
         self._registry.register_all(build_local_tools(backend))
         self._registry.register_all(build_astock_data_tools(backend))
         self._registry.register_all(build_query_tools(backend))
+        self._registry.register(build_read_result_tool(self._result_store))
         self._knowledge = KnowledgeIndex(
             embedder=self._model.embed,
             cache_dir=base_dir / "AI缓存",
@@ -190,6 +207,7 @@ class AiService:
             api_style=str(payload.get("api_style", current.api_style)),
             research_style=str(payload.get("research_style", current.research_style)),
             temperature=float(payload.get("temperature", current.temperature)),
+            max_tokens=int(payload.get("max_tokens", current.max_tokens)),
             max_steps=int(payload.get("max_steps", current.max_steps)),
             insights_enabled=bool(payload.get("insights_enabled", current.insights_enabled)),
             insight_max_per_hour=int(payload.get("insight_max_per_hour", current.insight_max_per_hour)),
@@ -299,7 +317,7 @@ class AiService:
                 lock_held = True
             yield {"type": "session", "session_id": session_id, "title": session.get("title")}
 
-            system_prompt = build_system_prompt(self._knowledge.is_ready(), config.research_style)
+            system_prompt = f"{build_system_prompt(self._knowledge.is_ready(), config.research_style)}\n\n{today_context()}"
             profile = self._memory.profile_context()
             if profile:
                 system_prompt += f"\n\n## 用户画像（长期记忆，越用越准）\n{profile}"
@@ -361,7 +379,14 @@ class AiService:
                 release_session_lock()
                 raise
             while True:
-                event = events.get()
+                try:
+                    event = events.get(timeout=AI_STREAM_HEARTBEAT_SECONDS)
+                except queue.Empty:
+                    # 一次工具调用（尤其全市场多年的回测）可以几分钟不产生任何事件，
+                    # 而前端按"多久没收到字节"判定空闲超时：静默会被误杀成"回答中断"，
+                    # 之后 worker 仍在跑并持着会话锁，用户下一次发送要白等 90 秒。
+                    yield {"type": "heartbeat", "session_id": session_id}
+                    continue
                 if event is None:
                     break
                 yield event
@@ -396,10 +421,46 @@ class AiService:
             pass
 
     def delete_session(self, session_id: str) -> bool:
-        return self._sessions.delete(session_id)
+        """Delete a stored session.
+
+        Refuses while that session still has a turn generating: the worker saves
+        the session in its ``finally`` block, which would resurrect the file
+        right after the delete and leave a "deleted" transcript on screen.
+
+        忙判定与 unlink 之间存在毫秒级 TOCTOU（判定后新请求可抢锁开跑），
+        这是 best-effort 边界：删除后的陈旧 session_id 在 worker 收尾时会落到
+        全新 uuid 会话，不会复活已删除的文件。
+        """
+        safe = sanitize_session_id(session_id)
+        if safe is None:
+            return False
+        with self._session_locks_guard:
+            entry = self._session_locks.get(safe)
+            busy = entry is not None and entry.lock.locked()
+        if busy:
+            raise AiSessionBusy("该会话仍在生成回答，请先停止后再删除。")
+        return self._sessions.delete(safe)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         return self._sessions.list_sessions()
+
+    def session_view(self, session_id: str) -> dict[str, Any]:
+        """Read one stored session back for the UI.
+
+        Only display turns cross the wire: protocol messages, the pending
+        archive and the rolling summary stay server-side, so a restored
+        transcript cannot be edited into model instructions.
+        """
+        session = self._sessions.get(session_id) if session_id else None
+        if session is None:
+            raise AiSessionNotFound("会话不存在或已被删除，将从新会话开始。")
+        return {
+            "session_id": str(session.get("session_id")),
+            "title": str(session.get("title") or "新会话"),
+            "created_at": session.get("created_at"),
+            "updated_at": session.get("updated_at"),
+            "display": session.get("display") or [],
+        }
 
     # --------------------------------------------------------------- reports
     def list_reports(self) -> dict[str, Any]:

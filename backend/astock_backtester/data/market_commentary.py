@@ -5,8 +5,8 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from astock_backtester.data.briefing import _is_noisy_content_line
 from astock_backtester.data.realtime import is_valid_full_market_breadth
+from astock_backtester.data.text_cleaning import is_noisy_market_line
 from astock_backtester.models import (
     MarketBriefingResponse,
     MarketCommentaryPoint,
@@ -352,9 +352,9 @@ class MarketCommentaryProvider:
         if briefing is None:
             return None
 
-        basis_parts = [briefing.summary.strip()] if briefing.summary.strip() and not _is_noisy_content_line(briefing.summary) else []
+        basis_parts = [briefing.summary.strip()] if briefing.summary.strip() and not is_noisy_market_line(briefing.summary) else []
         for section in briefing.sections[:2]:
-            if section.content and not _is_noisy_content_line(section.content):
+            if section.content and not is_noisy_market_line(section.content):
                 basis_parts.append(section.content.strip())
         basis = " ".join(part for part in basis_parts if part)
         if not basis:

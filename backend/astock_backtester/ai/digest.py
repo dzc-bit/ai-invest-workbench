@@ -5,7 +5,7 @@ a structured briefing, stored under 运行产物/AI简报 and exposed via ``GET
 Sources are the existing read-only tools (news providers, limit-up pool,
 yesterday-limit performance, realtime snapshot, fupan/zaopan) — richer than the
 raw news list alone, and every synthesized item is labelled ``ai-agent`` so it
-can never be mistaken for a raw market-data module (AGENT必读 module boundary).
+can never be mistaken for a raw market-data module (AGENTS.md module boundary).
 Runs automatically once per service start (when an LLM is configured) and then
 on a fixed interval; failures are logged and never fatal.
 """
@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from astock_backtester.ai.context import wrap_untrusted
 from astock_backtester.ai.insights import EventBroker
 from astock_backtester.ai.prompts import build_digest_messages
 
@@ -169,9 +170,16 @@ class DigestEngine:
 
     def _loop(self) -> None:
         # 启动即先跑一次（服务启动触发），之后按固定间隔刷新。
-        self.run_once()
-        while not self._stop.wait(self._interval):
-            self.run_once()
+        while True:
+            try:
+                self.run_once()
+            except Exception as exc:  # noqa: BLE001 - the engine must never crash the service
+                try:
+                    self._backend.log("warning", f"ai digest engine run failed: {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._stop.wait(self._interval):
+                break
 
     # ------------------------------------------------------------------ run
     def run_once(self, *, force: bool = False) -> dict[str, Any]:
@@ -215,7 +223,7 @@ class DigestEngine:
                             "title": item.title,
                             "digest": item.summary,
                             "related_symbols": item.symbols,
-                            "source": "ai-agent",
+                            "source": "ai-insight",
                             "disclaimer": "AI 聚合内容，仅供辅助观察，不构成投资建议",
                         },
                         "timestamp": datetime.now(UTC).isoformat(),
@@ -227,13 +235,18 @@ class DigestEngine:
                 pass
             return {"ok": True, "items": len(parsed)}
 
+    def _crawled_block(self, label: str, body: str) -> str:
+        # 新闻标题、涨停池、复盘正文都来自上游站点：进模型上下文前必须套
+        # 不可信分隔符（AGENTS.md §15-8）——工具路径如此，定时引擎路径同样如此。
+        return f"{label}\n{wrap_untrusted(body)}"
+
     def _gather_sources(self) -> str:
         sections: list[str] = []
         try:
             news = self._backend.news_provider.latest_news()
             headlines = [f"- {item.title}（{item.source}）" for item in news.items[:12]]
             if headlines:
-                sections.append("【新闻/电报】\n" + "\n".join(headlines))
+                sections.append(self._crawled_block("【新闻/电报】", "\n".join(headlines)))
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -244,14 +257,17 @@ class DigestEngine:
                 lines = [
                     f"- {row['name']}（{row['symbol']}）{row['zt_stat']} 行业:{row['industry']}" for row in zt[:10]
                 ]
-                sections.append(f"【涨停池·共 {len(zt)} 只】\n" + "\n".join(lines))
+                sections.append(self._crawled_block(f"【涨停池·共 {len(zt)} 只】", "\n".join(lines)))
             yzt = fetch_limit_up_rows("yzt")
             if yzt:
                 avg_change = sum(row["change_pct"] for row in yzt) / len(yzt)
                 strongest = max(yzt, key=lambda row: row["change_pct"])
                 sections.append(
-                    f"【昨日涨停今日表现】共 {len(yzt)} 只，平均涨幅 {avg_change:+.2f}%，"
-                    f"最强 {strongest['name']} {strongest['change_pct']:+.2f}%"
+                    self._crawled_block(
+                        "【昨日涨停今日表现】",
+                        f"共 {len(yzt)} 只，平均涨幅 {avg_change:+.2f}%，"
+                        f"最强 {strongest['name']} {strongest['change_pct']:+.2f}%",
+                    )
                 )
         except Exception:  # noqa: BLE001
             pass
@@ -264,13 +280,13 @@ class DigestEngine:
             if breadth is not None:
                 index_lines.append(f"- 红盘 {breadth.up} / 全市场 {breadth.total}（{snapshot.status}）")
             if index_lines:
-                sections.append("【实时行情】\n" + "\n".join(index_lines))
+                sections.append(self._crawled_block("【实时行情】", "\n".join(index_lines)))
         except Exception:  # noqa: BLE001
             pass
         try:
             fupan = self._backend.briefing_provider.latest_fupan()
             if fupan.summary:
-                sections.append(f"【同花顺复盘】{fupan.summary[:400]}")
+                sections.append(self._crawled_block("【同花顺复盘】", fupan.summary[:400]))
         except Exception:  # noqa: BLE001
             pass
         return "\n\n".join(sections)

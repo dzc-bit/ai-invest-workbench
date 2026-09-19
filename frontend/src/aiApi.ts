@@ -13,6 +13,8 @@ import type {
   AiNewsDigest,
   AiOverfitResult,
   AiReportsResponse,
+  AiSessionDetail,
+  AiSessionsResponse,
   AiStatus
 } from "./aiTypes";
 import type { BacktestSettingsConfig, OptimizeStreamHandlers, StrategyConfig } from "./types";
@@ -26,6 +28,9 @@ import {
   mockAiOptimizeEvents,
   mockAiReports,
   mockAiSaveConfig,
+  mockAiSessionDelete,
+  mockAiSessionDetail,
+  mockAiSessions,
   mockAiStatus
 } from "./aiMocks";
 
@@ -135,6 +140,43 @@ export async function loadAiReportFile(baseUrl: string, name: string): Promise<s
     throw new BackendError(typeof json.code === "string" ? json.code : "request_failed", "AI 报告读取失败");
   }
   return String(json.content ?? "");
+}
+
+export async function loadAiSessions(baseUrl: string): Promise<AiSessionsResponse> {
+  if (!isTauriRuntime()) {
+    return mockAiSessions();
+  }
+  const response = await fetch(`${baseUrl}/ai/sessions`);
+  const json = await response.json();
+  if (!response.ok) {
+    throw new BackendError(typeof json.code === "string" ? json.code : "request_failed", "历史会话列表读取失败");
+  }
+  return json as AiSessionsResponse;
+}
+
+export async function loadAiSession(baseUrl: string, sessionId: string): Promise<AiSessionDetail> {
+  if (!isTauriRuntime()) {
+    return mockAiSessionDetail(sessionId);
+  }
+  const response = await fetch(`${baseUrl}/ai/session?session_id=${encodeURIComponent(sessionId)}`);
+  const json = await response.json();
+  if (!response.ok) {
+    throw new BackendError(typeof json.code === "string" ? json.code : "request_failed", "历史对话回读失败");
+  }
+  return json as AiSessionDetail;
+}
+
+export async function deleteAiSession(baseUrl: string, sessionId: string): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    return mockAiSessionDelete(sessionId);
+  }
+  const result = await aiPostJson<{ deleted?: boolean }>(
+    baseUrl,
+    "/ai/session/delete",
+    { session_id: sessionId },
+    "历史会话删除失败"
+  );
+  return result.deleted === true;
 }
 
 export async function aiOverfitCheck(

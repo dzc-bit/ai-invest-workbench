@@ -143,7 +143,7 @@ function isYesterdaySectorTracking(snapshot: RealtimeMarketSnapshot | null): boo
 
 export function MarketDashboard({ snapshot, isLoading = false, refreshMeta }: Props) {
   // 本轮快照缺红绿家数时沿用最近一次有数据的宽度并明确标注“沿用”，
-  // 避免部分成功场景下长时间显示 "--"（AGENT必读 §5：缓存只能以 stale 标注使用）。
+  // 避免部分成功场景下长时间显示 "--"（AGENTS.md §5：缓存只能以 stale 标注使用）。
   const lastBreadthRef = useRef<{ breadth: MarketBreadth; at: string } | null>(null);
   if (snapshot?.breadth) {
     lastBreadthRef.current = { breadth: snapshot.breadth, at: snapshot.updated_at };

@@ -34,7 +34,7 @@ python -m pytest tests -q
 .\.tools\node-v20.18.1-win-x64\npm.cmd run test:ui -- --run
 ```
 
-6. Rust 测试（必须先设置工具链环境变量，见 `AGENT必读.md` §13）：
+6. Rust 测试（必须先设置工具链环境变量，见 `AGENTS.md` §13）：
 
 ```powershell
 $env:CARGO_HOME='D:\New project 6\.tools\cargo-home'

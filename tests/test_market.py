@@ -15,6 +15,7 @@ from astock_backtester.data.briefing import (
 )
 from astock_backtester.data.cls_finance import (
     ClsFinanceProvider,
+    _parse_ths_market_degree,
     _resolve_node_executable,
     _resolve_ths_cookie_worker,
     _subprocess_startup_kwargs,
@@ -1324,6 +1325,55 @@ def test_market_briefing_provider_labels_zaopan_fallback_source_when_ths_unavail
     assert response.sections
     assert response.diagnostics[0] == "同花顺早盘读取失败：zaopan blocked"
     assert any("本地简短防守早盘" in item for item in response.diagnostics)
+
+
+def test_market_briefing_provider_zaopan_empty_parse_falls_back_instead_of_claiming_success():
+    """页面 200 但选择器全落空（改版/风控空壳）时不能标 ths-zaopan 输出“已读取”套话。
+
+    否则“同花顺早盘已读取，重点关注……”会被 AI 复盘报告当早盘事实素材。
+    """
+    html = """
+    <html><body>
+      <div class="layout"><p>同花顺早盘页改版后的空壳，没有任何已知结构。</p></div>
+    </body></html>
+    """
+
+    response = MarketBriefingProvider(requester=lambda *args, **kwargs: FakeHtmlResponse(html)).latest_zaopan()
+
+    assert response.kind == "zaopan"
+    assert response.source in ("ths-zaopan+market-fallback", "ths-zaopan+local-brief")
+    assert "已读取，重点关注" not in response.summary
+    assert any("未解析到有效内容" in item for item in response.diagnostics)
+
+
+def test_market_briefing_provider_zaopan_summary_noise_line_is_dropped():
+    """`.yestoday` 里的时间戳串/数字汤不算真实早盘摘要——被过滤后摘要用正文兜底。"""
+    html = """
+    <html><body>
+      <div class="yestoday">2026-09-18 09:31 2026-09-18 15:00 板块名称 最新涨幅 1293.69</div>
+      <div class="content-main-fl">
+        <p>【盘前要点】A股三大指数昨夜美股收跌，今日关注量能变化。</p>
+      </div>
+    </body></html>
+    """
+
+    response = MarketBriefingProvider(requester=lambda *args, **kwargs: FakeHtmlResponse(html)).latest_zaopan()
+
+    assert response.source == "ths-zaopan"
+    assert response.summary.startswith("【盘前要点】")
+    assert "1293.69" not in response.summary
+
+
+def test_parse_ths_market_degree_ignores_attribute_hits_and_zero_placeholder():
+    """§5：标签属性里的数字不是评分；0 分是占位值，与“没解析到”同等对待。"""
+    attribute_page = '<html><body><div data-dppj_data="85">大盘评分 6.5</div></body></html>'
+    assert _parse_ths_market_degree(attribute_page) is None
+
+    inline_script = '<html><head><script>var dppj_data = 7.2;</script></head><body></body></html>'
+    assert _parse_ths_market_degree(inline_script) == 7.2
+
+    assert _parse_ths_market_degree('{"dppj_data": 0}') is None
+    assert _parse_ths_market_degree('{"dppj_data": 7.1}') == 7.1
 
 
 # ---------------------------------------------------------------------------

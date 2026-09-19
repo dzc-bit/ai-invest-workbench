@@ -266,6 +266,59 @@
   white-space: nowrap;
 }
 
+/* 历史对话：整块可点的会话条目 + 右侧删除 */
+.ai-history ul {
+  max-height: 240px;
+}
+
+.ai-history-empty {
+  margin: 4px 0 0;
+  color: var(--ink-3);
+  font-size: var(--text-xs);
+}
+
+.ai-session-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 10px;
+}
+
+.ai-session-item.current {
+  border-color: var(--ai-tint);
+  background: var(--ai-wash);
+}
+
+.ai-session-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.ai-session-open:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.ai-session-open strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-session-open small {
+  color: var(--ink-3);
+  font-size: var(--text-2xs);
+}
+
 .ai-messages {
   flex: 1;
   overflow-y: auto;

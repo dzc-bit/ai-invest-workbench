@@ -11,15 +11,29 @@ vi.mock("../aiApi", () => ({
   runAiChatStream: vi.fn(),
   openAiEventStream: vi.fn(),
   loadAiReports: vi.fn(),
-  loadAiReportFile: vi.fn()
+  loadAiReportFile: vi.fn(),
+  loadAiSessions: vi.fn(),
+  loadAiSession: vi.fn(),
+  deleteAiSession: vi.fn()
 }));
 
-import { loadAiReportFile, loadAiReports, loadAiStatus, runAiChatStream } from "../aiApi";
+import {
+  deleteAiSession,
+  loadAiReportFile,
+  loadAiReports,
+  loadAiSession,
+  loadAiSessions,
+  loadAiStatus,
+  runAiChatStream
+} from "../aiApi";
 
 const mockedLoadStatus = vi.mocked(loadAiStatus);
 const mockedRunChat = vi.mocked(runAiChatStream);
 const mockedLoadReports = vi.mocked(loadAiReports);
 const mockedLoadReportFile = vi.mocked(loadAiReportFile);
+const mockedLoadSessions = vi.mocked(loadAiSessions);
+const mockedLoadSession = vi.mocked(loadAiSession);
+const mockedDeleteSession = vi.mocked(deleteAiSession);
 
 const configuredStatus = {
   configured: true,
@@ -69,6 +83,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockedLoadStatus.mockResolvedValue(configuredStatus);
   mockedLoadReports.mockResolvedValue({ items: [] });
+  mockedLoadSessions.mockResolvedValue({ items: [] });
+  mockedDeleteSession.mockResolvedValue(true);
 });
 
 describe("AiAssistantPanel", () => {
@@ -188,5 +204,122 @@ describe("AiAssistantPanel", () => {
     await user.type(composer, "行情如何");
     await user.click(screen.getByRole("button", { name: "发送" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("模型服务调用失败");
+  });
+
+  it("clears the composer once the message is sent", async () => {
+    const user = userEvent.setup();
+    scriptChatStream("市场偏暖。");
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    const composer = await screen.findByPlaceholderText(/帮我看看 600519/);
+    await user.type(composer, "行情如何");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByText(/市场偏暖/)).toBeTruthy());
+    expect(composer).toHaveValue("");
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+  });
+
+  it("sends each message exactly once when Enter is pressed twice", async () => {
+    const user = userEvent.setup();
+    scriptChatStream("市场偏暖。");
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    const composer = await screen.findByPlaceholderText(/帮我看看 600519/);
+    await user.type(composer, "行情如何{Enter}");
+    await waitFor(() => expect(composer).toHaveValue(""));
+    await user.type(composer, "{Enter}");
+    await waitFor(() => expect(screen.getByText(/市场偏暖/)).toBeTruthy());
+    expect(mockedRunChat).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the latest stored conversation when the drawer opens", async () => {
+    mockedLoadSessions.mockResolvedValue({
+      items: [{ session_id: "s-1", title: "600519 诊断", updated_at: "2026-09-18T10:00:00Z", message_count: 2 }]
+    });
+    mockedLoadSession.mockResolvedValue({
+      session_id: "s-1",
+      title: "600519 诊断",
+      display: [
+        { role: "user", content: "帮我看看 600519" },
+        { role: "assistant", content: "茅台近 30 日 +5.2%。" }
+      ]
+    });
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    expect(await screen.findByText(/茅台近 30 日/)).toBeTruthy();
+    expect(mockedLoadSession).toHaveBeenCalledWith("http://x", "s-1");
+    expect(screen.getByText("历史对话（1）")).toBeTruthy();
+  });
+
+  it("keeps follow-ups inside the restored session so the agent keeps its history", async () => {
+    const user = userEvent.setup();
+    mockedLoadSessions.mockResolvedValue({
+      items: [{ session_id: "s-1", title: "600519 诊断", updated_at: null, message_count: 2 }]
+    });
+    mockedLoadSession.mockResolvedValue({
+      session_id: "s-1",
+      title: "600519 诊断",
+      display: [
+        { role: "user", content: "帮我看看 600519" },
+        { role: "assistant", content: "茅台近 30 日 +5.2%。" }
+      ]
+    });
+    scriptChatStream("资金面以主力净流入为主。");
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    const composer = await screen.findByPlaceholderText(/帮我看看 600519/);
+    await user.type(composer, "再看下资金面{Enter}");
+    await waitFor(() => expect(mockedRunChat).toHaveBeenCalled());
+    expect(mockedRunChat.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ message: "再看下资金面", session_id: "s-1" })
+    );
+  });
+
+  it("switches between stored conversations and starts a fresh one", async () => {
+    const user = userEvent.setup();
+    mockedLoadSessions.mockResolvedValue({
+      items: [
+        { session_id: "s-a", title: "会话 A", updated_at: null, message_count: 2 },
+        { session_id: "s-b", title: "会话 B", updated_at: null, message_count: 2 }
+      ]
+    });
+    mockedLoadSession.mockImplementation(async (_baseUrl: string, sessionId: string) => ({
+      session_id: sessionId,
+      title: sessionId === "s-a" ? "会话 A" : "会话 B",
+      display: [{ role: "assistant", content: `${sessionId} 的回答` }]
+    }));
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    expect(await screen.findByText("s-a 的回答")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /^会话 B/ }));
+    await waitFor(() => expect(screen.getByText("s-b 的回答")).toBeTruthy());
+    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    expect(screen.queryByText(/的回答/)).toBeNull();
+    expect(screen.getByText("问行情、评个股、写策略、解读回测")).toBeTruthy();
+  });
+
+  it("deletes a stored conversation and resets the transcript with it", async () => {
+    const user = userEvent.setup();
+    mockedLoadSessions.mockResolvedValue({
+      items: [{ session_id: "s-a", title: "会话 A", updated_at: null, message_count: 2 }]
+    });
+    mockedLoadSession.mockResolvedValue({
+      session_id: "s-a",
+      title: "会话 A",
+      display: [{ role: "assistant", content: "s-a 的回答" }]
+    });
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    await screen.findByText("s-a 的回答");
+    await user.click(screen.getByRole("button", { name: "删除会话 会话 A" }));
+    await waitFor(() => expect(mockedDeleteSession).toHaveBeenCalledWith("http://x", "s-a"));
+    expect(screen.queryByText("历史对话（1）")).toBeNull();
+    expect(screen.queryByText("s-a 的回答")).toBeNull();
   });
 });

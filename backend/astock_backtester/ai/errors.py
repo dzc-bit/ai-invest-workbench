@@ -37,6 +37,13 @@ class AiSessionBusy(AiError):
     code = "ai_session_busy"
 
 
+class AiSessionNotFound(AiError):
+    """Raised when a stored session is requested but no longer exists
+    (never created, already deleted, or its JSON file is unreadable)."""
+
+    code = "ai_session_not_found"
+
+
 def ai_error_code(exc: Exception) -> str:
     if isinstance(exc, AiError):
         return exc.code

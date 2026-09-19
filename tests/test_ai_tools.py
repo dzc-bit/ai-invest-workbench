@@ -335,3 +335,213 @@ def test_limit_up_pool_parses_rows(monkeypatch):
     item = execution.payload["items"][0]
     assert item["price"] == 1523.0 and item["zt_stat"] == "3天2板"
     assert "连板2" in execution.summary
+
+
+def test_read_tool_result_pages_a_stored_rowset():
+    """摘要写着"另有 M 行未展开"，模型就必须能按行把剩下的取回来。"""
+    from astock_backtester.ai.context import ToolResult, ToolResultStore
+    from astock_backtester.ai.tools.registry import build_read_result_tool
+
+    store = ToolResultStore()
+    rows = [{"symbol": f"{index:06d}", "close": 10.0 + index} for index in range(50)]
+    store.put(
+        ToolResult(
+            call_id="c1",
+            name="query_warehouse_sql",
+            arguments={},
+            payload={"ok": True, "rows": rows},
+            summary="ignored",
+        )
+    )
+    registry = ToolRegistry()
+    registry.register(build_read_result_tool(store))
+
+    first = registry.execute("read_tool_result", '{"call_id": "c1"}')
+    assert first.ok is True
+    assert first.payload["shown_rows"] == 40 and first.payload["more_rows"] == 10
+    assert "第 1~40 行（共 50 行）" in first.summary
+    assert "还剩 10 行未读，可继续 offset=40" in first.summary
+
+    second = registry.execute("read_tool_result", '{"call_id": "c1", "offset": 40}')
+    assert second.payload["shown_rows"] == 10 and second.payload["more_rows"] == 0
+    assert "该结果已全部读完" in second.summary
+
+    gone = registry.execute("read_tool_result", '{"call_id": "nope"}')
+    assert gone.ok is False and gone.code == "result_evicted"
+    assert "不是数据不存在" in gone.summary
+
+
+def test_data_health_report_exposes_rows_and_coverage_summary():
+    backend = FakeBackend()
+    backend.warehouse.gap_profile = {
+        "available": True,
+        "window": {"start_date": "2026-06-01", "end_date": "2026-06-04", "partitions": ["year=2025", "year=2026"]},
+        "daily_bars": {
+            "symbols": 5463,
+            "symbols_current": 74,
+            "symbols_stale": 5389,
+            "delisted_symbols": 12,
+            "stale_distribution": [{"last_date": "2026-07-14", "symbols": 3084}],
+            "thin_days": [],
+        },
+        "market_cap": {"symbols": 5463, "delisted_symbols": 12, "stale_distribution": []},
+        "capital_flow": {"symbols": 5463, "delisted_symbols": 10, "stale_distribution": []},
+    }
+    backend.coverage_snapshot = lambda: [
+        SimpleNamespace(dataset="daily_bars", symbols=5463, missing_rows=120_000, end_date="2026-09-18")
+    ]
+    registry = ToolRegistry()
+    registry.register_all(build_local_tools(backend))
+    execution = registry.execute("data_health_report", "{}")
+    assert execution.ok is True
+    # 停更分布行集化（可 read_tool_result 续读）+ 覆盖缺口汇总 + 退市剔除说明
+    rows = execution.payload["rows"]
+    assert {"dataset": "日线", "last_date": "2026-07-14", "symbols": 3084} in rows
+    assert execution.payload["coverage"][0]["missing_rows"] == 120_000
+    assert "退市" in execution.summary and "不要建议补齐" in execution.summary
+    assert "累计真实缺口" in execution.summary
+
+
+def test_data_health_report_distinguishes_corrupt_from_missing():
+    backend = FakeBackend()
+
+    class CorruptWarehouse(FakeWarehouse):
+        def data_gap_profile(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("Parquet magic bytes not found")
+
+        # 与真实 Warehouse 一致：corrupt_partitions 是 @property，不是方法。
+        @property
+        def corrupt_partitions(self) -> dict[str, str]:
+            return {"year=2025/daily_bars.parquet": "eof"}
+
+    backend.warehouse = CorruptWarehouse(backend)
+    registry = ToolRegistry()
+    registry.register_all(build_local_tools(backend))
+    execution = registry.execute("data_health_report", "{}")
+    assert execution.ok is False
+    assert execution.code == "warehouse_corrupt"
+    assert "year=2025/daily_bars.parquet" in execution.payload["corrupt_partitions"][0]
+    assert "先" in execution.payload["hint"]
+
+
+def test_write_tools_are_declared_non_read_only():
+    """并发判定以 registry 的 read_only 为单一事实来源：写工具漏登记就会被并发。"""
+    from astock_backtester.ai.agent import SERIAL_TOOLS
+    from astock_backtester.ai.tools.query_tools import build_query_tools
+
+    backend = FakeBackend()
+    registry = ToolRegistry()
+    registry.register_all(build_local_tools(backend))
+    registry.register_all(build_query_tools(backend))
+    for name in registry.names():
+        tool = registry.get(name)
+        assert tool is not None
+        if not tool.read_only:
+            assert name in SERIAL_TOOLS, f"{name} 是写工具但不在 SERIAL_TOOLS"
+    assert registry.get("update_stock_data").read_only is False
+    assert registry.get("run_strategy_backtest").read_only is False
+
+
+def test_update_stock_data_capital_flow_mode_uses_backfill_chain(monkeypatch):
+    """资金流补齐走 /fetch/capital-flow 同款链路（跳过已完整 + 独立行），且不同步重扫 coverage。"""
+    from astock_backtester.ai.tools.query_tools import build_query_tools
+
+    captured: dict[str, Any] = {}
+
+    def fake_fetch(cache, capital_flow_fetcher, symbols, start_date, end_date, warehouse=None, refresh_coverage=True):
+        captured["symbols"] = list(symbols)
+        captured["refresh_coverage"] = refresh_coverage
+        return SimpleNamespace(
+            logs=[],
+            status="ok",
+            imported_rows=3,
+            fetched_symbols=["600519"],
+            skipped_symbols=["600519"],
+            missing_symbols=[],
+            failures=[{"symbol": "000001", "error": "连接超时"}],
+        )
+
+    monkeypatch.setattr("astock_backtester.data.operations.fetch_capital_flow_into_cache", fake_fetch)
+    registry = ToolRegistry()
+    registry.register_all(build_query_tools(FakeBackend()))
+    execution = registry.execute(
+        "update_stock_data",
+        '{"mode": "capital_flow", "symbols": ["600519"], "start_date": "2026-06-01", "end_date": "2026-06-30"}',
+    )
+    assert execution.ok is True
+    assert execution.payload["mode"] == "capital_flow"
+    assert captured["symbols"] == ["600519"]
+    assert captured["refresh_coverage"] is False
+    # 失败明细行集化：模型才知道缺谁、为什么
+    assert {"symbol": "000001", "reason": "连接超时"} in execution.payload["rows"]
+    assert "000001" in execution.summary
+
+
+def test_update_stock_data_daily_mode_skips_sync_coverage_rescan(monkeypatch):
+    from astock_backtester.ai.tools.query_tools import build_query_tools
+
+    captured: dict[str, Any] = {}
+
+    def fake_fetch(cache, fetcher, symbols, start_date, end_date, warehouse=None, capital_flow_fetcher=None, refresh_coverage=True):
+        captured["refresh_coverage"] = refresh_coverage
+        return SimpleNamespace(
+            logs=[],
+            status="ok",
+            imported_rows=10,
+            fetched_symbols=["600519"],
+            missing_symbols=[],
+            skipped_symbols=[],
+            failures=[],
+        )
+
+    monkeypatch.setattr("astock_backtester.data.operations.fetch_daily_bars_into_cache", fake_fetch)
+    backend = FakeBackend()
+    backend.coverage_refresh_calls: list[bool] = []
+    backend.start_coverage_refresh = lambda *, force=False: backend.coverage_refresh_calls.append(force)
+    registry = ToolRegistry()
+    registry.register_all(build_query_tools(backend))
+    execution = registry.execute(
+        "update_stock_data",
+        '{"symbols": ["600519"], "start_date": "2026-06-01", "end_date": "2026-06-30"}',
+    )
+    assert execution.ok is True
+    assert captured["refresh_coverage"] is False
+    assert backend.coverage_refresh_calls == [True]
+
+
+def test_update_stock_data_full_market_capital_flow_starts_background_job():
+    from datetime import date
+
+    from astock_backtester.ai.tools.query_tools import build_query_tools
+
+    backend = FakeBackend()
+    started: dict[str, Any] = {}
+
+    class FakeSyncManager:
+        def start_capital_flow_backfill(self, symbols: list[str], start_date: str, end_date: str):
+            started["symbols"] = list(symbols)
+            return SimpleNamespace(
+                job_id="job-1",
+                mode="capital_flow_backfill",
+                status="running",
+                total_symbols=len(symbols),
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 30),
+            )
+
+    class GapWarehouse(FakeWarehouse):
+        def read_capital_flow_missing_symbols(self, start_date: str, end_date: str) -> set[str]:
+            return {"600002", "600001"}
+
+    backend.warehouse = GapWarehouse(backend)
+    backend.sync_manager = FakeSyncManager()
+    registry = ToolRegistry()
+    registry.register_all(build_query_tools(backend))
+    execution = registry.execute(
+        "update_stock_data",
+        '{"mode": "capital_flow", "start_date": "2026-06-01", "end_date": "2026-06-30"}',
+    )
+    assert execution.ok is True
+    assert started["symbols"] == ["600001", "600002"]
+    assert "job-1" in execution.summary
+    assert "sync_job_status" in execution.summary

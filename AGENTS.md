@@ -1,8 +1,21 @@
 # AGENT 必读
 
-新 agent 只需要读这一份即可开始。`README.md` 和 `docs/*` 只作补充背景，不是接手前置条件。`项目说明书.md`、`应用创新类项目报告.md` 和 `演示文档操作提醒.md` 都是本地人工材料，不上传 GitHub，也不作为 agent 接手依据。
+这份文档只放**花很久才踩明白的坑换来的红线与不变量**：路径与 git 边界、实时行情完整性、爬虫与资金流边界、A 股交易日历与覆盖口径、错误码契约、AI 子系统硬约束、门禁命令。能从代码直接读出来的目录清单、事件协议细节和一次性发布记录不放在这里。
 
-这份文档把前面花了很久才踩明白的坑收进来：路径、未提交改动、实时行情完整性、爬虫边界、资金流位置、A 股交易日历、签名更新、安装后 sidecar 验证和临时产物清理。
+分层规则（新增内容先问该放哪一层）：
+
+`docs/` 整个目录被 `.gitignore` 排除（内部文档与截图仅本机留存），所以下列 `docs/*` 只在维护者本机存在；克隆仓库后找不到它们时，按本文对应章节的摘要行事即可。
+
+| 文件 | 放什么 | 什么时候读 |
+| --- | --- | --- |
+| `AGENTS.md`（本文） | 红线、不变量、门禁命令 | 每次接手都读，改代码前对照 §2 与 §15 |
+| `docs/ai-subsystem.md`（本地） | AI 子包目录地图、事件协议、会话历史、记忆引擎、测试分层 | 改 `backend/astock_backtester/ai/` 或 AI 抽屉前端时 |
+| `docs/release-build.md`（本地） | Windows 构建、签名、覆盖安装与安装后 sidecar 验证 | 只在发布安装包时 |
+| `docs/frontend-style.md`（本地） | 设计 token 纪律与响应式检查 | 改前端样式时 |
+| `design.md` | 视觉系统的锁（token 表本身） | 新增色值/字号/圆角前 |
+| `README.md` / `CHANGELOG.md` | 面向用户的能力说明与历史发布记录 | 需要"这个产品有什么功能"时，不是接手前置条件 |
+
+`项目说明书.md`、`应用创新类项目报告.md` 和 `演示文档操作提醒.md` 是本地人工材料，不上传 GitHub，也不作为 agent 接手依据。
 
 ## 1. 工作区和 git
 
@@ -29,7 +42,7 @@ git branch --show-current
 https://github.com/dzc-bit/ai-invest-workbench.git
 ```
 
-保护已有未提交修改。不要覆盖无关文件，不要清理、删除、迁移 `D:\New project 6\运行产物`。版本号统一跟随桌面端当前版本，当前为 `1.5.1`（同步 7 处：`package.json`、`package-lock.json` 根条目×2、`pyproject.toml`、`backend/astock_backtester/__init__.py`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `a-stock-backtester` 条目、`src-tauri/tauri.conf.json`，外加 `tests/test_scripts.py` 的版本断言），除非用户明确要求改版本。前端视觉系统由仓库根 `design.md` 锁定（token 纪律见 §16.6）。
+保护已有未提交修改。不要覆盖无关文件，不要清理、删除、迁移 `D:\New project 6\运行产物`。版本号统一跟随桌面端当前版本（以 `package.json` 的 `version` 为准，各处清单由 `tests/test_scripts.py::test_release_manifests_use_one_version` 把关），除非用户明确要求改版本就不要动它。前端视觉系统由仓库根 `design.md` 锁定（token 纪律见 [`docs/frontend-style.md`](docs/frontend-style.md)）。
 
 ## 2. 绝对不要碰错边界
 
@@ -76,8 +89,9 @@ https://github.com/dzc-bit/ai-invest-workbench.git
 | user 模式候选 | `/run/backtest/stream` 最终 `result.latest_strategy_matches.matches` |
 | 资金流补齐 | `POST /fetch/daily-bars`、`POST /fetch/capital-flow` |
 | AI 对话/快讯 | `POST /ai/chat/stream`、`GET /ai/events/stream`、`GET /ai/news`、`GET /ai/status`、`GET|POST /ai/config` |
-| AI 轻路由（1.5.0） | `POST /ai/conditions/parse`（NL→条件 DSL，自愈校验）、`POST /ai/insight/oneshot`（场景点评：results_overview / data_coverage / risk_alerts）、`POST /ai/optimize`（参数网格寻优，NDJSON） |
-| 缺口画像（1.5.x） | `GET /diagnostics/data-gaps`（停更分布/疑似写入失败日/字段尾部，读 warehouse 缓存不触发抓取；AI 工具 `data_health_report` 消费同一明细） |
+| AI 会话历史 | `GET /ai/sessions`（列表）、`GET /ai/session?session_id=`（回读 display）、`POST /ai/session/delete`（删除） |
+| AI 轻路由 | `POST /ai/conditions/parse`（NL→条件 DSL，自愈校验）、`POST /ai/insight/oneshot`（场景点评：results_overview / data_coverage / risk_alerts）、`POST /ai/optimize`（参数网格寻优，NDJSON） |
+| 缺口画像 | `GET /diagnostics/data-gaps`（停更分布/疑似写入失败日/字段尾部，读 warehouse 缓存不触发抓取；AI 工具 `data_health_report` 消费同一明细） |
 
 复盘正文不能塞 user 候选；新闻不能替代行情评价；实时行情失败不能拿本地历史数据伪装成 live；AI 轻路由失败带稳定 code，前端对 oneshot 点评失败静默不显示。
 
@@ -158,7 +172,6 @@ source 语义：
 ```text
 backend/astock_backtester/data/capital_flow_crawler.py
 tests/test_capital_flow_crawler.py
-docs/capital-flow-crawler-report.md
 ```
 
 边界：
@@ -190,9 +203,11 @@ docs/capital-flow-crawler-report.md
 
 `/health` 不能同步阻塞重型 `warehouse.coverage()` 扫描。数据中心连接和操作后刷新应快速返回最近 coverage 快照，并用后台刷新更新缺失行数；不要让 60 秒级 coverage 扫描卡住“本地服务已连接”、按钮状态或全市场同步进度。
 
-`Warehouse.coverage()` 缺失行口径（1.5.x 起）：**累计真实缺口**。日线 = 每只股票在 [首行日期, min(最新数据日, 退市日)] 窗口内的交易日期望行数 − 实有行数（内部洞 + 多日未同步的尾部缺口都算）；市值/资金流保留“已有行但字段为空”的内部统计，再叠加“最后一条数据之后到最新交易日”的停更尾部（边界取 OHLC 最后行，避免与内部 NaN 重复计数）。无生命周期记录的股票走保守口径照算。因此多日未同步时缺失行数会是大数字（数十万级），这是特性不是 bug；真正的补齐手段是全市场同步。
+`Warehouse.coverage()` 缺失行口径（1.5.x 起）：**累计真实缺口**。日线 = 每只股票在 [首行日期, min(最新数据日, 退市日)] 窗口内的交易日期望行数 − 实有行数（内部洞 + 多日未同步的尾部缺口都算）；市值/资金流保留“已有行但字段为空”的内部统计，再叠加“最后一条数据之后到最新交易日”的停更尾部。停更尾部边界：市值取 OHLC 最后行（cap 行只存在于 OHLC 行上）；资金流取 **OHLC 末行与资金流末行的较大者**——§8 允许“暂无日 K 先写资金流独立行”，独立行覆盖的日期已有数据，若按 OHLC 末行计会“补齐后缺口不降、与缺口画像互相矛盾”。无生命周期记录的股票走保守口径照算。因此多日未同步时缺失行数会是大数字（数十万级），这是特性不是 bug；真正的补齐手段是全市场同步。
 
-配套明细：`Warehouse.data_gap_profile()`（停更分布/疑似写入失败日/市值与资金流停更尾部，只读最近年分区，10 分钟缓存、写入自动失效）——数据中心"缺失数据监控"折叠区与 AI 工具 `data_health_report` 消费同一份明细，保证 UI 与 AI 看到一致的"具体缺什么"。
+配套明细：`Warehouse.data_gap_profile()`（停更分布/疑似写入失败日/市值与资金流停更尾部，只读最近年分区，10 分钟缓存、写入自动失效、lifecycle 变更即失效）。已标记退市的股票从停更分布剔除并单列 `delisted_symbols`（退市是终态不是缺口）。数据中心"缺失数据监控"折叠区与 AI 工具 `data_health_report` 消费同一份明细，保证 UI 与 AI 看到一致的"具体缺什么"；`data_health_report` 另带 coverage 快照汇总与损坏分区区分（`error_code=warehouse_corrupt`），模型据此能分辨"先修损坏还是先补数据"。
+
+节假日硬编码表（`data/trading_calendar.py`）只覆盖到有限年份；计算范围超出表覆盖年份时会在日志打一次性 warning，**每年发布前必须更新 `_A_SHARE_HOLIDAY_RANGES`**，否则次年春节/国庆会被计成永远补不回来的缺口。
 
 后台刷新期间如果 `/health` 返回三项 coverage 全是 `symbols=0`、无日期、`missing_rows=0` 且 `coverage_refreshing=true`，前端不能把它当权威结果覆盖已有覆盖表；应保留旧覆盖并继续轮询，等刷新完成后的真实快照再更新。
 
@@ -259,110 +274,11 @@ assert events[-1]["type"] == "result"
 
 ## 12. 桌面安装包构建、签名和覆盖安装
 
-本节是 1.3.6 当前重发时实际使用的流程。所有工具、缓存、构建产物和安装包均在 `D:\New project 6` 所在的 D 盘；不要重新下载工具，也不要再使用或恢复 `C:\BuildTool`、`C:\BuildTools` 下的构建环境。
+完整流程（项目内固定工具链清单、构建前检查、签名与覆盖安装、安装后 sidecar 验证、清理边界）见 [`docs/release-build.md`](docs/release-build.md)，只在发布时读。日常改代码只需守住这几条：
 
-### 固定工具与目录
-
-以下内容已经存在于项目内，构建前只检查，不执行 `npm install`、Rust 安装器、NSIS 安装器或任何额外下载：
-
-```text
-D:\New project 6\.tools\node-v20.18.1-win-x64\node.exe
-D:\New project 6\.tools\node-v20.18.1-win-x64\npm.cmd
-D:\New project 6\.tools\python-build\Scripts\python.exe
-D:\New project 6\.tools\rustup-home\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe
-D:\New project 6\.tools\msvc-build-tools\VC\Auxiliary\Build\vcvars64.bat
-D:\New project 6\src-tauri\target\.tauri\NSIS
-```
-
-`src-tauri\tauri.conf.json` 已设置 `bundle.useLocalToolsDir: true`，所以 Tauri 的 NSIS 缓存必须保留在 `src-tauri\target\.tauri\NSIS`，而不是用户目录或 C 盘。`.tools\llvm-mingw`、GNU/GNULLVM 工具链不是本流程的一部分，不能作为 MSVC 构建的替代品；是否清理它们必须另行确认，不能在构建命令中顺带删除。
-
-签名私钥仅从以下运行产物路径读入当前 PowerShell 进程，绝不输出、写入日志或提交：
-
-```text
-D:\New project 6\运行产物\签名密钥\a-stock-backtester-v017.key
-```
-
-### 构建前检查
-
-版本必须在 `package.json`、`pyproject.toml`、`src-tauri\Cargo.toml` 与 `src-tauri\tauri.conf.json` 保持一致；本次为 `1.3.6`。在项目根目录执行：
-
-```powershell
-$root = 'D:\New project 6'
-Set-Location -LiteralPath $root
-
-$nodeDir = Join-Path $root '.tools\node-v20.18.1-win-x64'
-$cargoBin = Join-Path $root '.tools\rustup-home\toolchains\stable-x86_64-pc-windows-msvc\bin'
-$msvcEnv = Join-Path $root '.tools\msvc-build-tools\VC\Auxiliary\Build\vcvars64.bat'
-$signingKey = Join-Path $root '运行产物\签名密钥\a-stock-backtester-v017.key'
-$required = @(
-  (Join-Path $nodeDir 'node.exe'),
-  (Join-Path $nodeDir 'npm.cmd'),
-  (Join-Path $root '.tools\python-build\Scripts\python.exe'),
-  (Join-Path $cargoBin 'cargo.exe'),
-  $msvcEnv,
-  (Join-Path $root 'src-tauri\target\.tauri\NSIS\makensis.exe'),
-  $signingKey
-)
-$missing = $required | Where-Object { -not (Test-Path -LiteralPath $_) }
-if ($missing) { throw "缺少项目内构建依赖：$($missing -join '; ')" }
-```
-
-不要把 `node.exe`、`npm.cmd`、Python、MSVC、Rust 或 NSIS 的路径改到 C 盘。缺少依赖时先停止并说明缺哪一项；只有用户明确授权后，才可将缺少的工具下载到项目内的 `.tools`。
-
-### 本次实际构建命令
-
-`tauri.conf.json` 的 `beforeBuildCommand` 会依次执行前端 `vite build` 与 `scripts\build-data-service.ps1`。后者用项目内 Python 打包 `astock-data-service.exe`，并把 `node.exe`、`ths-cookie-worker.cjs`、`xhr-sync-worker.js` 一起放入 `src-tauri\bin`。因此本次只运行一次 Tauri release 构建，不再另跑重复的前端或 sidecar 打包命令。
-
-```powershell
-$env:RUSTUP_HOME = Join-Path $root '.tools\rustup-home'
-$env:CARGO_HOME = Join-Path $root '.tools\cargo-home'
-$env:TAURI_SIGNING_PRIVATE_KEY = [System.IO.File]::ReadAllText($signingKey).Trim()
-$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ''
-
-try {
-  $build = "call `"$msvcEnv`" && set `"PATH=$cargoBin;$nodeDir;%PATH%`" && set `"RUSTUP_HOME=$env:RUSTUP_HOME`" && set `"CARGO_HOME=$env:CARGO_HOME`" && `"$nodeDir\npm.cmd`" run tauri -- build --ci"
-  cmd.exe /S /C $build
-  if ($LASTEXITCODE -ne 0) { throw "Tauri 构建失败，退出码：$LASTEXITCODE" }
-} finally {
-  Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
-  Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
-}
-```
-
-本次产生的签名安装包为（中文文件名仅作本地构建产物，上传时改用 ASCII 资产名）：
-
-```text
-D:\New project 6\src-tauri\target\release\bundle\nsis\A股策略回测工作台_1.3.6_x64-setup.exe
-D:\New project 6\src-tauri\target\release\bundle\nsis\A股策略回测工作台_1.3.6_x64-setup.exe.sig
-```
-
-对应的 GitHub Release 资产名为 `Astock-backtester_1.3.6_x64-setup.exe`，`latest.json` 必须指向该 ASCII 名称。更新同一 `v1.3.6` Release 时使用 `gh release upload v1.3.6 ... --clobber` 替换旧资产；已安装的 1.3.6 客户端不会因为同版本号自动更新。
-
-产物名、版本和 `.sig` 必须同一轮生成。非零退出码就是失败，不能因为目录里留下了旧 `.exe` 就把它当成本次可用安装包；签名缺失时也不得复用旧 `.sig` 或生成 `latest.json`。
-
-### 覆盖安装和最低验证
-
-覆盖安装前先退出桌面端及旧 sidecar，随后只使用刚生成的安装包静默安装：
-
-```powershell
-Get-Process -ErrorAction SilentlyContinue |
-  Where-Object { $_.ProcessName -like '*astock*' -or $_.Path -like '*A股策略回测工作台*' } |
-  Stop-Process -Force
-
-$installer = Join-Path $root 'src-tauri\target\release\bundle\nsis\A股策略回测工作台_1.3.6_x64-setup.exe'
-$install = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
-if ($install.ExitCode -ne 0) { throw "覆盖安装失败，退出码：$($install.ExitCode)" }
-```
-
-本次静默覆盖安装退出码为 `0`。安装后必须启动安装版并确认没有访问开发地址 `127.0.0.1:1420`，再比较工作区与安装目录 `bin\astock-data-service.exe` 的 SHA-256，并至少探测 `/ping`、`/health`、`/market/finance`、`/realtime/market-snapshot`、`/market/commentary`、`/market/fupan`、`/market/zaopan` 与 `/run/backtest/stream`。`/run/backtest/stream` 是 NDJSON，需逐行解析并断言最后一条事件的 `type` 为 `result`。
-
-桌面端 release 主程序必须使用 Windows GUI subsystem（`windows_subsystem = "windows"`）；启动 `astock-data-service.exe` 与同花顺 cookie worker 的 `node.exe` 都必须隐藏控制台窗口。安装成功不代表 sidecar 已替换，也不代表服务自动启动成功，这两项需要分别验证。
-
-### GitHub 与清理边界
-
-本次只构建并覆盖安装，未创建 GitHub Release。后续需要发布时，GitHub updater 资产名必须使用 ASCII，例如 `Astock-backtester_1.3.6_x64-setup.exe`；只能由本次真实 `.sig` 使用 `scripts\write-latest-json.ps1` 生成 `latest.json`，且不提交安装包、`.sig`、`latest.json` 或私钥。
-
-构建后可点名清理 `.pyinstaller`、明确的临时探针、日志和下载残留；不要使用 `git clean -fdX`，也不要删除 `.tools`、`node_modules`、`src-tauri\bin`、`src-tauri\target`、`src-tauri\target\.tauri\NSIS` 或整个 `运行产物`。
+- 工具链固定在 D 盘项目内的 `.tools`，缺少依赖先停下来报告，不擅自下载，也不改用 C 盘或 mingw 工具链。
+- 安装包、`.sig`、临时 `latest.json` 与签名私钥一律不提交；产物名、版本和 `.sig` 必须同一轮生成，签名缺失时不得复用旧 `.sig`。
+- 构建后只点名清理临时探针与缓存，不得用 `git clean -fdX`。
 
 ## 13. 验证命令
 
@@ -395,6 +311,12 @@ python -m pytest tests/test_capital_flow_crawler.py tests/test_data_operations.p
 
 ```powershell
 python -m pytest tests/test_market.py tests/test_data_service_http.py -q
+```
+
+AI 子系统变更：
+
+```powershell
+python -m pytest tests/test_ai_routes_v150.py tests/test_ai_service_http.py tests/test_ai_agent.py tests/test_ai_sessions.py -q
 ```
 
 ## 14. 最终交付前检查
@@ -440,80 +362,50 @@ python -m ruff check backend tests scripts
 
 1. **符号与数值解析只有一个家**：符号规范化/新浪转换在 `data/symbols.py`，宽松数值解析在 `data/parsing.py`。任何爬虫不得再私建 `_normalize_code`、`_to_float`、`_sina_symbol` 之类的本地副本。
 2. **HTTP 策略集中在 `data/http_transport.py`**：UA 常量（MINIMAL/USER/BROWSER）、`create_scraping_session()`（trust_env=False，爬虫请求不读系统代理）、`resilient_get()`（瞬时错误重试 + curl_cffi 降级）。新增数据源先复用这一层。
-3. **禁止跨模块私有访问**：service/operations/sync 只能用公共接口——`RealtimeMarketProvider.retained_successful_snapshot()`、`DataServiceState.start_coverage_refresh()`、`Warehouse.read_capital_flow_missing_symbols()`、`SyncJobManager.start_full_market()/cancel_job()`。不允许再出现 `getattr(obj, "私有名", None)` 式的测试兼容 shim。
+3. **禁止跨模块私有访问**：service/operations/sync 只能用公共接口——`RealtimeMarketProvider.retained_successful_snapshot()`、`DataServiceState.start_coverage_refresh()/coverage_snapshot()`、`Warehouse.read_capital_flow_missing_symbols()/corrupt_partitions()`、`SyncJobManager.start_full_market()/start_capital_flow_backfill()/get_job()/cancel_job()`、`data/text_cleaning.py`（文本清洗唯一归属：`html_to_plaintext/collapse_ws/is_noisy_market_line`）。不允许再出现 `getattr(obj, "私有名", None)` 式的测试兼容 shim。
 4. **依赖方向单向**：`data/*` 只允许依赖 `models` 与 data 内共享模块（symbols/parsing/http_transport/importer/trading_calendar/cls），禁止反向 import 根包（service/engine/cli）。当前全仓 0 个 import 环。
 5. **回测条件必须双注册**：`conditions.py` 里每个 condition_id 必须同时有行级 `EVALUATORS` 和向量化 `MASK_BUILDERS`；`tests/test_core.py::test_condition_registry_stays_in_sync` 是守卫，新增条件只改 conditions.py 一个文件。
-6. **错误响应必须带稳定 code**：后端错误码 `no_local_data / validation_error / payload_error / request_failed`（`service.py::_stream_error_code`），数据缺失类失败抛 `LocalDataUnavailable`；AI 模块额外有 `ai_not_configured / ai_upstream_error`（`ai/errors.py`）。前端经 `api.ts` 的 `BackendError` 消费，AI 抽屉经 `aiTypes.ts::translateAiError` 按码翻译。新增错误路径必须带码。
+6. **错误响应必须带稳定 code**：后端错误码 `no_local_data / validation_error / payload_error / request_failed`（`service.py::_stream_error_code`），数据缺失类失败抛 `LocalDataUnavailable`；AI 模块额外有 `ai_not_configured / ai_upstream_error / ai_session_busy / ai_session_not_found`（`ai/errors.py`）。前端经 `api.ts` 的 `BackendError` 消费，AI 抽屉经 `aiTypes.ts::translateAiError` 按码翻译。新增错误路径必须带码。
 7. **回环测试不走代理**：`tests/test_data_service_http.py` 用 `ProxyHandler({})` 的 opener 发起全部回环请求；开发机开着 Clash 等系统代理时测试也必须绿。AI 回环测试（`tests/test_ai_service_http.py`）沿用同一模式，且 cache_dir 必须指向 tmp 子目录（`tmp_path/"本地数据仓"`），否则 AI 配置会落在 pytest 共享根目录造成跨测试泄漏。
 8. **AI 子系统边界（违反即回退）**：
    - `backend/astock_backtester/ai/` 是独立子包，只依赖 `models`、data 公共接口与根包的 backtest_runner/condition_parser/indicators；任何 data/* 或 engine 不得反向 import ai。
-   - AI 对数据仓默认只读：`query_warehouse_sql` 只允许 SELECT/WITH（DuckDB 内存连接 + 语句黑名单 + 自动 LIMIT 500）；**唯一写路径**是 `update_stock_data` → `operations.fetch_daily_bars_into_cache`，不得出现第二个写工具或裸 SQL 写。
-   - 分层记忆：短期窗口 10 条协议消息（`agent.SHORT_TERM_WINDOW`），溢出先进 `pending_archive` 再压缩为 `rolling_summary`；长期记忆提取是哨兵之后的独立 daemon 线程，**绝不允许阻塞 /ai/chat/stream 的事件流**。
-   - 爬取内容（新闻/复盘/研报）进入模型上下文前必须经 `ai/context.py::wrap_untrusted` 分隔；工具结果只以摘要进上下文，全量留在 `ToolResultStore`。
+   - AI 对数据仓默认只读：`query_warehouse_sql` 只允许 SELECT/WITH（DuckDB 内存连接 + 语句黑名单 + 自动 LIMIT 500）；**唯一写工具**是 `update_stock_data`（`mode=daily_bars` → `fetch_daily_bars_into_cache`；`mode=capital_flow` → `fetch_capital_flow_into_cache`，省略 symbols 时按缺口名单转 `SyncJobManager.start_capital_flow_backfill` 后台任务），不得出现第二个写工具或裸 SQL 写。
+   - 分层记忆：短期窗口按条数与字符数双阈值控制（`agent.SHORT_TERM_WINDOW` 条协议消息 + `SHORT_TERM_MAX_CHARS` 字符，两者都未超限才不压缩，具体数值以 `ai/agent.py` 常量为准），溢出先进 `pending_archive` 再压缩为 `rolling_summary`；长期记忆提取是哨兵之后的独立 daemon 线程，**绝不允许阻塞 /ai/chat/stream 的事件流**。
+   - 爬取内容（新闻/复盘/研报）进入模型上下文前必须经 `ai/context.py::wrap_untrusted` 分隔——工具路径与定时引擎（`digest._gather_sources`/`reports._gather_review_sources`）同样适用；且必须**先按 `digest_chars` 压缩、再包不可信围栏**，反序会让闭合标记被二次截断切掉，隔离退化成"只有开标记"。
+   - 工具结果只以摘要进上下文，全量留在内存 `ToolResultStore`（有条数/字节/TTL 三重上限）。摘要必须携带**精确保留元数据**（`context.retain_rows` 的 seen/kept/omitted + `resume_offset`）：只写"已截断"而不说省略多少行、缺的行在哪，模型就不知道要不要、从哪续读（tail 保留时省略的是头部行，resume_offset=0）。表格/榜单类工具用 `AiTool.digest_chars` 自己声明预算（默认 1200 字会把 20 行榜单切成 8 行）；模型可用只读工具 `read_tool_result(call_id, offset)` 按行续读，**不得**为了省事把全量 payload 直接灌进上下文。
+   - 工具失败必须以稳定 code 进协议 tool 消息与会话文件（`registry.CODE_*`：`unknown_tool` / `bad_arguments` / `no_data` / `tool_error`，加上 `interrupted` / `result_evicted` / `not_rowset`），让中断恢复与回放能按类别分支（改参数重试 vs 换工具 vs 先补数据）；code 服务的是代码与历史，用户文案仍走中文摘要。
+   - 会话 JSON 带 `schema_version`；格式演进只走**相邻迁移**——新版本可加字段，绝不移动、改写或销毁已落盘的会话代，读侧必须继续容忍旧代。
+   - 会话历史回读只允许暴露 `display`（`facade.session_view`）：协议消息、`pending_archive` 与 `rolling_summary` 不得出现在任何 HTTP 响应里，否则恢复出来的历史就能反向注入模型指令；该会话仍有轮次在生成时不得删除（`delete_session` 抛 `ai_session_busy`，因为 worker 会在 `finally` 里把文件重新写回来）。
+   - 工具批次可以并发（并发判定以 registry 的 `read_only` 标志为单一事实来源，`agent.SERIAL_TOOLS` 保留为显式串行名单，上限 `MAX_PARALLEL_TOOLS`），但 **tool 消息必须按 `tool_calls` 原顺序在主线程落盘**——乱序会破坏 `_repair_interrupted_turn` 依赖的 assistant(tool_calls)→tool 配对，整条会话被上游判为协议非法。`update_stock_data`（唯一写工具）与 `run_strategy_backtest`（整表读进 pandas）**永远独占**。
+   - 事件流静默满 `AI_STREAM_HEARTBEAT_SECONDS` 必须发 `heartbeat` 事件：前端按"多久没收到字节"判定空闲超时（180 秒），一次长回测期间的静默会被误杀成"回答中断"，而 worker 仍在跑并持着会话锁，用户下一次发送白等 90 秒。`/ai/optimize` 流同理（`AI_OPTIMIZE_HEARTBEAT_SECONDS`）。
+   - 上下文截断只能落在行或 JSON 字段边界（`context.truncate_text`）：把 `"close": 12.34` 切成 `12.` 会让模型读到格式合法但数值错误的价格，比整行丢弃危险得多；禁止按字符硬切。
+   - 单次 `AgentRunner.run` 产出的 UI 工件（strategy/chart）**只能是 run 内的局部 dict**，绝不允许做成实例属性——runner 是每服务一个单例，两个会话并发时会拿到彼此的策略与权益曲线。
    - LLM 配置只存 `运行产物/AI配置/ai-config.json`；`GET /ai/config` 只回掩码，`GET /ai/config/reveal` 仅用于桌面端展示用户自己的 Key；会话落盘 `运行产物/AI对话/`、记忆落盘 `运行产物/AI记忆/`；三者在 .gitignore 覆盖范围内，不得提交。
-   - AI 快讯（insight）必须带 `source="ai-insight"` 与免责声明；`data_fresh` 信号只触发刷新，不得替代任何行情模块的 live 判定。
+   - AI 快讯（insight）必须带 `source="ai-insight"` 与免责声明；`GET /ai/news` 的"AI 聚合要点"记录标签是 `ai-agent`（1.4.0 起的产品约定，与事件流 insight 的 ai-insight 并存）；`data_fresh` 信号只触发刷新，不得替代任何行情模块的 live 判定。
    - LLM 客户端复用 `openai` SDK（`ai/llm_client.py` 只做错误码映射与事件规范化）；测试用 FakeModel/注入 client_factory，禁止网络。
    - a-stock-data 裁剪端点（`ai/tools/astock_data_tools.py`）统一走 `data/symbols.py` + `data/http_transport.py`，东财系请求必须过 `_em_get` 限流。
    - 提示词模板含字面 JSON 时必须用 `{{ }}` 转义（`str.format` 会把 `{"content": ...}` 当占位符，曾踩坑）。
 9. **symbol_lifecycle 口径（1.5.0 起）**：覆盖/同步/资金流缺口的"缺失"判定必须尊重每只股票的 `[listing_date, delisted_date]` 窗口；无生命周期记录一律走旧保守口径，禁止用"数据源名单缺席"单独判定退市（必须有近 30 天无新行的佐证，且名单行数 <1000 时禁用退市判定）。绿/中性色不得用于表达"最优/成功"（A 股绿=跌），前端样式只允许引用 `design.md` 的 token。
 
-## 16. AI 子系统完整手册（1.5.0）
+## 16. AI 子系统
 
-### 16.1 目录结构
+目录地图、事件协议、会话历史三路由、三种 api_style、记忆/简报/快讯引擎与测试分层见 [`docs/ai-subsystem.md`](docs/ai-subsystem.md)。硬约束只有 §15-8 那几条，违反即回退。
 
-```text
-backend/astock_backtester/ai/
-  facade.py        # AiService：HTTP 服务唯一入口（status/config/chat/events/轻路由/报告/过拟合）
-  agent.py         # AgentRunner 工具循环（协议消息、上下文预算、UI artifacts、中断自愈）
-  llm_client.py    # OpenAiCompatibleClient：chat-completions / responses / anthropic 三协议
-  prompts.py       # 人设/风格/条件速查/模糊映射/快讯/简报/条件解析/oneshot/收尾作答模板
-  condition_dsl.py # NL→条件 DSL（LLM 候选→本地校验→带报错自愈重试 ≤2 次）
-  oneshot.py       # 场景化单段点评（results_overview / data_coverage / risk_alerts）
-  optimizer.py     # 参数网格寻优（≤48 组合，确定性循环 + 末尾一次 AI 点评）
-  insights.py      # EventBroker + InsightEngine（data_fresh 信号 + AI 快讯，小时配额 + 同因冷却去重）
-  digest.py        # 启动多源资讯聚合（DigestStore 落盘 运行产物/AI简报/）
-  reports.py       # 定时任务：收盘复盘报告 + 策略库自动体检（ReportStore 落盘 运行产物/AI报告/）
-  overfit.py       # 回测过拟合确定性检测（交易数/胜率/收益结构/网格离散度，无模型可用）
-  memory.py        # mem0 式长期记忆（plan_memory_ops → apply_ops）
-  sessions.py      # 会话落盘 运行产物/AI对话/
-  config.py        # AiConfigStore（运行产物/AI配置/ai-config.json，GET /ai/config 只回掩码）
-  context.py       # wrap_untrusted 注入防御 + ToolResultStore + ContextBudget
-  errors.py        # AiError/AiNotConfigured/AiUpstreamError/AiSessionBusy 稳定错误码
-  rag/retriever.py # 本地知识检索（语料含异动/监管/量能 + embedding 缓存 + 余弦 Top-K）
-  tools/           # registry（失败回传参数提示）+ local_tools + astock_data_tools + query_tools
-```
+## 17. 红线与决策的维护规则
 
-### 16.2 事件协议
+本文之所以再次变臃肿，靠的不是定期打扫，而是下面三条纪律（思路取自 deepseek-harness 的 Agent Notes：按 `{lifecycle}/{class}/日期-主题` 存决策、`implemented` 的事实必须跟着代码改、归档即冻结；本项目规模小，只取用得上的三条）：
 
-- `POST /ai/chat/stream`（NDJSON）：`session` → `phase`/`token`/`tool_call`/`tool_result`* → `result`（含 display/strategy/chart）或 `error`（带 code）。错误事件由 `_write_ai_error_event` 统一写出；payload 校验失败在开流前回 JSON 400。同一会话由 facade 内的 per-session 锁串行化：上一轮 worker 未结束时新一轮等待最多 90 秒，超时回 `ai_session_busy`（防止并发写同一会话产生悬空 tool_calls——那是“中断后失忆”的根源）。
-- `GET /ai/events/stream`（长连接）：`insight` / `data_fresh`（module=news/market/risk/ai_news）/ `heartbeat`（15s）。
-- `POST /ai/optimize`（NDJSON）：`phase` → (`combination` + `progress`)* → `result`（combinations/best/insight/insight_error）。AI 未配置时网格照常完成，`insight=null` + `insight_error` 说明原因。
-- 报告与过拟合（1.5.x）：`GET /ai/reports`（列 `运行产物/AI报告/*.md`）、`GET /ai/report/file?name=`（读单篇，非法名/缺文件回 404+code）、`POST /ai/overfit/check`（确定性检测，无需配置模型；metrics 是小数比例口径）。
+1. **新增红线前先做取代检查。** 在本文搜是否已有条目覆盖同一个决策或同一个机制：被完全取代的当场删除，只是部分取代的保留双方并互相指明位置。已知冲突不要留给下一个人去发现——§15-8 曾经同时写着"短期窗口 10 条"和 §16 的 24 条。
+2. **事实跟着代码走，判断不跟着改。** 条目里的路径、常量、默认值一旦代码变更，必须在同一次改动里同步（只改事实，不改当初的决策）。凡能从代码读出的数值就**不要抄进本文**，写"以 `agent.SHORT_TERM_WINDOW` 为准"即可：抄一次的数字必然会再次腐烂。
+3. **否决一个方案要留下防重提的理由；理由失效就直接删掉那一行。** 见 §18。登记它是因为"不记下来就会有人重新设计一遍"，而不是为了攒清单。
 
-### 16.3 三种 api_style
+## 18. 已否决的方案（防重提，不是待办）
 
-`chat-completions`（OpenAI 兼容，默认）、`responses`（OpenAI Responses）、`anthropic`（Messages API，tool_use/tool_result 流式映射）。全部由 `OpenAiCompatibleClient` 归一为 `(type, payload)` 事件流：`text` 增量与 `final`（content/tool_calls）。测试注入点：`client_factory`（单元）或 `monkeypatch.setattr(ai_service, "_model", FakeModel())`（HTTP 级）。embedding 允许独立供应商：`embedding_base_url`/`embedding_api_key` 留空时跟随主 base_url/api_key（`AiConfig.embedding_endpoint()`），二者与 api_key 一样"留空保持已有值"。
+只登记**仍然诱人、且当初的否决理由依然成立**的方案。前提变了或理由失效，就删掉这一行（它们不是待办事项）。
 
-### 16.4 记忆 / 简报 / 快讯引擎
-
-- 短期窗口 `agent.SHORT_TERM_WINDOW = 24` 条协议消息 + 36k 字符双阈值；溢出进 `pending_archive`，攒批（≥12 条或 ≥6k 字符）才压缩为 `rolling_summary`——刻意降低压缩频率，避免几乎每个新问题开始时都触发“压缩进长期会话纪要”。归档未压缩时随会话落盘，内容不丢。
-- 会话中断自愈：`AgentRunner.run` 开头的 `_repair_interrupted_turn` 为悬空 `tool_calls` 合成占位工具结果（否则整条会话会被上游以协议错误拒绝，表现为失忆）；步数耗尽时 `_forced_final_answer` 强制一次无工具收尾作答，绝不空手中断。
-- 长期记忆：每轮结束后独立 daemon 线程跑 `plan_memory_ops`（绝不阻塞事件流），写 `运行产物/AI记忆/memory.json`。
-- 简报：`DigestEngine.run_once` 多源聚合 → LLM 出 3-6 条 JSON 要点（提示词里字面 JSON 必须 `{{ }}` 转义）→ `运行产物/AI简报/digest.json`；与既有条目同题的不再重复推送快讯。
-- 快讯：`InsightEngine` 规则触发（新闻变化/宽度 >75% 或 <25%/风险增加）→ 小时配额内生成，强制 `source="ai-insight"` + 免责声明；`data_fresh` 信号不需要模型；同因快讯（去重键按 5pp 分桶）2 小时冷却，防止宽度持续极端时每分钟连发雷同快讯。
-- 定时任务（`reports.py`，单一 daemon 调度线程，本地时间 HH:MM，每天最多一次，错过整点 30 分钟内补跑）：复盘报告（AI 叙事 + 无模型时数据摘要版兜底）与策略库体检（重跑已存策略近 180 天 + 4 变体小网格 + 过拟合检测 + 与上次体检的漂移，整份报告共享一次行情框读取，绝不改写用户保存的策略）。
-
-### 16.5 工具清单（注册即用，id 即名）
-
-本地：`realtime_market_snapshot`、`market_news`、`market_briefing`、`risk_alerts`、`recent_daily_bars`、`validate_strategy_conditions`、`run_strategy_backtest`、`latest_market_digest`、`data_health_report`（数据仓缺口画像：停更分布/写入失败日/字段尾部，数据源健康自检类问题先调用）。a-stock-data 裁剪端点：估值/研报/龙虎榜/涨停池/多股对比等（`astock_data_tools.py`）。查询：`query_warehouse_sql`（只读 DuckDB）、`compute_stock_stats`、`compare_stocks`、`update_stock_data`（唯一写路径）。知识：`retrieve_knowledge`。1.5.0 新增轻路由不在工具注册表内：`/ai/conditions/parse`、`/ai/insight/oneshot`、`/ai/optimize` 走 `condition_dsl.py` / `oneshot.py` / `optimizer.py`。
-
-### 16.6 前端设计 token 纪律
-
-根目录 `design.md` 是锁：所有色值/字号/圆角经 `styles.css :root` 命名 token 引用（`--paper/--ink/--rule/--accent/--rise/--fall/--warn/--info/--ai/--focus/--text-*/--radius-*/--shadow-*`），token 块之外 0 处硬编码；装饰渐变与左侧实色边条是禁区；`--rise` 红=涨、`--fall` 绿=跌，绿不得表达"最优/成功"。改动前端样式后到 320/375/768 宽度各看一眼。
-
-### 16.7 测试策略
-
-- 零网络零 key：FakeModel 脚本化回放（`tests/test_ai_routes_v150.py::FakeModel`），回环请求走 `ProxyHandler({})` opener，cache_dir 指向 `tmp_path/"本地数据仓"`。
-- 轻路由测试分层：`tests/test_ai_routes_v150.py`（conditions/parse 自愈、oneshot 场景、optimize 网格与流事件、diagnostics/sources）+ `tests/test_ai_service_http.py`（chat/events/config 回归 + 报告/过拟合端点 + embedding 独立供应商配置）。
-- Agent 行为：`tests/test_ai_agent.py`（归档/攒批压缩、中断自愈、强制收尾作答、预算摘要）；定时任务与过拟合：`tests/test_ai_reports.py`、`tests/test_ai_overfit.py`；快讯冷却：`tests/test_ai_insights.py`。
-- 前端：`frontend/src/components/v150Features.test.tsx`（AI 条件面板/寻优/oneshot/报告导出）、`DataCenter.lifecycle.test.tsx`（徽标/诊断/健康卡），AI 函数在 jsdom 走 `aiMocks`。
+| 已否决 | 为什么否决 | 什么条件下重提 |
+| --- | --- | --- |
+| 给 `DataServiceHandler` 设 `protocol_version = "HTTP/1.1"` | NDJSON 靠 HTTP/1.0 + 无 `Content-Length` 才能逐行即时送达；改 1.1 却不手工补 chunked 分帧，整条流会攒到连接关闭才出字 | 实现了分帧写出之后 |
+| 为上下文超长 / 429 / 401 新增 5 个面向用户的错误码 | 后端 detail 已带异常类名与原因，前端 `translateAiError` 也已透出，再加一层只是文案微调 | 需要**代码**按失败类别分支时（自动重试、自动开新会话）——那时做"结构化 code 进协议消息与会话文件"，服务回放与恢复，而不是服务用户文案 |
+| 把归档压缩挪出首轮、改用抽取式纪要 | 压缩那一轮有 `phase` 明示不是无提示白等；代价换的是后续每轮少带几千字历史，而这块正被 §15-8 分层记忆约束保护 | 实测首轮等待确实成为主要投诉时 |
+| `latest_market_digest` 进 `UNTRUSTED_DIGEST_TOOLS` | 它是模型聚合产物而非一手爬取正文，注入属二阶风险 | 简报改成直接拼接爬取正文时 |

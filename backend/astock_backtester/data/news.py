@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
-from html import unescape
 from threading import Lock
 from time import monotonic
 
@@ -14,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from astock_backtester.data.cls import cls_telegraph_signed_params
 from astock_backtester.data.http_transport import MINIMAL_USER_AGENT, resilient_get, scraping_get, should_allow_alternate_transport
+from astock_backtester.data.text_cleaning import html_to_plaintext
 from astock_backtester.models import MarketNewsItem, MarketNewsResponse
 
 POSITIVE_WORDS = ("利好", "拉升", "走强", "活跃", "增长", "抢筹", "突破")
@@ -57,8 +56,9 @@ def _parse_unix_time(value: object) -> datetime | None:
 
 
 def _clean_html_text(value: str | None) -> str:
-    text = re.sub(r"<[^>]+>", "", value or "")
-    return unescape(text).strip()
+    # 统一走 text_cleaning：剥 script/style 内文与注释、解码实体、折叠空白，
+    # 不再是“只删标签”的旧正则清洗（script 内文会残留）。
+    return html_to_plaintext(value)
 
 
 def _tags(title: str, summary: str | None) -> list[str]:

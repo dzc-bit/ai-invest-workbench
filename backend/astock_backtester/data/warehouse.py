@@ -488,16 +488,18 @@ class Warehouse:
                 window_end=pd.Timestamp(daily_end),
                 lifecycle=lifecycle,
             )
+            # 资金流尾部边界：取日线末行与资金流末行的较大者。§8 允许“暂无
+            # 日 K 也先写资金流独立行”，独立行会把资金流末行推到日线末行之后；
+            # 这段日期已有资金流数据，不能再按日线末行计成缺口——否则补齐
+            # 资金流后 coverage 的缺口永远不降，与缺口画像“已最新”互相矛盾。
+            capital_flow_boundary_by_symbol: dict[str, pd.Timestamp] = dict(ohlc_last_by_symbol)
+            for flow_symbol, flow_last in flow_last_by_symbol.items():
+                current = capital_flow_boundary_by_symbol.get(flow_symbol)
+                if current is None or flow_last > current:
+                    capital_flow_boundary_by_symbol[flow_symbol] = flow_last
             capital_flow_missing_rows += self._tail_missing_rows(
-                # 与 market_cap 完全同构：边界优先取日线末行（日线在 → 说明该股
-                # 仍在正常交易），只在日线也缺该股时才退化为自身的资金流末行。
-                # 旧口径只遍历 flow_rows_by_symbol，从未采到资金流的股票不在其
-                # 中，于是它们不产生任何尾部缺口计数（看起来 0 缺口，实际天天缺）。
-                symbols=set(flow_rows_by_symbol) | {s for s in daily_symbols if s not in flow_rows_by_symbol},
-                boundary_by_symbol={
-                    **{s: ohlc_last_by_symbol[s] for s in daily_symbols if s in ohlc_last_by_symbol},
-                    **{s: flow_last_by_symbol[s] for s in flow_last_by_symbol if s not in ohlc_last_by_symbol},
-                },
+                symbols=set(capital_flow_boundary_by_symbol),
+                boundary_by_symbol=capital_flow_boundary_by_symbol,
                 window_end=pd.Timestamp(daily_end),
                 lifecycle=lifecycle,
             )
@@ -587,8 +589,9 @@ class Warehouse:
     ) -> int:
         """统计每只股票“最后一条数据之后”到最新交易日之间的交易日数。
 
-        边界取该股票最后一条完整数据行（OHLC 行优先，退化到字段最后行），
-        之后的交易日整段无行，不会与“已有行但字段为空”的内部缺口重复计数。
+        边界由调用方给出（市值取 OHLC 末行；资金流取 OHLC 末行与资金流末行
+        的较大者，独立资金流行覆盖的日期不算缺失），边界之后的交易日整段
+        无行，不会与“已有行但字段为空”的内部缺口重复计数。
         """
         if not symbols or not boundary_by_symbol:
             return 0
@@ -626,8 +629,13 @@ class Warehouse:
         - 薄行日：行数远低于中位数的交易日（旧写入失败的可疑日期）；
         - 市值/资金流的字段停更尾部。
 
+        已标记退市（``symbol_lifecycle``）的股票不计入停更分布，单列
+        ``delisted_symbols``——退市股的停更是终态而非缺口，混在一起会让
+        UI 与 AI 把“退市”误读成“需要补数据”。
+
         只读最近 ``partition_years`` 个年分区（最新数据必然在其中），带
-        10 分钟缓存——AI 工具与诊断端点共用，避免每次全仓扫描。
+        10 分钟缓存——AI 工具与诊断端点共用，避免每次全仓扫描；画像窗口
+        不覆盖的更早分区里的停更股票不会出现在分布里。
         """
         with self._gap_profile_lock:
             cached = self._gap_profile_cache
@@ -697,9 +705,26 @@ class Warehouse:
                         last_flow[symbol] = timestamp
         if not rows_per_date or not last_ohlc:
             return {"available": False, "reason": "选中分区内没有可用的日线行。"}
+        try:
+            lifecycle = self.read_symbol_lifecycle()
+        except Exception:  # noqa: BLE001 - 画像读不到生命周期时退回保守口径
+            lifecycle = {}
+        delisted_symbols = {
+            symbol
+            for symbol, record in lifecycle.items()
+            if record.get("status") == "delisted" or record.get("delisted_date")
+        }
         daily_end = max(rows_per_date)
         window_start = min(rows_per_date)
-        current_symbols = sum(1 for timestamp in last_ohlc.values() if timestamp >= daily_end)
+
+        def split_delisted(last_by_symbol: dict[str, pd.Timestamp]) -> tuple[dict[str, pd.Timestamp], int]:
+            active = {symbol: ts for symbol, ts in last_by_symbol.items() if symbol not in delisted_symbols}
+            return active, len(last_by_symbol) - len(active)
+
+        active_ohlc_last, ohlc_delisted = split_delisted(last_ohlc)
+        active_cap_last, cap_delisted = split_delisted(last_cap)
+        active_flow_last, flow_delisted = split_delisted(last_flow)
+        current_symbols = sum(1 for timestamp in active_ohlc_last.values() if timestamp >= daily_end)
         thin_days: list[dict[str, object]] = []
         if len(rows_per_date) >= 4:
             median_rows = median(rows_per_date.values())
@@ -729,17 +754,20 @@ class Warehouse:
             "daily_bars": {
                 "symbols": len(last_ohlc),
                 "symbols_current": current_symbols,
-                "symbols_stale": len(last_ohlc) - current_symbols,
-                "stale_distribution": stale_entries(last_ohlc),
+                "symbols_stale": len(active_ohlc_last) - current_symbols,
+                "delisted_symbols": ohlc_delisted,
+                "stale_distribution": stale_entries(active_ohlc_last),
                 "thin_days": thin_days,
             },
             "market_cap": {
                 "symbols": len(last_cap),
-                "stale_distribution": stale_entries(last_cap),
+                "delisted_symbols": cap_delisted,
+                "stale_distribution": stale_entries(active_cap_last),
             },
             "capital_flow": {
                 "symbols": len(last_flow),
-                "stale_distribution": stale_entries(last_flow),
+                "delisted_symbols": flow_delisted,
+                "stale_distribution": stale_entries(active_flow_last),
             },
         }
         return profile
@@ -783,6 +811,9 @@ class Warehouse:
                 """,
                 payload,
             )
+        # 生命周期变更会改变缺口画像的退市剔除口径，让下次读取重新计算。
+        with self._gap_profile_lock:
+            self._gap_profile_cache = None
         return len(payload)
 
     def read_symbol_lifecycle(self, symbols: Sequence[str] | None = None) -> dict[str, dict[str, str | None]]:
@@ -825,8 +856,13 @@ class Warehouse:
         return {str(row[0]) for row in rows}
 
     def read_capital_flow_missing_symbols(self, start_date: str, end_date: str) -> set[str]:
-        """Return symbols whose rows in the latest daily-bars partition have no
-        ``main_net_inflow`` value within ``[start_date, end_date]``.
+        """Return symbols with no ``main_net_inflow`` value within
+        ``[start_date, end_date]`` across the daily-bars partitions the window
+        touches.
+
+        只读最新分区会让横跨旧分区的补数窗口漏掉旧分区里的缺流股票
+        （例如 12 月~1 月的窗口漏掉 ``year=2025`` 分区），因此按窗口覆盖
+        的年份选择分区；一个分区都选不中时退回最新分区保持旧行为。
 
         Rows outside a symbol's ``symbol_lifecycle`` window (before listing /
         after delisting) are ignored, so a delisted stock no longer reports its
@@ -839,22 +875,38 @@ class Warehouse:
         paths = sorted(self.daily_bars_root.glob("year=*/daily_bars.parquet"))
         if not paths:
             return set()
-        latest_path = paths[-1]
+        window_start = pd.Timestamp(start_date)
+        window_end = pd.Timestamp(end_date)
+        selected: list[Path] = []
+        for path in paths:
+            try:
+                year = int(path.parent.name.split("=", maxsplit=1)[1])
+            except (IndexError, ValueError):
+                continue
+            if window_start.year <= year <= window_end.year:
+                selected.append(path)
+        if not selected:
+            selected = [paths[-1]]
         columns_to_read = ["symbol", "trade_date", "main_net_inflow"]
-        try:
-            available = set(pq.ParquetFile(latest_path).schema_arrow.names)
-        except FileNotFoundError:
+        frames: list[pd.DataFrame] = []
+        for path in selected:
+            try:
+                available = set(pq.ParquetFile(path).schema_arrow.names)
+            except FileNotFoundError:
+                continue
+            columns = [column for column in columns_to_read if column in available]
+            if "symbol" not in columns or "main_net_inflow" not in columns:
+                continue
+            frame = self._safe_read_parquet(path, columns=columns)
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
             return set()
-        columns_to_read = [column for column in columns_to_read if column in available]
-        if "symbol" not in columns_to_read or "main_net_inflow" not in columns_to_read:
-            return set()
-        frame = self._safe_read_parquet(latest_path, columns=columns_to_read)
-        if frame.empty:
-            return set()
+        frame = pd.concat(frames, ignore_index=True)
         frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         frame = frame.dropna(subset=["trade_date"])
-        frame = frame[frame["trade_date"] >= pd.Timestamp(start_date)]
-        frame = frame[frame["trade_date"] <= pd.Timestamp(end_date)]
+        frame = frame[frame["trade_date"] >= window_start]
+        frame = frame[frame["trade_date"] <= window_end]
         if frame.empty:
             return set()
         lifecycle = self.read_symbol_lifecycle(

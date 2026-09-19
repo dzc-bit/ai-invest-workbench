@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from astock_backtester.ai.config import AiConfig
 from astock_backtester.ai.digest import DigestEngine, DigestStore, parse_digest_items
 from astock_backtester.ai.insights import EventBroker
@@ -14,6 +16,19 @@ from astock_backtester.models import (
     MarketNewsResponse,
     RealtimeMarketSnapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_external_crawl(monkeypatch):
+    """简报引擎的涨停池来自东财公开 XHR；单测不打真实网络。
+
+    否则离线/CI 环境里每次 run_once 多出秒级 DNS/连接超时，
+    ``_gather_sources`` 变慢、线程循环的计时断言随机翻车。
+    """
+    monkeypatch.setattr(
+        "astock_backtester.ai.tools.astock_data_tools.fetch_limit_up_rows",
+        lambda kind: [],
+    )
 
 DIGEST_JSON = (
     '[{"title": "光量子计算取得突破", "summary": "图灵量子发布第三代光量子计算机。", '
@@ -160,3 +175,43 @@ def test_fresh_engine_never_treated_as_recent_run_on_low_uptime_machines(tmp_pat
     )
 
     assert engine.run_once()["skipped"] == "not_configured"
+
+
+def test_loop_survives_upstream_exception_and_logs_it(tmp_path):
+    """一次上游异常不得杀死简报线程。
+
+    线程一死，3 小时定时器随之消失，资讯与事件面板会静默停摆到下次重启，
+    并且不留任何日志痕迹——这正是 run_once 抛出 AiUpstreamError 时的表现。
+    """
+    backend = FakeBackend()
+    _wire(backend)
+
+    class RaisingModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages: list[dict[str, Any]], *, tools: Any = None):
+            # 真实客户端是生成器，异常发生在迭代时，这里保持一致
+            self.calls += 1
+            raise RuntimeError("ai_upstream_error: 503 upstream reset")
+            yield  # pragma: no cover
+
+    model = RaisingModel()
+    engine = DigestEngine(
+        broker=EventBroker(),
+        backend=backend,
+        model_provider=lambda: model,
+        config_provider=lambda: AiConfig(base_url="http://x", api_key="k", model="m"),
+        store=DigestStore(tmp_path),
+        interval_seconds=0.05,
+    )
+    engine.start()
+    try:
+        deadline = time.monotonic() + 5
+        while model.calls < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        engine.stop()
+
+    assert model.calls >= 3, f"简报线程在异常后停跑了（只尝试 {model.calls} 次）"
+    assert any("ai digest engine run failed" in entry for entry in backend.logged), backend.logged

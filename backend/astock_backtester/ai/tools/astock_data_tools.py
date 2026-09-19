@@ -27,6 +27,7 @@ import requests
 from astock_backtester.ai.tools.registry import AiTool
 from astock_backtester.data.http_transport import USER_AGENT, create_scraping_session
 from astock_backtester.data.symbols import a_share_market_symbol, normalize_symbol
+from astock_backtester.data.text_cleaning import html_to_plaintext
 
 if TYPE_CHECKING:
     from astock_backtester.ai.tools.local_tools import AiBackend
@@ -282,7 +283,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
                 "date": str(row.get("publishDate", ""))[:10],
                 "org": row.get("orgSName", ""),
                 "rating": row.get("emRatingName", ""),
-                "title": row.get("title", ""),
+                "title": html_to_plaintext(str(row.get("title", ""))),
                 "eps_this_year": row.get("predictThisYearEps"),
                 "industry": row.get("indvInduName", ""),
             }
@@ -427,6 +428,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=stock_valuation,
             summarizer=summarize_valuation,
+            digest_chars=2_600,
         ),
         AiTool(
             name="stock_research_reports",
@@ -441,6 +443,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=stock_research_reports,
             summarizer=summarize_reports,
+            digest_chars=2_600,
         ),
         AiTool(
             name="dragon_tiger_board",
@@ -456,6 +459,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=dragon_tiger_board,
             summarizer=summarize_dragon_tiger,
+            digest_chars=2_600,
         ),
         AiTool(
             name="limit_up_pool",
@@ -469,6 +473,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             },
             executor=limit_up_pool,
             summarizer=summarize_limit_up,
+            digest_chars=3_000,
         ),
         AiTool(
             name="compare_stocks",
