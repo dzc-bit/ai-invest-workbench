@@ -808,6 +808,9 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
                     <td>{item.start_date ?? "-"} 至 {item.end_date ?? "-"}</td>
                     <td>
                       <span>{item.missing_rows}</span>
+                      {item.suspension_rows > 0 ? (
+                        <small className="coverage-progress-note">停牌类缺行 {item.suspension_rows}（不可补）</small>
+                      ) : null}
                       {syncJob && item.dataset === (syncJob.mode === "capital_flow_backfill" ? "capital_flow" : "daily_bars") && syncProgressNote ? (
                         <small className="coverage-progress-note">{syncProgressNote}</small>
                       ) : null}

@@ -104,9 +104,9 @@ export function mockDataServiceHealth(): DataServiceHealth {
     cache_path: ".astock-cache",
     port: 9010,
     coverage: [
-      { dataset: "daily_bars", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 },
-      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 },
-      { dataset: "market_cap", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 }
     ]
   };
 }
@@ -628,9 +628,9 @@ export function mockFetchDailyBarsResult(
     fetched_symbols: symbols,
     missing_symbols: [],
     coverage: [
-      { dataset: "daily_bars", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0 },
-      { dataset: "capital_flow", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0 },
-      { dataset: "market_cap", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0 }
+      { dataset: "daily_bars", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 }
     ],
     logs: [{ level: "info", message: `Fetched ${symbols.length * 5} daily bar rows` }]
   };
@@ -649,9 +649,9 @@ export function mockFetchCapitalFlowResult(
       fetched_symbols: [],
       missing_symbols: [],
       coverage: [
-        { dataset: "daily_bars", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0 },
-        { dataset: "capital_flow", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0 },
-        { dataset: "market_cap", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0 }
+        { dataset: "daily_bars", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+        { dataset: "capital_flow", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+        { dataset: "market_cap", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 }
       ],
       logs: [{ level: "info", message: "Capital-flow backfill started for all preview symbols" }],
       diagnostics: [{ code: "capital_flow_backfill_job_started", requested_symbols: 2, source: "capital_flow_crawler" }],
@@ -678,9 +678,9 @@ export function mockFetchCapitalFlowResult(
     fetched_symbols: symbols,
     missing_symbols: [],
     coverage: [
-      { dataset: "daily_bars", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0 },
-      { dataset: "capital_flow", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0 },
-      { dataset: "market_cap", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0 }
+      { dataset: "daily_bars", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: symbols.length, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 }
     ],
     logs: [{ level: "info", message: `Capital-flow crawler merged ${symbols.length} rows as primary main_net_inflow source` }],
     diagnostics: [{ code: "capital_flow_crawler_merge", merged_rows: symbols.length, source: "capital_flow_crawler" }],
@@ -693,9 +693,9 @@ export function mockImportDailyBarsResult(source: "sample" | "file", path?: stri
     status: "ok",
     imported_rows: 10,
     coverage: [
-      { dataset: "daily_bars", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 },
-      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 },
-      { dataset: "market_cap", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 }
     ],
     logs: [{ level: "info", message: `Imported daily bars from ${source}${path ? `: ${path}` : ""}` }]
   };
@@ -766,8 +766,8 @@ export function mockCancelSyncJob(jobId: string): { job: SyncJobStatus } {
 export function mockCallBackendCoverage() {
   return {
     coverage: [
-      { dataset: "daily_bars", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 },
-      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-08", missing_rows: 0, suspension_rows: 0 }
     ]
   };
 }

@@ -345,6 +345,21 @@ class SyncJobManager:
     def _complete_daily_symbols(self, start_date: str, end_date: str) -> set[str]:
         return self._daily_completeness_snapshot(start_date, end_date).complete_symbols
 
+    def incomplete_symbols(self, start_date: str, end_date: str) -> list[str]:
+        """缺口基准补齐入口：窗口内“不完整”的股票名单。
+
+        与 ``run_full_market`` 的跳过判定同源（同一份完整性快照），供外部
+        补齐脚本/调用方只对真正有缺口的股票发起抓取，而不是全量扫描。
+        退市股票从名单中剔除（与全市场同步的股票池规则一致）。
+        """
+        complete = self._daily_completeness_snapshot(start_date, end_date).complete_symbols
+        pool = self.warehouse.read_daily_symbols(require_ohlc=True)
+        try:
+            delisted = self.warehouse.read_delisted_symbols()
+        except Exception:  # noqa: BLE001 - 生命周期读取失败不阻塞补齐
+            delisted = set()
+        return sorted(symbol for symbol in pool if symbol not in complete and symbol not in delisted)
+
     def _daily_completeness_snapshot(self, start_date: str, end_date: str) -> DailyCompletenessSnapshot:
         expected_dates = effective_a_share_date_range(start_date, end_date)
         if expected_dates is None:

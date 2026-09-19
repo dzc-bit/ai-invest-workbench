@@ -119,7 +119,11 @@ class DatasetCoverage(BaseModel):
     symbols: int
     start_date: date | None
     end_date: date | None
+    # 可行动缺口：尾部停更 + thin day（疑似写入失败）的内部洞。
     missing_rows: int = 0
+    # 停牌类缺行：市场正常日（横截面行数正常）的内部洞——公开渠道天然没有
+    # 停牌日 K 线，这些行不可补、也不是数据质量问题，单列以保证数字诚实。
+    suspension_rows: int = 0
 
 
 class ServiceLogEntry(BaseModel):

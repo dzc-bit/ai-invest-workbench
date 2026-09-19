@@ -510,6 +510,35 @@ def test_async_full_market_job_reuses_completeness_snapshot_for_gap_counts(tmp_p
     assert warehouse.read_daily_calls == 1
 
 
+def test_incomplete_symbols_returns_gap_based_pool(tmp_path):
+    """缺口基准补齐：只返回窗口内不完整的股票，完整股与退市股剔除。"""
+    warehouse = Warehouse(tmp_path)
+    rows = []
+    for symbol, days in (("000001", ("2026-06-01", "2026-06-02", "2026-06-03")), ("000002", ("2026-06-01", "2026-06-03"))):
+        for day in days:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": day,
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "volume": 1000,
+                    "float_market_cap": 100.0,
+                    "total_market_cap": 120.0,
+                }
+            )
+    warehouse.write_daily_bars(pd.DataFrame(rows))
+    warehouse.upsert_symbol_lifecycle([{"symbol": "000004", "status": "delisted", "delisted_date": "2026-06-01"}])
+
+    manager = SyncJobManager(warehouse=warehouse, provider=FakeProvider())
+    incomplete = manager.incomplete_symbols("2026-06-01", "2026-06-03")
+
+    # 000001 三天齐 → 完整剔除；000002 缺 06-02 → 保留；000004 已退市 → 剔除。
+    assert incomplete == ["000002"]
+
+
 def test_capital_flow_job_reports_completed_with_errors_when_rows_import_with_failures(tmp_path):
     cache = LocalCache(tmp_path)
     warehouse = Warehouse(tmp_path)

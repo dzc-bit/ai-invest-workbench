@@ -194,6 +194,7 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
                     "dataset": item.dataset,
                     "symbols": item.symbols,
                     "missing_rows": item.missing_rows,
+                    "suspension_rows": getattr(item, "suspension_rows", 0),
                     "end_date": str(item.end_date or ""),
                 }
                 for item in coverage
@@ -231,10 +232,15 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
         coverage = payload.get("coverage") or []
         if coverage:
             parts = "；".join(
-                f"{item['dataset']} {item['symbols']} 只缺 {item['missing_rows']} 行" for item in coverage
+                f"{item['dataset']} {item['symbols']} 只缺 {item['missing_rows']} 行"
+                + (f"（另有 {item['suspension_rows']} 行停牌类缺行，不可补）" if item.get("suspension_rows") else "")
+                for item in coverage
             )
-            lines.append(f"覆盖缺口汇总（累计真实缺口口径，含日历/生命周期/停更尾部）：{parts}。")
-            lines.append("注意：直接用 SQL 数 NULL 行只能得到内部缺口，不等于覆盖缺口口径。长期停牌的股票会计为缺口且无法补齐。")
+            lines.append(f"覆盖缺口汇总（可行动口径 = 停更尾部 + 疑似写入失败日）：{parts}。")
+            lines.append(
+                "注意：停牌日的 K 线公开渠道天然没有，已单列为停牌类缺行、不计入可补缺口；"
+                "直接用 SQL 数 NULL 行只能得到内部字段缺口，不等于覆盖缺口口径。"
+            )
         return "\n".join(lines)
 
     def recent_daily_bars(args: dict[str, Any]) -> dict[str, Any]:

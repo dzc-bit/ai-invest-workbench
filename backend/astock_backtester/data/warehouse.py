@@ -270,7 +270,7 @@ class Warehouse:
             .reset_index(drop=True)
         )
 
-    def coverage(self) -> list[DatasetCoverage]:
+    def coverage(self, *, thin_day_ratio: float = 0.5) -> list[DatasetCoverage]:
         paths = sorted(self.daily_bars_root.glob("year=*/daily_bars.parquet"))
         if not paths:
             return [
@@ -292,11 +292,15 @@ class Warehouse:
         capital_flow_start: date | None = None
         capital_flow_end: date | None = None
         daily_missing_rows = 0
+        daily_suspension_rows = 0
         market_cap_missing_rows = 0
         capital_flow_missing_rows = 0
         first_daily_date_by_symbol: dict[str, pd.Timestamp] = {}
         flow_start_by_symbol: dict[str, pd.Timestamp] = {}
         missing_capital_flow_frames: list[pd.DataFrame] = []
+        # 每个交易日的全市场 OHLC 完整行数：横截面证据，用于把内部洞分成
+        # “停牌类（市场正常日，不可补）”与“疑似写入失败（thin day，可补）”。
+        rows_per_date: dict[pd.Timestamp, int] = {}
         # 逐股统计（按年分区增量合并）：缺失行数改为“交易日历期望 − 实际持有”
         # 的累计口径，让“多日未同步的尾部缺口”可见，而不是只数最新一天。
         ohlc_rows_by_symbol: dict[str, int] = {}
@@ -380,6 +384,9 @@ class Warehouse:
                     first=None,
                     last=ohlc_last_by_symbol,
                 )
+                for trade_date, count in ohlc_complete.groupby("trade_date").size().items():
+                    key = pd.Timestamp(trade_date)
+                    rows_per_date[key] = rows_per_date.get(key, 0) + int(count)
 
             if "float_market_cap" in ohlc_complete:
                 market_cap_mask = ohlc_complete["float_market_cap"].notna()
@@ -467,12 +474,27 @@ class Warehouse:
 
         lifecycle = self.read_symbol_lifecycle()
         if daily_symbols and daily_end is not None:
-            # 日线：完整累计口径——期望交易日行数 − 实有行数（内部洞 + 停更尾部）。
-            daily_missing_rows = self._accumulated_missing_rows(
-                symbols=daily_symbols,
-                present_by_symbol=ohlc_rows_by_symbol,
+            # 日线缺口 = 内部洞（分类后）+ 停更尾部：
+            # - 内部洞按横截面证据分类：市场正常日的缺行是停牌（公开渠道天然
+            #   没有停牌日 K 线，不可补，单列 suspension_rows）；thin day（当日
+            #   全市场行数异常低，疑似写入失败）的缺行才是可行动缺口。
+            #   2025 年实测：15,095 个缺口对 100% 落在市场正常日——旧口径把
+            #   它们全数计入缺失，数字因此基本虚假。
+            # - 停更尾部（最后一条行 → 最新交易日）保持可行动口径，它是
+            #   “这只股票多久没同步”的信号，绝不参与停牌分类。
+            internal_missing, internal_suspension = self._classified_internal_missing(
                 first_by_symbol=first_daily_date_by_symbol,
                 last_by_symbol=ohlc_last_by_symbol,
+                rows_per_date=rows_per_date,
+                window_end=pd.Timestamp(daily_end),
+                lifecycle=lifecycle,
+                thin_day_ratio=thin_day_ratio,
+            )
+            daily_missing_rows += internal_missing
+            daily_suspension_rows += internal_suspension
+            daily_missing_rows += self._tail_missing_rows(
+                symbols=set(ohlc_last_by_symbol),
+                boundary_by_symbol=ohlc_last_by_symbol,
                 window_end=pd.Timestamp(daily_end),
                 lifecycle=lifecycle,
             )
@@ -511,6 +533,7 @@ class Warehouse:
                 start_date=daily_start,
                 end_date=daily_end,
                 missing_rows=daily_missing_rows,
+                suspension_rows=daily_suspension_rows,
             ),
             DatasetCoverage(
                 dataset="market_cap",
@@ -533,51 +556,72 @@ class Warehouse:
             return []
         return sorted(a_share_trade_dates(start, end))
 
-    def _accumulated_missing_rows(
+    def _classified_internal_missing(
         self,
         *,
-        symbols: set[str],
-        present_by_symbol: dict[str, int],
         first_by_symbol: dict[str, pd.Timestamp],
         last_by_symbol: dict[str, pd.Timestamp],
+        rows_per_date: dict[pd.Timestamp, int],
         window_end: pd.Timestamp,
         lifecycle: dict[str, dict[str, str | None]],
-    ) -> int:
-        """累计缺失行：按交易日历数出每只股票在
-        [首行日期, min(最新数据日, 退市日)] 窗口内应有多少行，减去实有行数。
+        thin_day_ratio: float,
+    ) -> tuple[int, int]:
+        """内部洞（首行 ~ 末行之间的缺行）按横截面证据分类。
 
-        无生命周期记录的股票走保守口径（视为在市，缺口照算）。一只股票
-        数据停更在 7 月，7 月到最新交易日之间的每个交易日都算缺失——这是
-        旧口径（只数最新一天在场股票数）看不见的尾部缺口。
+        对窗口内每个交易日 d：内部缺行数 = spanning(d) − 实有行数(d)，其中
+        spanning(d) = 满足 [起, 止]（生命周期截断后）覆盖 d 的股票数。某股票
+        在 d 有行则必然 spanning d，因此实有 ≤ spanning 恒成立。
+
+        分类：实有行数低于 ``median × thin_day_ratio`` 的交易日是 thin day
+        （疑似写入失败），其缺行计入 missing_rows（可行动）；其余交易日的
+        缺行是停牌类（公开渠道天然没有，不可补），计入 suspension_rows。
+
+        返回 (missing_rows, suspension_rows)。无生命周期记录的股票按在市
+        处理（保守口径不变）。
         """
-        if not symbols or not first_by_symbol:
-            return 0
-        bounds_start = min(first_by_symbol.values())
-        if window_end <= bounds_start:
-            return 0
-        calendar = self._trading_dates_between(bounds_start, window_end)
-        if not calendar:
-            return 0
-        total = 0
-        for symbol in symbols:
-            sym_start = first_by_symbol.get(symbol)
-            if sym_start is None:
+        starts: list[int] = []
+        ends: list[int] = []
+        for symbol, first in first_by_symbol.items():
+            last = last_by_symbol.get(symbol)
+            if last is None:
                 continue
             record = lifecycle.get(symbol)
-            delisted = lifecycle_bound(record, "delisted_date")
             listing = lifecycle_bound(record, "listing_date")
-            sym_end = min(window_end, pd.Timestamp(delisted)) if delisted is not None else window_end
-            if listing is not None and pd.Timestamp(listing) > sym_start:
-                sym_start = pd.Timestamp(listing)
-            if sym_end < sym_start:
+            delisted = lifecycle_bound(record, "delisted_date")
+            span_start = pd.Timestamp(first)
+            span_end = pd.Timestamp(last)
+            if listing is not None and pd.Timestamp(listing) > span_start:
+                span_start = pd.Timestamp(listing)
+            if delisted is not None and pd.Timestamp(delisted) < span_end:
+                span_end = pd.Timestamp(delisted)
+            if span_start > span_end:
                 continue
-            lo = bisect.bisect_left(calendar, sym_start)
-            hi = bisect.bisect_right(calendar, sym_end)
-            expected = max(0, hi - lo)
-            present = present_by_symbol.get(symbol, 0)
-            if expected > present:
-                total += expected - present
-        return total
+            starts.append(span_start.value)
+            ends.append(span_end.value)
+        if not starts:
+            return 0, 0
+        bounds_start = pd.Timestamp(min(starts))
+        if window_end <= bounds_start:
+            return 0, 0
+        calendar = self._trading_dates_between(bounds_start, window_end)
+        if not calendar:
+            return 0, 0
+        starts.sort()
+        ends.sort()
+        threshold = max(1.0, float(median(rows_per_date.values())) * thin_day_ratio)
+        missing_total = 0
+        suspension_total = 0
+        for day in calendar:
+            day_value = day.value
+            spanning = bisect.bisect_right(starts, day_value) - bisect.bisect_left(ends, day_value)
+            internal = spanning - rows_per_date.get(day, 0)
+            if internal <= 0:
+                continue
+            if rows_per_date.get(day, 0) < threshold:
+                missing_total += internal
+            else:
+                suspension_total += internal
+        return missing_total, suspension_total
 
     def _tail_missing_rows(
         self,

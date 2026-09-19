@@ -388,7 +388,9 @@ def test_data_health_report_exposes_rows_and_coverage_summary():
         "capital_flow": {"symbols": 5463, "delisted_symbols": 10, "stale_distribution": []},
     }
     backend.coverage_snapshot = lambda: [
-        SimpleNamespace(dataset="daily_bars", symbols=5463, missing_rows=120_000, end_date="2026-09-18")
+        SimpleNamespace(
+            dataset="daily_bars", symbols=5463, missing_rows=120_000, suspension_rows=310_000, end_date="2026-09-18"
+        )
     ]
     registry = ToolRegistry()
     registry.register_all(build_local_tools(backend))
@@ -399,7 +401,9 @@ def test_data_health_report_exposes_rows_and_coverage_summary():
     assert {"dataset": "日线", "last_date": "2026-07-14", "symbols": 3084} in rows
     assert execution.payload["coverage"][0]["missing_rows"] == 120_000
     assert "退市" in execution.summary and "不要建议补齐" in execution.summary
-    assert "累计真实缺口" in execution.summary
+    # 口径修订后：可行动缺口与停牌类缺行分列说明
+    assert "可行动口径" in execution.summary
+    assert "310000" in execution.summary and "停牌类缺行" in execution.summary
 
 
 def test_data_health_report_distinguishes_corrupt_from_missing():

@@ -154,10 +154,12 @@ def test_warehouse_coverage_uses_partition_stats_without_full_read(tmp_path, mon
     assert coverage["daily_bars"].symbols == 2
     assert coverage["daily_bars"].start_date.isoformat() == "2015-01-05"
     assert coverage["daily_bars"].end_date.isoformat() == "2016-01-04"
-    # 累计口径：600519 窗口 [2015-01-05, 2016-01-04] 覆盖全区间，实有 2 行；
-    # 000001 窗口 [2016-01-04, 2016-01-04] 实有 1 行 → 缺口 = 区间交易日数 − 2 − 0。
+    # 口径修订后：600519 窗口内的内部洞落在“无任何行”的交易日上——横截面
+    # 证据下这些日子的缺行方向是可补（thin），记入 missing_rows；两只股票都
+    # 同步到窗口末行 → 尾部缺口 0 → suspension_rows 为 0。
     span = len(a_share_trade_dates(pd.Timestamp("2015-01-05"), pd.Timestamp("2016-01-04")))
     assert coverage["daily_bars"].missing_rows == span - 2
+    assert coverage["daily_bars"].suspension_rows == 0
     assert coverage["market_cap"].symbols == 2
     assert coverage["market_cap"].missing_rows == 0
     assert coverage["capital_flow"].symbols == 0
@@ -614,6 +616,50 @@ def test_build_daily_bars_coverage_sees_tail_gap_without_explicit_end_date(tmp_p
 
     explicit_end = build_daily_bars_coverage(cache, warehouse, symbols=["000001"], end_date="2016-01-04")
     assert len(explicit_end.items[0].missing_trade_dates) == len(item.missing_trade_dates)
+
+
+def test_coverage_classifies_internal_gaps_by_cross_section_evidence(tmp_path):
+    """内部洞按横截面证据分类：市场正常日=停牌（不可补），thin day=疑似写入失败（可补）。
+
+    停更尾部不参与分类，永远记入 missing_rows——它是“多久没同步”的可行动信号。
+    """
+    warehouse = Warehouse(tmp_path)
+    layout = {
+        # 000001 全程在场；000002 只在 06-01（06-02/03/04 全是停更尾部）；
+        # 000003 缺 06-02（thin day）与 06-03（市场正常日→停牌类）；
+        # 000004/5/6 只缺 06-02（thin day→可补）。
+        "000001": ("2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"),
+        "000002": ("2026-06-01",),
+        "000003": ("2026-06-01", "2026-06-04"),
+        "000004": ("2026-06-01", "2026-06-03", "2026-06-04"),
+        "000005": ("2026-06-01", "2026-06-03", "2026-06-04"),
+        "000006": ("2026-06-01", "2026-06-03", "2026-06-04"),
+    }
+    rows = [
+        {
+            "symbol": symbol,
+            "trade_date": day,
+            "open": 10.0,
+            "high": 10.5,
+            "low": 9.8,
+            "close": 10.2,
+            "volume": 1000,
+        }
+        for symbol, days in layout.items()
+        for day in days
+    ]
+    warehouse.write_daily_bars(pd.DataFrame(rows))
+
+    coverage = {item.dataset: item for item in warehouse.coverage()}
+    daily = coverage["daily_bars"]
+
+    # 行数分布：06-01=6、06-02=1、06-03=4、06-04=6 → 中位数 5，thin 阈值 2.5：
+    # - 06-02 thin day：spanning 6 − 实有 1 = 5（000003..000006，000002 不跨此日）→ missing_rows
+    # - 06-03 市场正常：spanning 5 − 实有 4 = 1（000003）→ suspension_rows
+    # - 06-04 市场正常：spanning 6 − 实有 6 = 0
+    # - 尾部：000002 止于 06-01 → 3 个交易日 → missing_rows
+    assert daily.missing_rows == 7
+    assert daily.suspension_rows == 1
 
 
 def test_coverage_capital_flow_counts_symbols_absent_from_flow(tmp_path):

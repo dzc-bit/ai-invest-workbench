@@ -4,6 +4,7 @@ export type DatasetCoverage = {
   start_date: string | null;
   end_date: string | null;
   missing_rows: number;
+  suspension_rows: number;
 };
 
 export type DataServiceStatus = {
