@@ -23,7 +23,7 @@ describe("createTauriUpdateApi", () => {
   it("uses the package version in browser preview", async () => {
     const api = createTauriUpdateApi();
 
-    await expect(api.getVersion()).resolves.toBe("1.5.1");
+    await expect(api.getVersion()).resolves.toBe("1.5.2");
   });
 
   it("retries transport failures but not signature failures", async () => {
