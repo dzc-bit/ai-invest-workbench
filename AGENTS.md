@@ -207,7 +207,7 @@ tests/test_capital_flow_crawler.py
 
 配套明细：`Warehouse.data_gap_profile()`（停更分布/疑似写入失败日/市值与资金流停更尾部，只读最近年分区，10 分钟缓存、写入自动失效、lifecycle 变更即失效）。已标记退市的股票从停更分布剔除并单列 `delisted_symbols`（退市是终态不是缺口）。数据中心"缺失数据监控"折叠区与 AI 工具 `data_health_report` 消费同一份明细，保证 UI 与 AI 看到一致的"具体缺什么"；`data_health_report` 另带 coverage 快照汇总与损坏分区区分（`error_code=warehouse_corrupt`），模型据此能分辨"先修损坏还是先补数据"。
 
-节假日硬编码表（`data/trading_calendar.py`）只覆盖到有限年份；计算范围超出表覆盖年份时会在日志打一次性 warning，**每年发布前必须更新 `_A_SHARE_HOLIDAY_RANGES`**，否则次年春节/国庆会被计成永远补不回来的缺口。
+节假日硬编码表（`data/trading_calendar.py`）覆盖 **2015~2028** 年；计算范围超出表覆盖年份时会在日志打一次性 warning（上界与下界都查），**每年发布前必须把新一年追加进 `_A_SHARE_HOLIDAY_RANGES`**，否则该年春节/国庆会被计成永远补不回来的缺口。历史教训：表曾只从 2024 年起，2022-2023 年的节假日被当成交易日，制造了 17 万+“节假日幽灵缺口”并被 thin-day 规则误判为可补——新增年份时用数据仓自校验（真节假日当天仓库行数应≈0，相邻交易日应有数千行）。
 
 后台刷新期间如果 `/health` 返回三项 coverage 全是 `symbols=0`、无日期、`missing_rows=0` 且 `coverage_refreshing=true`，前端不能把它当权威结果覆盖已有覆盖表；应保留旧覆盖并继续轮询，等刷新完成后的真实快照再更新。
 

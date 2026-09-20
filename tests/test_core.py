@@ -762,3 +762,42 @@ def test_custom_stock_pool_requires_symbols():
 )
 def test_a_share_trade_dates_excludes_2027_and_2028_holidays(holiday):
     assert pd.Timestamp(holiday) not in a_share_trade_dates(holiday, holiday)
+
+
+@pytest.mark.parametrize(
+    "holiday",
+    [
+        # 2015-2023 补录（此前表只从 2024 起，这些休市日曾被当成交易日
+        # 计入缺口，制造出数十万“节假日幽灵缺口”）。
+        "2015-02-19",
+        "2015-09-03",
+        "2016-10-04",
+        "2017-10-05",
+        "2018-02-19",
+        "2019-10-02",
+        "2020-01-28",
+        "2021-02-15",
+        "2022-10-04",
+        "2023-05-01",
+        "2023-09-29",
+        "2023-10-04",
+    ],
+)
+def test_a_share_trade_dates_excludes_2015_to_2023_holidays(holiday):
+    assert pd.Timestamp(holiday) not in a_share_trade_dates(holiday, holiday)
+
+
+@pytest.mark.parametrize(
+    "trade_day",
+    [
+        "2015-01-05",
+        "2015-09-07",
+        "2016-02-15",
+        "2022-10-10",
+        "2023-10-09",
+        "2023-10-30",
+    ],
+)
+def test_a_share_trade_dates_keeps_adjacent_trade_days(trade_day):
+    """补录节假日不得把相邻的真实交易日误删。"""
+    assert pd.Timestamp(trade_day) in a_share_trade_dates(trade_day, trade_day)
