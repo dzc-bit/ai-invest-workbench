@@ -71,20 +71,7 @@ extend or amend this file when the system needs to grow.
 - 标题一律 roman；强调用字重与 accent，不用斜体。
 
 ## Spacing
-间距 token 化（原"后续工作"已落地）：8pt 系派生，4px 起步。所有间距/内边距**新代码必须**经
-`--space-*` 引用，不得再写裸 px（存量裸值按触及即收编处理，不做一次性大扫）。
-
-| Token | 值 | 用途 |
-| --- | --- | --- |
-| `--space-1` | 4px | 紧邻元素（图标与文字、徽标与标签） |
-| `--space-2` | 8px | 列表项间距、小内边距 |
-| `--space-3` | 12px | 卡片内边距、控件间距 |
-| `--space-4` | 16px | 区块内边距 |
-| `--space-5` | 20px | 区块间距 |
-| `--space-6` | 24px | 大区块分隔 |
-
-## Layout
-抽屉宽度：`--drawer-width: 480px`（AI 抽屉的唯一宽度声明，窄屏由 `min(…, 100vw)` 收口）。
+继承现有 8pt 系裸值（本次仅锁定颜色/字号/圆角；间距 token 化列为后续工作）。
 
 ## Radius
 `--radius-s: 6px` · `--radius-m: 8px` · `--radius-l: 12px` · `--radius-xl: 16px` · `--radius-pill: 999px`。

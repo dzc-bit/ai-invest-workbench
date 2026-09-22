@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DataCenter } from "./DataCenter";
 
 const apiMocks = vi.hoisted(() => ({
@@ -21,16 +21,12 @@ vi.mock("../api", async (importOriginal) => ({
 }));
 
 const coverage = [
-  { dataset: "daily_bars", symbols: 3, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 0, suspension_rows: 0 }
+  { dataset: "daily_bars", symbols: 3, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 0 }
 ];
 
 describe("DataCenter lifecycle badges", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    // 冻结"今天"：缺省补数区间由 recentAShareTradingDateRange() 按真实系统日期
-    // 算出，而"未上市"徽标判定的是 窗口起点 < listing_date。不冻结的话，真实日期
-    // 一旦越过夹具里的 2026-09-15，窗口起点就不再早于上市日，断言会随日历失效。
-    vi.setSystemTime(new Date("2026-06-07T10:00:00+08:00"));
     vi.clearAllMocks();
     apiMocks.ensureDataService.mockResolvedValue({
       running: true,
@@ -84,10 +80,6 @@ describe("DataCenter lifecycle badges", () => {
         }
       ]
     });
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
   });
 
   it("marks delisted and not-yet-listed symbols in the coverage details", async () => {

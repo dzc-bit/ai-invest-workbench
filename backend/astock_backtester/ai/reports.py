@@ -30,7 +30,6 @@ from typing import Any
 
 from astock_backtester.ai.config import AiConfig
 from astock_backtester.ai.context import wrap_untrusted
-from astock_backtester.ai.prompts import build_review_prompt
 from astock_backtester.models import BacktestSettings, StrategyConfig
 
 REPORT_DIR_NAME = "AI报告"
@@ -191,6 +190,18 @@ def _gather_review_sources(backend: Any, digest_items: list[dict[str, Any]]) -> 
         lines = [f"- {item.get('title')}｜{item.get('summary')}" for item in digest_items[:6]]
         sections.append("【AI 聚合要点】\n" + "\n".join(lines))
     return "\n\n".join(sections)
+
+
+REVIEW_PROMPT = """你是 A 股收盘复盘撰稿人。基于以下当日多源数据，输出一份 markdown 复盘报告（500-900 字）：
+# {date} 收盘复盘
+## 大盘与量能（指数涨跌、红绿家数、量能观察；数据缺失的部分明确写“数据缺失”）
+## 主线与板块（从新闻/复盘/涨停信息归纳 1-3 条主线，注明来源）
+## 消息面要点（3-5 条，标注来源）
+## 风险与明日关注（2-3 条，含风险提示）
+只使用给定数据中的事实与数字，禁止编造；结尾加一行“本报告由本地 AI 自动生成，仅供辅助观察，不构成投资建议。”。
+
+数据：
+{data}"""
 
 
 def _fallback_review_report(now_local: datetime, sources: str) -> str:
@@ -432,12 +443,10 @@ class ScheduledReportEngine:
         model = self._model_provider() if config.is_configured() else None
         if model is not None:
             try:
-                prompt = build_review_prompt(
-                    config.research_style,
-                    date_text=now_local.strftime("%Y-%m-%d"),
-                    data_text=sources,
-                )
-                for event in model.chat([{"role": "user", "content": prompt}], tools=None):
+                for event in model.chat(
+                    [{"role": "user", "content": REVIEW_PROMPT.format(date=now_local.strftime("%Y-%m-%d"), data=sources)}],
+                    tools=None,
+                ):
                     if event[0] == "final":
                         content = str((event[1] or {}).get("content") or "")
             except Exception:  # noqa: BLE001 - 模型失败回退数据摘要版

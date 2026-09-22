@@ -1,19 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
-import { readPackageVersion } from "../appVersion";
 
-// 仓库根的 package.json 是版本单一事实来源；jsdom 下 import.meta.url 不是 file
-// scheme、worker 的 cwd 也可能在别处，所以从候选路径探测（与 AiOverflow.test.tsx 同策略）。
-// readPackageVersion(root) 内部按 `root/../package.json` 找，因此这里传 frontend/。
-function resolveFrontendDir(): string {
-  for (const candidate of [resolve("frontend"), resolve(".")]) {
-    if (existsSync(resolve(candidate, "..", "package.json"))) {
-      return candidate;
-    }
-  }
-  throw new Error("找不到 frontend/ 目录");
-}const invokeMock = vi.hoisted(() => vi.fn());
+const invokeMock = vi.hoisted(() => vi.fn());
 const updaterCheckMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -36,9 +23,7 @@ describe("createTauriUpdateApi", () => {
   it("uses the package version in browser preview", async () => {
     const api = createTauriUpdateApi();
 
-    // 断言"等于 package.json 里的版本"而不是抄一份字面量：抄数字每轮发版都要改，
-    // 忘了改就是一次假失败（发版纪律由 tests/test_scripts.py 的清单守卫把关）。
-    await expect(api.getVersion()).resolves.toBe(readPackageVersion(resolveFrontendDir()));
+    await expect(api.getVersion()).resolves.toBe("1.5.2");
   });
 
   it("retries transport failures but not signature failures", async () => {

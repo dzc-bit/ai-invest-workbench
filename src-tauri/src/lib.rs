@@ -52,7 +52,6 @@ pub fn run() {
         .manage(Mutex::new(service_manager::DataServiceManager::default()))
         .setup(|app| {
             build_main_window(app)?;
-            service_manager::ensure_nine_router_gateway();
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;

@@ -4,20 +4,19 @@
 
 面向 A 股的本地优先 AI 投研终端：本地数据仓 + 实时行情 + 财联社资讯聚合 + 风险清单监控 + LLM AI 投研 Agent（评股对话 / 本地知识检索 / 参数寻优 / 资讯摘要）+ 策略回测。前端 React + TypeScript，桌面容器 Tauri，本地数据服务与回测执行由 Python 承担。
 
-当前版本：`1.6.0`
+当前版本：`1.5.1`
 
 本轮与历轮发布内容统一记在 [`CHANGELOG.md`](CHANGELOG.md)；本文件只描述“现在能做什么”，不堆发布流水账。
 
 ## 面向用户
 
 - 策略条件一句话生成：在"策略配置 → AI 条件理解"里用口语描述买卖规则，AI 解析成可勾选的条件清单（含近似说明），确认后写入策略；需要精细控制时展开"高级模式"手工编辑。
-- **三种研究风格，输出真的不一样**：设置里可选保守（防御型）/ 均衡（默认）/ 激进（进攻型），三者的取证清单、结论骨架与决策口径彼此独立——激进风格按龙头选手视角作答（情绪周期定位、连板梯队与断层、龙头辨识度、打板/低吸/半路参与语义、断板预案与仓位纪律），保守风格则先算下行风险与安全边际。风格同时作用于对话、回测点评与定时复盘报告。
-- AI 助手：右上角"AI 助手"唤起右侧抽屉。抽屉顶部按"对话 / 历史 / 快讯 / 报告"切换，主区一次只显示一个面板，消息区始终占满剩余高度；支持个股诊断、大盘快评、自然语言生成策略并一键回测、回测结果解读；工具调用过程与数据来源全部可见。
-- AI 对话历史：关掉抽屉或重启应用后再打开，会自动续上最近一条对话；"历史"面板列出全部会话，可切换或新建一条。追问仍在同一会话里，更早的内容（含压缩后的会话纪要）会继续被引用。旧会话由后端按容量与保留期自动回收，无需手工清理。
+- AI 助手：右上角"AI 助手"唤起右侧抽屉，支持个股诊断（技术/资金/估值/消息四维）、大盘快评、自然语言生成策略并一键回测、回测结果解读；工具调用过程与数据来源全部可见。
+- AI 对话历史：关掉抽屉或重启应用后再打开，会自动续上最近一条对话；"历史对话"折叠区列出全部会话，可切换、删除或新建一条。追问仍在同一会话里，更早的内容（含压缩后的会话纪要）会继续被引用。
 - AI 参数寻优：策略配置页底部"AI 参数寻优"面板，选 2–4 个参数给候选值（最多 48 组合），一键网格回测出对比表 + AI 解读最优区间与过拟合警告。
 - 回测报告导出：回测完成后"导出报告"一键下载单文件 HTML（权益曲线、指标、交易明细、AI 解读），可直接存档或分享。
 - 数据中心：维护 A 股日线、资金流、市值和覆盖信息，支持导入、全市场同步、指定股票补齐和资金流补齐；"AI 诊断缺失"按钮分析覆盖缺口并指路补齐操作；"数据源健康监控"折叠卡实时展示各数据源最近成功状态。
-- 覆盖口径可信：新上市股票上市前、已退市股票退市后不再算"缺失"，停牌类缺行单列（公开渠道天然没有停牌 K 线，不可补也不该算作数据问题）；覆盖表与同步进度反映真实**可行动**缺口（逐股明细带"未上市/已退市"徽标）。
+- 覆盖口径可信：新上市股票上市前、已退市股票退市后不再算"缺失"，覆盖表与同步进度反映真实缺口（逐股明细带"未上市/已退市"徽标）。
 - 策略回测：支持入场/离场条件、仓位参数、止盈止损、涨跌停约束和流式回测结果。
 - 行情看板：展示指数、红绿家数、强势板块、行情评价、新闻摘要、资讯事件、同花顺复盘/早盘和风险提示；后端有新数据或出现 AI 快讯时通过事件流即时提醒。
 - 候选股票：回测结果通过 `latest_strategy_matches.matches` 展示符合当前策略的个股。
@@ -41,11 +40,11 @@
 | 前端 | `frontend/src` | React + TypeScript，页面、状态、图表和结构化接口消费；API 层统一在 `api.ts`（含浏览器预览 mock 双轨），AI 对话流在 `aiApi.ts`，轮询类逻辑收敛在 `hooks/`；视觉系统由根目录 `design.md` 锁定（`:root` token 块 + A 股红涨绿跌语义） |
 | 桌面容器 | `src-tauri/src` | Tauri + Rust，负责桌面命令、本地服务启动（含 sidecar 五重身份校验）、策略保存和更新器 |
 | 本地后端 | `backend/astock_backtester` | Python，自写 HTTP 服务 + 数据 provider + 仓库 + 回测引擎；回测条件在 `conditions.py` 注册表统一维护（行级求值与向量化预过滤成对注册）；`symbol_lifecycle` 表驱动覆盖/同步的上市–退市窗口口径 |
-| AI 子系统 | `backend/astock_backtester/ai` | 独立子包：openai SDK 薄封装、工具注册表（本地数据 + a-stock-data 裁剪端点）、Agent 循环、上下文预算、分层记忆、会话存储与自动回收、RAG 检索、快讯引擎、条件解析/单段点评/参数寻优轻路由；对数据仓只读 |
+| AI 子系统 | `backend/astock_backtester/ai` | 独立子包：openai SDK 薄封装、工具注册表（本地数据 + a-stock-data 裁剪端点）、Agent 循环、上下文预算、会话存储、RAG 检索、快讯引擎、条件解析/单段点评/参数寻优轻路由；对数据仓只读 |
 | 共享数据设施 | `backend/astock_backtester/data` | `symbols.py`/`parsing.py` 收敛符号与数值解析，`http_transport.py` 统一 UA、代理策略和重试传输 |
-| 测试 | `tests`、`frontend/src/*.test.*` | 三层测试：后端（行为级，含 AI 子系统）、前端（≥270 断言）、Rust；回环 HTTP 测试自带代理隔离 |
+| 测试 | `tests`、`frontend/src/*.test.*` | 三层测试：后端（行为级，含 AI 子系统）、前端（≥250 断言）、Rust；回环 HTTP 测试自带代理隔离 |
 
-依赖方向保持单向（`service → data/* → models`，data 层不反向依赖根包），全仓零 import 环。错误响应携带稳定 `code`（`no_local_data` / `validation_error` / `payload_error` / `request_failed`；AI 另有 `ai_not_configured` / `ai_upstream_error` / `ai_session_busy` / `ai_session_not_found`），前端按错误码翻译文案。
+依赖方向保持单向（`service → data/* → models`，data 层不反向依赖根包），全仓零 import 环。错误响应携带稳定 `code`（`no_local_data` / `validation_error` / `payload_error` / `request_failed`），前端按错误码翻译文案。
 
 ## 质量门禁
 
@@ -76,7 +75,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 | 风险与策略 | `GET /risk/alerts`、`GET /strategy/recommended`、`POST /strategy/conditions/validate` |
 | 回测 | `POST /run/backtest/stream` |
 | AI 助手 | `GET /ai/status`、`GET /ai/news`、`GET /ai/config`、`POST /ai/config`、`GET /ai/config/reveal`（仅限本机桌面端，带 Host/Origin 校验）、`POST /ai/chat/stream`、`GET /ai/events/stream` |
-| AI 会话历史 | `GET /ai/sessions`（会话列表）、`GET /ai/session?session_id=`（回读展示转录）、`POST /ai/session/delete`（显式删除；日常回收由写侧 `SessionStore.prune` 自动完成） |
+| AI 会话历史 | `GET /ai/sessions`（会话列表）、`GET /ai/session?session_id=`（回读展示转录）、`POST /ai/session/delete`（删除会话） |
 | AI 轻路由 | `POST /ai/conditions/parse`（自然语言→条件 DSL，自愈校验）、`POST /ai/insight/oneshot`（场景化单段点评）、`POST /ai/optimize`（参数网格寻优，NDJSON 流式） |
 | AI 报告与过拟合 | `GET /ai/reports`、`GET /ai/report/file?name=`、`POST /ai/overfit/check` |
 

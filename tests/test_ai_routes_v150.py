@@ -61,15 +61,6 @@ def _configure_ai(server) -> None:
     )
 
 
-def _configure_style(server, style: str) -> None:
-    """/ai/config 是整体覆盖语义：只发 research_style 会把 base_url 清空。"""
-    _request_json(
-        "POST",
-        f"http://127.0.0.1:{server.server_address[1]}/ai/config",
-        {"base_url": "http://127.0.0.1:9", "api_key": "sk-test", "model": "demo", "research_style": style},
-    )
-
-
 class FakeModel:
     """Scripted chat model returning one canned final content per call."""
 
@@ -244,48 +235,6 @@ def test_insight_oneshot_returns_single_paragraph(tmp_path, monkeypatch):
         assert result["scene"] == "results_overview"
         assert "3.2%" in result["text"]
         assert result["generated_at"]
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-
-
-def test_insight_oneshot_carries_the_configured_research_style(tmp_path, monkeypatch):
-    """风格只作用于 chat 时，切风格对点评/寻优/复盘毫无影响——这是"三种风格没差别"
-    的一半来源。点评必须把当前风格指令一起送进提示词。"""
-    server, thread, port = _start_server(tmp_path)
-    _configure_ai(server)
-    model = FakeModel(["情绪处于发酵期，晋级率尚可，接力需控制仓位。"])
-    _stub_model(server, monkeypatch, model)
-    try:
-        _configure_style(server, "aggressive")
-        _request_json(
-            "POST",
-            f"http://127.0.0.1:{port}/ai/insight/oneshot",
-            {"scene": "results_overview", "context": {"total_return_pct": 0.032}},
-        )
-        prompt = model.calls[-1][0]["content"]
-        assert "龙头选手" in prompt
-        assert "价值" in prompt  # 明确不做价值型评论
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-
-
-def test_data_coverage_oneshot_ignores_trading_style(tmp_path, monkeypatch):
-    """覆盖诊断与交易风格无关：注入风格指令反而是噪声。"""
-    server, thread, port = _start_server(tmp_path)
-    _configure_ai(server)
-    model = FakeModel(["资金流字段缺失，点“补齐资金流”即可。"])
-    _stub_model(server, monkeypatch, model)
-    try:
-        _configure_style(server, "aggressive")
-        _request_json(
-            "POST",
-            f"http://127.0.0.1:{port}/ai/insight/oneshot",
-            {"scene": "data_coverage", "context": {"symbols": 1}},
-        )
-        prompt = model.calls[-1][0]["content"]
-        assert "视角：" not in prompt
     finally:
         server.shutdown()
         thread.join(timeout=5)

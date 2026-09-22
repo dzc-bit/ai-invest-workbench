@@ -267,6 +267,10 @@ export function mockAiSessionDetail(sessionId: string): AiSessionDetail {
   };
 }
 
+export function mockAiSessionDelete(sessionId: string): boolean {
+  return sessionId.length > 0;
+}
+
 export function mockAiConditionParse(text: string): AiConditionParseResult {
   const trimmed = text.trim() || "近5天放量上涨，破20日线卖";
   return {
