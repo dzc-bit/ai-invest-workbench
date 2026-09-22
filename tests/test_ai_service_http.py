@@ -263,6 +263,71 @@ class _RecordingStubAgent:
         return {}
 
 
+class _SystemPromptStubAgent:
+    """只记录本轮拿到的 system prompt，用于守卫风格/记忆的注入口径。"""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+        self.prompts.append(system_prompt)
+        session["display"].append({"role": "assistant", "content": "已记录。", "tool_steps": [], "ts": "now"})
+        return {}
+
+
+def _seed_memory(server) -> None:
+    """写一条"自认龙头选手"的长期记忆：这正是会把三种风格揉平的典型内容。"""
+    store = server.state.ai_service()._memory
+    store.apply_ops([{"op": "add", "content": "自认是龙头选手，偏好连板妖股", "category": "style", "weight": 3}])
+
+
+def test_ai_chat_stream_states_style_beats_long_term_memory(tmp_path, monkeypatch):
+    """风格必须压过记忆里自述的交易风格，否则切风格等于没切。"""
+    server, thread, port = _start_server(tmp_path)
+    _request_json(
+        "POST",
+        f"http://127.0.0.1:{port}/ai/config",
+        {"base_url": "http://127.0.0.1:9", "api_key": "sk-test", "model": "demo", "research_style": "conservative"},
+    )
+    stub = _SystemPromptStubAgent()
+    ai_service = server.state.ai_service()
+    monkeypatch.setattr(ai_service, "_agent", stub)
+    _seed_memory(server)
+    try:
+        _request_ndjson(f"http://127.0.0.1:{port}/ai/chat/stream", {"message": "帮我看看 002402"})
+        prompt = stub.prompts[-1]
+        assert "当前研究风格：保守" in prompt
+        # 记忆仍要注入（个性化），但必须明确风格优先
+        assert "风格与记忆的优先级" in prompt
+        assert "优先级高于长期记忆" in prompt
+        # 提示里要给出冲突时的具体处理方式，而不是只说"以风格为准"
+        assert "切到激进风格" in prompt
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_ai_chat_stream_bumps_hits_for_injected_memories(tmp_path, monkeypatch):
+    """被注入上下文并真正用上的记忆要累计 hits，否则 hit-boost 永远是死代码。"""
+    server, thread, port = _start_server(tmp_path)
+    _request_json(
+        "POST",
+        f"http://127.0.0.1:{port}/ai/config",
+        {"base_url": "http://127.0.0.1:9", "api_key": "sk-test", "model": "demo"},
+    )
+    ai_service = server.state.ai_service()
+    monkeypatch.setattr(ai_service, "_agent", _SystemPromptStubAgent())
+    _seed_memory(server)
+    before = {record.id: record.hits for record in ai_service._memory.load()}
+    try:
+        _request_ndjson(f"http://127.0.0.1:{port}/ai/chat/stream", {"message": "再看下资金面"})
+        after = {record.id: record.hits for record in ai_service._memory.load()}
+        assert after and all(after[record_id] == hits + 1 for record_id, hits in before.items())
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_ai_session_history_routes(tmp_path, monkeypatch):
     server, thread, port = _start_server(tmp_path)
     base = f"http://127.0.0.1:{port}"

@@ -70,6 +70,15 @@
   --radius-l: 12px;
   --radius-xl: 16px;
   --radius-pill: 999px;
+  /* spacing scale（8pt 系，4px 起步；新代码必须经 token 引用） */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  /* layout */
+  --drawer-width: 480px;
   font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
   color: var(--ink);
   background: var(--backdrop);

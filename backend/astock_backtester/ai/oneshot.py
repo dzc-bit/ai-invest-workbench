@@ -36,10 +36,10 @@ def compact_context(context: Any) -> str:
     return text[:MAX_CONTEXT_CHARS]
 
 
-def insight_oneshot(model: Any, scene: str, context: Any) -> str:
+def insight_oneshot(model: Any, scene: str, context: Any, style: str = "balanced") -> str:
     if scene not in ONESHOT_SCENES:
         raise ValueError(f"未知点评场景：{scene}（可选：{', '.join(ONESHOT_SCENES)}）")
-    text = oneshot_text(model, build_oneshot_messages(scene, compact_context(context)))
+    text = oneshot_text(model, build_oneshot_messages(scene, compact_context(context), style))
     if not text:
         raise ValueError("模型没有返回点评内容")
     return text

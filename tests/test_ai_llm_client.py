@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import pytest
 from astock_backtester.ai.config import AiConfig
 from astock_backtester.ai.errors import AiNotConfigured, AiUpstreamError
-from astock_backtester.ai.llm_client import OpenAiCompatibleClient, estimate_tokens
+from astock_backtester.ai.llm_client import (
+    OpenAiCompatibleClient,
+    _default_client_factory,
+    _loopback_base_url,
+    estimate_tokens,
+)
 
 
 def _configured_config(**overrides) -> AiConfig:
@@ -86,3 +91,63 @@ def test_estimate_tokens_counts_cjk_and_ascii():
     assert estimate_tokens("") == 0
     assert estimate_tokens("你好") == 2
     assert estimate_tokens("abcd") == 1
+
+
+class _FakeAnthropicResponse:
+    status_code = 200
+    text = ""
+
+    def iter_lines(self, decode_unicode=True):
+        return iter(["event: ping", ""])
+
+    def close(self):
+        pass
+
+
+def _anthropic_post_trust_env(monkeypatch, base_url):
+    import requests
+
+    captured = {}
+
+    def fake_post(self, url, **kwargs):
+        captured["trust_env"] = self.trust_env
+        captured["url"] = url
+        return _FakeAnthropicResponse()
+
+    monkeypatch.setattr(requests.Session, "post", fake_post)
+    config = _configured_config(base_url=base_url)
+    client = OpenAiCompatibleClient(lambda: config)
+    events = list(client._default_anthropic_post(config, {}))
+    assert events == ["event: ping"]
+    return captured
+
+
+def test_loopback_base_url_matches_ipv4_ipv6_and_localhost():
+    assert _loopback_base_url(_configured_config(base_url="http://127.0.0.1:20128/v1"))
+    assert _loopback_base_url(_configured_config(base_url="http://localhost:20128/v1"))
+    assert _loopback_base_url(_configured_config(base_url="http://[::1]:20128/v1"))
+    assert not _loopback_base_url(_configured_config(base_url="https://api.example.com/v1"))
+    assert not _loopback_base_url(_configured_config(base_url=""))
+
+
+def test_default_client_factory_bypasses_env_proxy_for_loopback():
+    client = _default_client_factory(_configured_config(base_url="http://127.0.0.1:20128/v1"))
+    assert client._client.trust_env is False
+    client.close()
+
+
+def test_default_client_factory_keeps_default_client_for_remote():
+    client = _default_client_factory(_configured_config(base_url="https://api.example.com/v1"))
+    assert client._client.trust_env is True
+    client.close()
+
+
+def test_anthropic_post_bypasses_env_proxy_for_loopback(monkeypatch):
+    captured = _anthropic_post_trust_env(monkeypatch, "http://127.0.0.1:20128")
+    assert captured["trust_env"] is False
+    assert captured["url"] == "http://127.0.0.1:20128/v1/messages"
+
+
+def test_anthropic_post_keeps_env_proxy_for_remote(monkeypatch):
+    captured = _anthropic_post_trust_env(monkeypatch, "https://api.example.com")
+    assert captured["trust_env"] is True

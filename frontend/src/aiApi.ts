@@ -28,7 +28,6 @@ import {
   mockAiOptimizeEvents,
   mockAiReports,
   mockAiSaveConfig,
-  mockAiSessionDelete,
   mockAiSessionDetail,
   mockAiSessions,
   mockAiStatus
@@ -164,19 +163,6 @@ export async function loadAiSession(baseUrl: string, sessionId: string): Promise
     throw new BackendError(typeof json.code === "string" ? json.code : "request_failed", "历史对话回读失败");
   }
   return json as AiSessionDetail;
-}
-
-export async function deleteAiSession(baseUrl: string, sessionId: string): Promise<boolean> {
-  if (!isTauriRuntime()) {
-    return mockAiSessionDelete(sessionId);
-  }
-  const result = await aiPostJson<{ deleted?: boolean }>(
-    baseUrl,
-    "/ai/session/delete",
-    { session_id: sessionId },
-    "历史会话删除失败"
-  );
-  return result.deleted === true;
 }
 
 export async function aiOverfitCheck(
