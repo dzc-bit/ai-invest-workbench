@@ -43,6 +43,20 @@ type Props = {
   onInsightsShown?: () => void;
 };
 
+/**
+ * 抽屉内的视图：主区同一时刻只渲染一个面板，避免历史/快讯/报告三个折叠块
+ * 常驻堆叠——它们曾占掉抽屉约 46% 的固定高度（含定时报告默认 open），
+ * 且占用量随会话数增长。改成切换后，消息区高度与这些列表完全解耦。
+ */
+type AiDrawerView = "chat" | "history" | "insights" | "reports";
+
+const DRAWER_VIEWS: Array<{ value: AiDrawerView; label: string }> = [
+  { value: "chat", label: "对话" },
+  { value: "history", label: "历史" },
+  { value: "insights", label: "快讯" },
+  { value: "reports", label: "报告" }
+];
+
 const QUICK_PROMPTS: Array<{ label: string; message: string }> = [
   { label: "大盘快评", message: "结合当前实时行情和最新新闻，做一次大盘快评。" },
   { label: "今日复盘要点", message: "根据同花顺复盘和早盘内容，总结今日市场主线与风险点。" },
@@ -98,6 +112,7 @@ export function AiAssistantPanel({
   onInsightsShown
 }: Props) {
   const [status, setStatus] = useState<AiStatus | null>(null);
+  const [view, setView] = useState<AiDrawerView>("chat");
   const [turns, setTurns] = useState<AiDisplayTurn[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [phase, setPhase] = useState<string | null>(null);
@@ -112,6 +127,9 @@ export function AiAssistantPanel({
   const [config, setConfig] = useState<AiConfigView | null>(null);
   const [configSaving, setConfigSaving] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
+  // 未读快讯徽标：切走「快讯」后新到的条目只在切换条上计数，否则用户不会主动切过去看。
+  const lastSeenInsightsRef = useRef(0);
+  const [unseenInsights, setUnseenInsights] = useState(0);
   const [lastStrategy, setLastStrategy] = useState<StrategyConfig | null>(null);
   const [lastChart, setLastChart] = useState<AiChartArtifact | null>(null);
   const [reports, setReports] = useState<AiReportMeta[]>([]);
@@ -156,11 +174,15 @@ export function AiAssistantPanel({
           setReports([]);
         }
       });
-    onInsightsShown?.();
+    // 悬浮球的未读徽标只在用户**真正停留在快讯面板**时清空：打开抽屉停在对话页
+    // 并不代表看过快讯，此时清空会让后续新条目失去提示。
+    if (view === "insights") {
+      onInsightsShown?.();
+    }
     return () => {
       cancelled = true;
     };
-  }, [open, baseUrl, onInsightsShown]);
+  }, [open, baseUrl, view, onInsightsShown]);
 
   useEffect(() => {
     if (!open || !baseUrl || restoredRef.current) {
@@ -210,6 +232,36 @@ export function AiAssistantPanel({
       abortRef.current?.abort();
     };
   }, []);
+
+  // 未读快讯：以"上次真正停留在快讯面板时的条数"为基线，而不是以"打开抽屉"为基线
+  // ——打开抽屉停在对话页并不代表用户看过快讯。基线存在 ref 里，关抽屉不丢。
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    if (view === "insights") {
+      lastSeenInsightsRef.current = insights.length;
+      setUnseenInsights(0);
+      return;
+    }
+    setUnseenInsights(Math.max(0, insights.length - lastSeenInsightsRef.current));
+  }, [open, view, insights.length]);
+
+  // 切到某个面板时才做它需要的 I/O：历史列表会全量读一遍会话 JSON，不该常挂。
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    if (view === "history") {
+      void refreshSessions();
+    }
+    if (view === "reports" && baseUrl) {
+      loadAiReports(baseUrl)
+        .then((next) => setReports(next.items ?? []))
+        .catch(() => setReports([]));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, view, baseUrl]);
 
   const refreshSessions = async () => {
     if (!baseUrl) {
@@ -482,82 +534,119 @@ export function AiAssistantPanel({
         </div>
       ) : null}
 
-      {/* 历史区永远渲染：列表为空时也要能展开触发刷新，否则“首次开抽屉时
-          无历史 → 之后产生对话 → 列表永无刷新路径”是一条死路。 */}
-      <details
-        className="ai-insights ai-history"
-        onToggle={(event) => {
-          // 展开时才刷新：list_sessions 会全量读一遍会话 JSON，不该挂在每轮响应上。
-          if (event.currentTarget.open) {
-            void refreshSessions();
-          }
-        }}
-      >
-        <summary>{sessions.length > 0 ? `历史对话（${sessions.length}）` : "历史对话"}</summary>
-        {sessions.length > 0 ? (
-          <ul>
-            {sessions.map((item) => (
-              <li
-                key={item.session_id}
-                className={`ai-insight ai-session-item${item.session_id === sessionId ? " current" : ""}`}
-              >
-                <button
-                  type="button"
-                  className="ai-session-open"
-                  aria-current={item.session_id === sessionId ? "true" : undefined}
-                  disabled={streaming || historyBusy !== null}
-                  onClick={() => void openHistorySession(item)}
-                >
-                  <strong>{item.title}</strong>
-                  <small>
-                    {item.message_count} 条 · {formatSessionTime(item.updated_at)}
-                  </small>
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="ai-history-empty">还没有历史会话。开始对话后，再次展开这里即可加载。</p>
-        )}
-      </details>
+      {/* 视图切换条：抽屉的主区同一时刻只承载一个面板（方案 A）。
+          旧实现把历史/快讯/报告三个折叠块纵向堆叠，固定占掉约 46% 的抽屉高度，
+          且占用量随会话数增长；切换后消息区高度与这些列表完全解耦。 */}
+      <nav className="ai-viewswitch" role="tablist" aria-label="AI 抽屉视图">
+        {DRAWER_VIEWS.map((item) => {
+          // 未读只对「快讯」有意义：历史/报告由用户主动产出，不是被动推送。
+          const badge = item.value === "insights" ? unseenInsights : 0;
+          const meta =
+            item.value === "history"
+              ? sessions.length
+              : item.value === "insights"
+                ? insights.length
+                : item.value === "reports"
+                  ? reports.length
+                  : 0;
+          return (
+            <button
+              key={item.value}
+              type="button"
+              role="tab"
+              aria-selected={view === item.value}
+              aria-label={
+                badge > 0 ? `${item.label}（${meta} 条，${badge} 条未读）` : meta > 0 ? `${item.label}（${meta}）` : item.label
+              }
+              className={`ai-viewswitch-tab${view === item.value ? " active" : ""}`}
+              onClick={() => setView(item.value)}
+            >
+              {item.label}
+              {meta > 0 ? <span className="ai-viewswitch-count">{meta}</span> : null}
+              {badge > 0 ? <span className="ai-viewswitch-dot" aria-hidden="true" /> : null}
+            </button>
+          );
+        })}
+      </nav>
 
-      {insights.length > 0 ? (
-        <details className="ai-insights">
-          <summary>AI 快讯（{insights.length}）</summary>
-          <ul>
-            {insights.map((insight) => (
-              <li key={insight.id} className={`ai-insight ${insight.level}`}>
-                <strong>{insight.title}</strong>
-                <span>{insight.digest}</span>
-              </li>
-            ))}
-          </ul>
-        </details>
+      {view === "history" ? (
+        <section className="ai-panel-view" aria-label="历史对话面板">
+          {sessions.length > 0 ? (
+            <ul>
+              {sessions.map((item) => (
+                <li
+                  key={item.session_id}
+                  className={`ai-insight ai-session-item${item.session_id === sessionId ? " current" : ""}`}
+                >
+                  <button
+                    type="button"
+                    className="ai-session-open"
+                    aria-current={item.session_id === sessionId ? "true" : undefined}
+                    disabled={streaming || historyBusy !== null}
+                    onClick={() => {
+                      void openHistorySession(item);
+                      setView("chat");
+                    }}
+                  >
+                    <strong>{item.title}</strong>
+                    <small>
+                      {item.message_count} 条 · {formatSessionTime(item.updated_at)}
+                    </small>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="ai-history-empty">还没有历史会话。开始对话后，回到这里即可切换。</p>
+          )}
+        </section>
       ) : null}
 
-      {reports.length > 0 ? (
-        <details className="ai-insights" open>
-          <summary>定时报告（{reports.length}）</summary>
-          <ul>
-            {reports.slice(0, 8).map((report) => (
-              <li key={report.name} className="ai-insight ai-report-item">
-                <strong>{report.name.replace(/\.md$/, "")}</strong>
-                <button
-                  className="ai-reveal-button"
-                  type="button"
-                  disabled={reportBusy === report.name}
-                  onClick={() => void downloadReport(report)}
-                >
-                  <Download size={13} aria-hidden="true" />
-                  {reportBusy === report.name ? "下载中" : "下载"}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </details>
+      {view === "insights" ? (
+        <section className="ai-panel-view" aria-label="AI 快讯面板">
+          {insights.length > 0 ? (
+            <ul>
+              {insights.map((insight) => (
+                <li key={insight.id} className={`ai-insight ${insight.level}`}>
+                  <strong>{insight.title}</strong>
+                  <span>{insight.digest}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="ai-history-empty">还没有 AI 快讯。服务端触发后会出现在这里。</p>
+          )}
+        </section>
       ) : null}
 
-      <div className="ai-messages" ref={scrollRef}>
+      {view === "reports" ? (
+        <section className="ai-panel-view" aria-label="定时报告面板">
+          {reports.length > 0 ? (
+            <ul>
+              {reports.slice(0, 8).map((report) => (
+                <li key={report.name} className="ai-insight ai-report-item">
+                  <strong>{report.name.replace(/\.md$/, "")}</strong>
+                  <button
+                    className="ai-reveal-button"
+                    type="button"
+                    disabled={reportBusy === report.name}
+                    onClick={() => void downloadReport(report)}
+                  >
+                    <Download size={13} aria-hidden="true" />
+                    {reportBusy === report.name ? "下载中" : "下载"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="ai-history-empty">还没有定时报告。开启后由服务端按计划生成。</p>
+          )}
+        </section>
+      ) : null}
+
+      {view === "chat" ? (
+        <>
+          <div className="ai-messages" ref={scrollRef}>
         {turns.length === 0 && !streaming ? (
           <div className="ai-empty">
             <Bot size={26} aria-hidden="true" />
@@ -629,9 +718,9 @@ export function AiAssistantPanel({
         ) : null}
 
         {error ? <div className="error-banner" role="alert">{error}</div> : null}
-      </div>
+          </div>
 
-      <footer className="ai-composer">
+          <footer className="ai-composer">
         <div className="ai-composer-row">
           <textarea
             value={input}
@@ -664,7 +753,9 @@ export function AiAssistantPanel({
           )}
         </div>
         <small className="ai-disclaimer">AI 生成内容仅供辅助观察，不构成投资建议；数据均来自本地服务与公开数据源。</small>
-      </footer>
+          </footer>
+        </>
+      ) : null}
 
       <AiSettingsModal
         open={settingsOpen}

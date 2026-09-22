@@ -110,7 +110,9 @@ describe("AiAssistantPanel", () => {
       render(
         <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
       );
-      expect(await screen.findByText("定时报告（1）")).toBeTruthy();
+      // 报告列表已移到「报告」切换面板：默认视图是对话，切过去才渲染。
+      await user.click(await screen.findByRole("tab", { name: /报告/ }));
+      expect(await screen.findByText("复盘报告-20260913-1530")).toBeTruthy();
       await user.click(screen.getByRole("button", { name: /下载/ }));
       await waitFor(() => expect(mockedLoadReportFile).toHaveBeenCalledWith("http://x", "复盘报告-20260913-1530.md"));
       expect(anchorClick).toHaveBeenCalled();
@@ -240,7 +242,8 @@ describe("AiAssistantPanel", () => {
     );
     expect(await screen.findByText(/茅台近 30 日/)).toBeTruthy();
     expect(mockedLoadSession).toHaveBeenCalledWith("http://x", "s-1");
-    expect(screen.getByText("历史对话（1）")).toBeTruthy();
+    // 会话数徽标在切换条上，不再是常驻的折叠块标题。
+    expect(await screen.findByRole("tab", { name: /历史（1）/ })).toBeTruthy();
   });
 
   it("keeps follow-ups inside the restored session so the agent keeps its history", async () => {
@@ -285,7 +288,9 @@ describe("AiAssistantPanel", () => {
       <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
     );
     expect(await screen.findByText("s-a 的回答")).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: /^会话 B/ }));
+    // 会话列表现在在「历史」面板里，且点选后会自动切回对话视图。
+    await user.click(await screen.findByRole("tab", { name: /历史/ }));
+    await user.click(await screen.findByRole("button", { name: /^会话 B/ }));
     await waitFor(() => expect(screen.getByText("s-b 的回答")).toBeTruthy());
     await user.click(screen.getByRole("button", { name: "新建对话" }));
     expect(screen.queryByText(/的回答/)).toBeNull();
@@ -308,9 +313,46 @@ describe("AiAssistantPanel", () => {
       <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
     );
     expect(await screen.findByText("s-a 的回答")).toBeTruthy();
+    await user.click(await screen.findByRole("tab", { name: /历史/ }));
     expect(screen.queryByRole("button", { name: /删除会话/ })).toBeNull();
     // 切换会话的能力必须保留
-    await user.click(screen.getByRole("button", { name: /^会话 A/ }));
+    await user.click(await screen.findByRole("button", { name: /^会话 A/ }));
     expect(mockedLoadSession).toHaveBeenCalledWith("http://x", "s-a");
+  });
+
+  it("keeps the composer height out of the non-chat panels", async () => {
+    // 方案 A 的核心收益：历史/快讯/报告不再常驻堆叠，切走对话时它们不占消息区高度。
+    const user = userEvent.setup();
+    render(
+      <AiAssistantPanel
+        open
+        baseUrl="http://x"
+        insights={[
+          {
+            id: "i1",
+            created_at: "2026-09-22T00:00:00Z",
+            level: "info",
+            title: "快讯",
+            digest: "红盘占比回升",
+            source: "ai-insight",
+            disclaimer: "AI 生成内容，仅供辅助观察，不构成投资建议"
+          }
+        ]}
+        task={null}
+        onTaskConsumed={() => undefined}
+        onClose={() => undefined}
+      />
+    );
+    // 默认停在对话视图：消息区与输入区在，历史列表不在。
+    expect(await screen.findByPlaceholderText(/帮我看看 600519/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^会话/ })).toBeNull();
+
+    await user.click(await screen.findByRole("tab", { name: /快讯/ }));
+    // 切到快讯后：面板出现，消息区与输入区让位（同一槽位只渲染一个面板）。
+    expect(await screen.findByText("红盘占比回升")).toBeTruthy();
+    expect(screen.queryByPlaceholderText(/帮我看看 600519/)).toBeNull();
+
+    await user.click(screen.getByRole("tab", { name: /对话/ }));
+    expect(await screen.findByPlaceholderText(/帮我看看 600519/)).toBeTruthy();
   });
 });

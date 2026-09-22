@@ -963,7 +963,7 @@ def test_release_manifests_use_one_version():
         tauri_version,
         init_version,
     }
-    assert all_versions == {"1.5.2"}
+    assert all_versions == {"1.6.0"}
 
 
 def test_deprecated_full_array_strategy_mutation_is_removed():

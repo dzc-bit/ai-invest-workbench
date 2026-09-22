@@ -378,7 +378,7 @@ python -m ruff check backend tests scripts
    - 会话历史回读只允许暴露 `display`（`facade.session_view`）：协议消息、`pending_archive` 与 `rolling_summary` 不得出现在任何 HTTP 响应里，否则恢复出来的历史就能反向注入模型指令。会话回收靠**写侧动态自动清理**（`SessionStore.save` 后调 `prune`：条数上限 + 保留期，`exclude` 与忙碌会话永不动；忙判定由 facade 经 `set_busy_check` 注入，且必须同时看 `refs > 0` 与锁——只看 `lock.locked()` 会漏掉"已认领、还没 acquire"的窗口，那正是 `_SessionLockEntry` 注释里否决过的判定）。`prune` 只回收**看起来像会话**的文件（有 `session_id`，与 `list_sessions` 同口径），目录里混进导出/手写 JSON 不得被回收。`POST /ai/session/delete` 保留给脚本/测试，忙时抛 `ai_session_busy`，因为 worker 的 `finally` 会把同名文件重新写回来。
    - **研究风格必须真正改变输出**（1.5.2 起）：`prompts.STYLE_PROMPTS` 三种风格各自带独立输出骨架 + 取证清单 + 决策口径；通用人设 `CORE_RULES` **不得**写死单一输出骨架（旧"四维/评股模板"已删）。风格必须贯穿所有 AI 出口——chat（`build_system_prompt`）、一次性点评（`build_oneshot_messages` 的 `style_directive`）、复盘报告（`build_review_prompt` 的 `style_sections`）；`data_coverage` 与交易风格无关，天然不吃风格。风格与长期记忆冲突时**风格优先**（facade 追加"风格与记忆的优先级"段落）。守卫在 `tests/test_ai_style_prompts.py`。
    - 长期记忆：召回与 hit-boost 必须同源（`MemoryStore.recall()` 返回 `injected_ids`，facade 交给 `bump_hits` 落盘），拆成两次查询会让 `recall_score` 的 hits 项永远是 1；`injected_ids` 只能含**真正渲染进上下文**的记录（被字符预算挡掉的不算，否则未注入的记忆也被加分，与召回排序形成正反馈）。hit-boost 必须封顶（`memory.MAX_HITS_FOR_RECALL`）：注入集合就是当前 top-N，不封顶约 44 轮后新记忆再也挤不进来，且封顶值要满足"weight=1 拉满也压不过 weight=3 的新记忆"。记忆提炼调用不带 chat 的 system prompt，必须显式传 `reference_date`，否则时间性事实落库时无日期。`hits` 累计只用于召回排序，失败一律吞掉（记忆不是关键路径）。
-   - AI 抽屉样式：`styles.css` 有无作用域的 `table { min-width: 680px }`，抽屉内 Markdown 表格必须由 `.ai-markdown table` 的 `min-width:0` + `table-layout:fixed` 覆盖；`pre`/`img` 必须显式给 `max-width:100%`（sanitize 放行它们且 `<pre>` 的 `white-space:pre` 让 `overflow-wrap` 失效）；容器只写 `overflow-y` 会让另一轴变 `auto` 形成隐蔽横向滚动面，必须显式 `overflow-x:hidden`。约束来自 CSS，不得用内联样式掩盖。守卫在 `frontend/src/components/AiOverflow.test.tsx`。
+   - AI 抽屉样式：`styles.css` 有无作用域的 `table { min-width: 680px }`，抽屉内 Markdown 表格必须由 `.ai-markdown table` 的 `min-width:0` + `table-layout:fixed` 覆盖；`pre`/`img` 必须显式给 `max-width:100%`（sanitize 放行它们且 `<pre>` 的 `white-space:pre` 让 `overflow-wrap` 失效）；容器只写 `overflow-y` 会让另一轴变 `auto` 形成隐蔽横向滚动面，必须显式 `overflow-x:hidden`。约束来自 CSS，不得用内联样式掩盖；间距/宽度一律引用 `design.md` 的 `--space-*`/`--drawer-width`，不得新写裸 px。守卫在 `frontend/src/components/AiOverflow.test.tsx` 与 `AiAssistantPanel.test.tsx`。
    - 工具批次可以并发（并发判定以 registry 的 `read_only` 标志为单一事实来源，`agent.SERIAL_TOOLS` 保留为显式串行名单，上限 `MAX_PARALLEL_TOOLS`），但 **tool 消息必须按 `tool_calls` 原顺序在主线程落盘**——乱序会破坏 `_repair_interrupted_turn` 依赖的 assistant(tool_calls)→tool 配对，整条会话被上游判为协议非法。`update_stock_data`（唯一写工具）与 `run_strategy_backtest`（整表读进 pandas）**永远独占**。
    - 事件流静默满 `AI_STREAM_HEARTBEAT_SECONDS` 必须发 `heartbeat` 事件：前端按"多久没收到字节"判定空闲超时（180 秒），一次长回测期间的静默会被误杀成"回答中断"，而 worker 仍在跑并持着会话锁，用户下一次发送白等 90 秒。`/ai/optimize` 流同理（`AI_OPTIMIZE_HEARTBEAT_SECONDS`）。
    - 上下文截断只能落在行或 JSON 字段边界（`context.truncate_text`）：把 `"close": 12.34` 切成 `12.` 会让模型读到格式合法但数值错误的价格，比整行丢弃危险得多；禁止按字符硬切。
@@ -393,7 +393,12 @@ python -m ruff check backend tests scripts
 
 ## 16. AI 子系统
 
-目录地图、事件协议、会话历史三路由、三种 api_style、记忆/简报/快讯引擎与测试分层见 [`docs/ai-subsystem.md`](docs/ai-subsystem.md)。硬约束只有 §15-8 那几条，违反即回退。
+目录地图、事件协议、会话历史三路由、三种 api_style、三种研究风格的骨架与贯穿口径、记忆/简报/快讯引擎与测试分层见 [`docs/ai-subsystem.md`](docs/ai-subsystem.md)。硬约束只有 §15-8 那几条，违反即回退。
+
+改动 AI 时最容易踩的两处（都在 §15-8 里写成红线，这里只给定位）：
+
+- **风格不是一段提示词，是一组出口**：`prompts.STYLE_PROMPTS` 的骨架、`build_system_prompt`/`build_oneshot_messages`/`build_review_prompt` 三个出口、facade 的"风格优先于记忆"段落是同一套机制，改一处要连带检查其余；四个风格表的 key 由 `prompts._check_style_tables()` 在导入期把关。
+- **抽屉的视图切换是高度契约**：`AiAssistantPanel` 主区同一时刻只渲染一个面板（`view` 状态），消息区与输入区只在 `chat` 视图挂载。把某个面板改回常驻堆叠会直接吃掉消息区高度——旧实现实测固定占掉约 38%。
 
 ## 17. 红线与决策的维护规则
 

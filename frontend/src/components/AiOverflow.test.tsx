@@ -126,10 +126,10 @@ describe("AI 抽屉横向溢出（CSS 契约）", () => {
     expect(img).toMatch(/height: auto/);
   });
 
-  it("消息区与快讯列表不得留下横向滚动面", () => {
+  it("消息区与面板不得留下横向滚动面", () => {
     // 只写 overflow-y 时另一轴会被规范推成 auto → 隐蔽的横向滚动条
     expect(declarationsFor(panelCss, ".ai-messages")).toMatch(/overflow-x: hidden/);
-    expect(declarationsFor(panelCss, ".ai-insights ul")).toMatch(/overflow-x: hidden/);
+    expect(declarationsFor(panelCss, ".ai-panel-view")).toMatch(/overflow-x: hidden/);
   });
 
   it("气泡与 markdown 容器必须可收缩（flex 子项默认 min-width:auto）", () => {
