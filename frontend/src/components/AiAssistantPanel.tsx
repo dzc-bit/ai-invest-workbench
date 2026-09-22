@@ -2,9 +2,8 @@ import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { AlertTriangle, Bot, Download, MessageSquarePlus, Send, Settings2, Sparkles, Square, Trash2, X } from "lucide-react";
+import { AlertTriangle, Bot, Download, MessageSquarePlus, Send, Settings2, Sparkles, Square, X } from "lucide-react";
 import {
-  deleteAiSession,
   loadAiConfig,
   loadAiReportFile,
   loadAiReports,
@@ -250,24 +249,6 @@ export function AiAssistantPanel({
       setLastChart(null);
       setLastStrategy(null);
       setError(null);
-    } catch (caught) {
-      setError(translateAiError(caught));
-    } finally {
-      setHistoryBusy(null);
-    }
-  };
-
-  const removeHistorySession = async (target: AiSessionMeta) => {
-    if (!baseUrl) {
-      return;
-    }
-    setHistoryBusy(target.session_id);
-    try {
-      await deleteAiSession(baseUrl, target.session_id);
-      setSessions((prev) => prev.filter((item) => item.session_id !== target.session_id));
-      if (target.session_id === sessionIdRef.current) {
-        startNewChat();
-      }
     } catch (caught) {
       setError(translateAiError(caught));
     } finally {
@@ -531,16 +512,6 @@ export function AiAssistantPanel({
                   <small>
                     {item.message_count} 条 · {formatSessionTime(item.updated_at)}
                   </small>
-                </button>
-                <button
-                  type="button"
-                  className="ai-reveal-button"
-                  aria-label={`删除会话 ${item.title}`}
-                  disabled={historyBusy !== null}
-                  onClick={() => void removeHistorySession(item)}
-                >
-                  <Trash2 size={13} aria-hidden="true" />
-                  删除
                 </button>
               </li>
             ))}

@@ -226,6 +226,9 @@
   gap: 8px;
   max-height: 180px;
   overflow-y: auto;
+  /* 只声明 overflow-y 时另一轴会被规范推成 auto，形成隐蔽的横向滚动面；
+     这里显式收口，纵向滚动条不会连出横向拖动。 */
+  overflow-x: hidden;
 }
 
 .ai-insight {
@@ -233,6 +236,7 @@
   border-radius: var(--radius-m);
   background: var(--paper);
   border: 1px solid var(--rule-soft);
+  min-width: 0;
 }
 
 .ai-insight.warning {
@@ -244,10 +248,13 @@
   display: block;
   font-size: 12.5px;
   color: var(--ink);
+  overflow-wrap: anywhere;
 }
 
 .ai-insight span {
   color: var(--ink-2);
+  /* 快讯/报告摘要来自模型原文，可能带长 URL 或连续非中文串。 */
+  overflow-wrap: anywhere;
 }
 
 /* 定时报告条目：标题 + 右侧下载按钮 */
@@ -322,6 +329,8 @@
 .ai-messages {
   flex: 1;
   overflow-y: auto;
+  /* 见 .ai-insights ul：显式收掉另一轴，横溢必须由内容自己滚动容器消化。 */
+  overflow-x: hidden;
   padding: 16px 18px;
   display: flex;
   flex-direction: column;
@@ -371,6 +380,10 @@
   padding: 10px 14px;
   font-size: 13.5px;
   line-height: 1.65;
+  /* 抽屉内容预算 ≈ 480 − 18×2(padding) − 14×2(气泡) − 边框；flex 子项默认
+     min-width:auto 会让块级内容把它们一起顶宽，必须显式归零。 */
+  min-width: 0;
+  max-width: 100%;
 }
 
 .ai-msg.user {
@@ -439,10 +452,21 @@
   border-color: var(--fall-tint);
 }
 
+/* Agent 步骤行：工具名与摘要都是可变长度 token，任一段不收缩就会顶宽整行。 */
+.ai-steps li,
+.ai-steps-live li {
+  min-width: 0;
+}
+
 .ai-step-name {
   font-weight: 600;
   color: var(--ink);
-  flex: 0 0 auto;
+  /* 原来 flex:0 0 auto 让长工具名不可收缩；允许收缩并省略，摘要才拿得到空间。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ai-step-summary {
@@ -461,6 +485,8 @@
 .ai-markdown {
   color: var(--ink);
   overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .ai-markdown h1,
@@ -480,16 +506,69 @@
   padding-left: 20px;
 }
 
+/* 全局 `table { min-width: 680px }`（styles.css）服务的是数据中心的宽表，
+   AI 抽屉只有 ~400px 预算，命中它会被硬撑到 680px 并把气泡边框切穿——
+   这里显式覆盖并允许单元格内换行。 */
 .ai-markdown table {
   border-collapse: collapse;
   margin: 8px 0;
   font-size: 12.5px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  table-layout: fixed;
+  overflow-wrap: anywhere;
 }
 
 .ai-markdown th,
 .ai-markdown td {
   border: 1px solid var(--rule);
   padding: 4px 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 代码块没有 rehype 高亮器，<pre> 走的是浏览器默认 white-space:pre，
+   overflow-wrap 对它无效；不加上限就会把气泡顶宽。块内横向滚动是对的，
+   但不能溢出容器。 */
+.ai-markdown pre {
+  margin: 8px 0;
+  padding: 8px 10px;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-m);
+  background: var(--paper-3);
+  font-size: var(--text-xs);
+  tab-size: 2;
+}
+
+.ai-markdown pre code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre;
+}
+
+/* 行内 code：允许在任意字符处断行，否则长符号串会顶宽段落。 */
+.ai-markdown :not(pre) > code {
+  padding: 1px 4px;
+  border-radius: var(--radius-s);
+  background: var(--paper-3);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.ai-markdown img {
+  max-width: 100%;
+  height: auto;
+}
+
+.ai-markdown blockquote {
+  margin: 8px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--rule);
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
 }
 
 /* Agent 回测结果内嵌 ECharts */

@@ -42,14 +42,33 @@ class ChatModel(Protocol):
         ...
 
 
+def _loopback_base_url(config: AiConfig) -> bool:
+    """True when the configured base_url points at a loopback host.
+
+    Local gateways (9router etc.) must never honor ambient proxy env vars:
+    HTTP(S)_PROXY/ALL_PROXY hands 127.0.0.1 traffic to the proxy process,
+    which cannot forward loopback ports and answers 502.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(config.base_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 def _default_client_factory(config: AiConfig) -> Any:
+    import httpx
     from openai import OpenAI
 
+    http_client = httpx.Client(trust_env=False, timeout=120.0) if _loopback_base_url(config) else None
     return OpenAI(
         base_url=config.base_url,
         api_key=config.api_key,
         timeout=120.0,
         max_retries=2,
+        http_client=http_client,
     )
 
 
@@ -343,12 +362,16 @@ class OpenAiCompatibleClient:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        session = requests.Session()
+        session.trust_env = not _loopback_base_url(config)
         try:
-            response = requests.post(url, json=payload, headers=headers, stream=True, timeout=(15, 180))
+            response = session.post(url, json=payload, headers=headers, stream=True, timeout=(15, 180))
         except requests.RequestException as exc:
+            session.close()
             raise _map_provider_error(exc) from exc
         if response.status_code != 200:
             body = response.text[:300]
+            session.close()
             raise AiUpstreamError(f"模型服务调用失败（HTTP {response.status_code}）：{body}")
         try:
             for line in response.iter_lines(decode_unicode=True):
@@ -356,6 +379,9 @@ class OpenAiCompatibleClient:
                     yield line
         except requests.RequestException as exc:
             raise _map_provider_error(exc) from exc
+        finally:
+            response.close()
+            session.close()
 
     def _chat_anthropic(
         self, config: AiConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None

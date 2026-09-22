@@ -13,19 +13,10 @@ vi.mock("../aiApi", () => ({
   loadAiReports: vi.fn(),
   loadAiReportFile: vi.fn(),
   loadAiSessions: vi.fn(),
-  loadAiSession: vi.fn(),
-  deleteAiSession: vi.fn()
+  loadAiSession: vi.fn()
 }));
 
-import {
-  deleteAiSession,
-  loadAiReportFile,
-  loadAiReports,
-  loadAiSession,
-  loadAiSessions,
-  loadAiStatus,
-  runAiChatStream
-} from "../aiApi";
+import { loadAiReportFile, loadAiReports, loadAiSession, loadAiSessions, loadAiStatus, runAiChatStream } from "../aiApi";
 
 const mockedLoadStatus = vi.mocked(loadAiStatus);
 const mockedRunChat = vi.mocked(runAiChatStream);
@@ -33,7 +24,6 @@ const mockedLoadReports = vi.mocked(loadAiReports);
 const mockedLoadReportFile = vi.mocked(loadAiReportFile);
 const mockedLoadSessions = vi.mocked(loadAiSessions);
 const mockedLoadSession = vi.mocked(loadAiSession);
-const mockedDeleteSession = vi.mocked(deleteAiSession);
 
 const configuredStatus = {
   configured: true,
@@ -84,7 +74,6 @@ beforeEach(() => {
   mockedLoadStatus.mockResolvedValue(configuredStatus);
   mockedLoadReports.mockResolvedValue({ items: [] });
   mockedLoadSessions.mockResolvedValue({ items: [] });
-  mockedDeleteSession.mockResolvedValue(true);
 });
 
 describe("AiAssistantPanel", () => {
@@ -303,7 +292,9 @@ describe("AiAssistantPanel", () => {
     expect(screen.getByText("问行情、评个股、写策略、解读回测")).toBeTruthy();
   });
 
-  it("deletes a stored conversation and resets the transcript with it", async () => {
+  it("lists stored conversations without a per-row delete control", async () => {
+    // 会话回收改由后端 SessionStore.prune 动态自动完成；抽屉里不应再有删除按钮
+    // 把列表挤成一团，只保留"点标题切换会话"。
     const user = userEvent.setup();
     mockedLoadSessions.mockResolvedValue({
       items: [{ session_id: "s-a", title: "会话 A", updated_at: null, message_count: 2 }]
@@ -316,10 +307,10 @@ describe("AiAssistantPanel", () => {
     render(
       <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
     );
-    await screen.findByText("s-a 的回答");
-    await user.click(screen.getByRole("button", { name: "删除会话 会话 A" }));
-    await waitFor(() => expect(mockedDeleteSession).toHaveBeenCalledWith("http://x", "s-a"));
-    expect(screen.queryByText("历史对话（1）")).toBeNull();
-    expect(screen.queryByText("s-a 的回答")).toBeNull();
+    expect(await screen.findByText("s-a 的回答")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /删除会话/ })).toBeNull();
+    // 切换会话的能力必须保留
+    await user.click(screen.getByRole("button", { name: /^会话 A/ }));
+    expect(mockedLoadSession).toHaveBeenCalledWith("http://x", "s-a");
   });
 });

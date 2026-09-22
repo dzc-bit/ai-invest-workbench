@@ -89,7 +89,7 @@ https://github.com/dzc-bit/ai-invest-workbench.git
 | user 模式候选 | `/run/backtest/stream` 最终 `result.latest_strategy_matches.matches` |
 | 资金流补齐 | `POST /fetch/daily-bars`、`POST /fetch/capital-flow` |
 | AI 对话/快讯 | `POST /ai/chat/stream`、`GET /ai/events/stream`、`GET /ai/news`、`GET /ai/status`、`GET|POST /ai/config` |
-| AI 会话历史 | `GET /ai/sessions`（列表）、`GET /ai/session?session_id=`（回读 display）、`POST /ai/session/delete`（删除） |
+| AI 会话历史 | `GET /ai/sessions`（列表）、`GET /ai/session?session_id=`（回读 display）、`POST /ai/session/delete`（显式删除，抽屉不再用；日常回收是写侧 `SessionStore.prune` 动态自动清理） |
 | AI 轻路由 | `POST /ai/conditions/parse`（NL→条件 DSL，自愈校验）、`POST /ai/insight/oneshot`（场景点评：results_overview / data_coverage / risk_alerts）、`POST /ai/optimize`（参数网格寻优，NDJSON） |
 | 缺口画像 | `GET /diagnostics/data-gaps`（停更分布/疑似写入失败日/字段尾部，读 warehouse 缓存不触发抓取；AI 工具 `data_health_report` 消费同一明细） |
 
@@ -375,7 +375,10 @@ python -m ruff check backend tests scripts
    - 工具结果只以摘要进上下文，全量留在内存 `ToolResultStore`（有条数/字节/TTL 三重上限）。摘要必须携带**精确保留元数据**（`context.retain_rows` 的 seen/kept/omitted + `resume_offset`）：只写"已截断"而不说省略多少行、缺的行在哪，模型就不知道要不要、从哪续读（tail 保留时省略的是头部行，resume_offset=0）。表格/榜单类工具用 `AiTool.digest_chars` 自己声明预算（默认 1200 字会把 20 行榜单切成 8 行）；模型可用只读工具 `read_tool_result(call_id, offset)` 按行续读，**不得**为了省事把全量 payload 直接灌进上下文。
    - 工具失败必须以稳定 code 进协议 tool 消息与会话文件（`registry.CODE_*`：`unknown_tool` / `bad_arguments` / `no_data` / `tool_error`，加上 `interrupted` / `result_evicted` / `not_rowset`），让中断恢复与回放能按类别分支（改参数重试 vs 换工具 vs 先补数据）；code 服务的是代码与历史，用户文案仍走中文摘要。
    - 会话 JSON 带 `schema_version`；格式演进只走**相邻迁移**——新版本可加字段，绝不移动、改写或销毁已落盘的会话代，读侧必须继续容忍旧代。
-   - 会话历史回读只允许暴露 `display`（`facade.session_view`）：协议消息、`pending_archive` 与 `rolling_summary` 不得出现在任何 HTTP 响应里，否则恢复出来的历史就能反向注入模型指令；该会话仍有轮次在生成时不得删除（`delete_session` 抛 `ai_session_busy`，因为 worker 会在 `finally` 里把文件重新写回来）。
+   - 会话历史回读只允许暴露 `display`（`facade.session_view`）：协议消息、`pending_archive` 与 `rolling_summary` 不得出现在任何 HTTP 响应里，否则恢复出来的历史就能反向注入模型指令。会话回收靠**写侧动态自动清理**（`SessionStore.save` 后调 `prune`：条数上限 + 保留期，`exclude` 与忙碌会话永不动；忙判定由 facade 经 `set_busy_check` 注入，且必须同时看 `refs > 0` 与锁——只看 `lock.locked()` 会漏掉"已认领、还没 acquire"的窗口，那正是 `_SessionLockEntry` 注释里否决过的判定）。`prune` 只回收**看起来像会话**的文件（有 `session_id`，与 `list_sessions` 同口径），目录里混进导出/手写 JSON 不得被回收。`POST /ai/session/delete` 保留给脚本/测试，忙时抛 `ai_session_busy`，因为 worker 的 `finally` 会把同名文件重新写回来。
+   - **研究风格必须真正改变输出**（1.5.2 起）：`prompts.STYLE_PROMPTS` 三种风格各自带独立输出骨架 + 取证清单 + 决策口径；通用人设 `CORE_RULES` **不得**写死单一输出骨架（旧"四维/评股模板"已删）。风格必须贯穿所有 AI 出口——chat（`build_system_prompt`）、一次性点评（`build_oneshot_messages` 的 `style_directive`）、复盘报告（`build_review_prompt` 的 `style_sections`）；`data_coverage` 与交易风格无关，天然不吃风格。风格与长期记忆冲突时**风格优先**（facade 追加"风格与记忆的优先级"段落）。守卫在 `tests/test_ai_style_prompts.py`。
+   - 长期记忆：召回与 hit-boost 必须同源（`MemoryStore.recall()` 返回 `injected_ids`，facade 交给 `bump_hits` 落盘），拆成两次查询会让 `recall_score` 的 hits 项永远是 1；`injected_ids` 只能含**真正渲染进上下文**的记录（被字符预算挡掉的不算，否则未注入的记忆也被加分，与召回排序形成正反馈）。hit-boost 必须封顶（`memory.MAX_HITS_FOR_RECALL`）：注入集合就是当前 top-N，不封顶约 44 轮后新记忆再也挤不进来，且封顶值要满足"weight=1 拉满也压不过 weight=3 的新记忆"。记忆提炼调用不带 chat 的 system prompt，必须显式传 `reference_date`，否则时间性事实落库时无日期。`hits` 累计只用于召回排序，失败一律吞掉（记忆不是关键路径）。
+   - AI 抽屉样式：`styles.css` 有无作用域的 `table { min-width: 680px }`，抽屉内 Markdown 表格必须由 `.ai-markdown table` 的 `min-width:0` + `table-layout:fixed` 覆盖；`pre`/`img` 必须显式给 `max-width:100%`（sanitize 放行它们且 `<pre>` 的 `white-space:pre` 让 `overflow-wrap` 失效）；容器只写 `overflow-y` 会让另一轴变 `auto` 形成隐蔽横向滚动面，必须显式 `overflow-x:hidden`。约束来自 CSS，不得用内联样式掩盖。守卫在 `frontend/src/components/AiOverflow.test.tsx`。
    - 工具批次可以并发（并发判定以 registry 的 `read_only` 标志为单一事实来源，`agent.SERIAL_TOOLS` 保留为显式串行名单，上限 `MAX_PARALLEL_TOOLS`），但 **tool 消息必须按 `tool_calls` 原顺序在主线程落盘**——乱序会破坏 `_repair_interrupted_turn` 依赖的 assistant(tool_calls)→tool 配对，整条会话被上游判为协议非法。`update_stock_data`（唯一写工具）与 `run_strategy_backtest`（整表读进 pandas）**永远独占**。
    - 事件流静默满 `AI_STREAM_HEARTBEAT_SECONDS` 必须发 `heartbeat` 事件：前端按"多久没收到字节"判定空闲超时（180 秒），一次长回测期间的静默会被误杀成"回答中断"，而 worker 仍在跑并持着会话锁，用户下一次发送白等 90 秒。`/ai/optimize` 流同理（`AI_OPTIMIZE_HEARTBEAT_SECONDS`）。
    - 上下文截断只能落在行或 JSON 字段边界（`context.truncate_text`）：把 `"close": 12.34` 切成 `12.` 会让模型读到格式合法但数值错误的价格，比整行丢弃危险得多；禁止按字符硬切。
@@ -383,6 +386,7 @@ python -m ruff check backend tests scripts
    - LLM 配置只存 `运行产物/AI配置/ai-config.json`；`GET /ai/config` 只回掩码，`GET /ai/config/reveal` 仅用于桌面端展示用户自己的 Key；会话落盘 `运行产物/AI对话/`、记忆落盘 `运行产物/AI记忆/`；三者在 .gitignore 覆盖范围内，不得提交。
    - AI 快讯（insight）必须带 `source="ai-insight"` 与免责声明；`GET /ai/news` 的"AI 聚合要点"记录标签是 `ai-agent`（1.4.0 起的产品约定，与事件流 insight 的 ai-insight 并存）；`data_fresh` 信号只触发刷新，不得替代任何行情模块的 live 判定。
    - LLM 客户端复用 `openai` SDK（`ai/llm_client.py` 只做错误码映射与事件规范化）；测试用 FakeModel/注入 client_factory，禁止网络。
+   - LLM 客户端对环回 base_url（127.0.0.1/localhost/::1）必须绕过环境代理：宿主进程可能带 HTTP(S)_PROXY/ALL_PROXY（ZCode 注入、Clash 等），代理进程转发不了本机回环端口，环回请求被劫走只会 502（2026-09-19 排查：9router 网关一直正常，AI 却全挂）。实现是 `llm_client._loopback_base_url` → openai 路径传 `httpx.Client(trust_env=False)`、anthropic 路径 Session `trust_env=False`；远程 base_url 行为不变。桌面端启动时经 `service_manager::ensure_nine_router_gateway` 幂等拉起本机网关，属 fire-and-forget，不得改为跟踪/杀掉网关子进程。
    - a-stock-data 裁剪端点（`ai/tools/astock_data_tools.py`）统一走 `data/symbols.py` + `data/http_transport.py`，东财系请求必须过 `_em_get` 限流。
    - 提示词模板含字面 JSON 时必须用 `{{ }}` 转义（`str.format` 会把 `{"content": ...}` 当占位符，曾踩坑）。
 9. **symbol_lifecycle 口径（1.5.0 起）**：覆盖/同步/资金流缺口的"缺失"判定必须尊重每只股票的 `[listing_date, delisted_date]` 窗口；无生命周期记录一律走旧保守口径，禁止用"数据源名单缺席"单独判定退市（必须有近 30 天无新行的佐证，且名单行数 <1000 时禁用退市判定）。绿/中性色不得用于表达"最优/成功"（A 股绿=跌），前端样式只允许引用 `design.md` 的 token。

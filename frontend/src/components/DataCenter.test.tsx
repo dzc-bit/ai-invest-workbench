@@ -24,13 +24,13 @@ vi.mock("../api", async (importOriginal) => ({
 }));
 
 const coverage = [
-  { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 2 },
-  { dataset: "capital_flow", symbols: 1, start_date: "2024-01-03", end_date: "2024-01-03", missing_rows: 1 }
+  { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 2, suspension_rows: 0 },
+  { dataset: "capital_flow", symbols: 1, start_date: "2024-01-03", end_date: "2024-01-03", missing_rows: 1, suspension_rows: 0 }
 ];
 
 const staleRecentCoverage = [
-  { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-05-26", missing_rows: 0 },
-  { dataset: "capital_flow", symbols: 4900, start_date: "2015-01-05", end_date: "2026-05-26", missing_rows: 0 }
+  { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-05-26", missing_rows: 0, suspension_rows: 0 },
+  { dataset: "capital_flow", symbols: 4900, start_date: "2015-01-05", end_date: "2026-05-26", missing_rows: 0, suspension_rows: 0 }
 ];
 
 describe("DataCenter", () => {
@@ -140,7 +140,7 @@ describe("DataCenter", () => {
 
   it("does not block service readiness while health coverage refresh continues in the background", async () => {
     const refreshedCoverage = [
-      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 0, suspension_rows: 0 }
     ];
     const onCoverageChange = vi.fn();
     apiMocks.loadDataServiceHealth
@@ -174,14 +174,14 @@ describe("DataCenter", () => {
 
   it("keeps existing coverage when health returns an empty refreshing snapshot", async () => {
     const emptyRefreshingCoverage = [
-      { dataset: "daily_bars", symbols: 0, start_date: null, end_date: null, missing_rows: 0 },
-      { dataset: "capital_flow", symbols: 0, start_date: null, end_date: null, missing_rows: 0 },
-      { dataset: "market_cap", symbols: 0, start_date: null, end_date: null, missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 0, start_date: null, end_date: null, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 0, start_date: null, end_date: null, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 0, start_date: null, end_date: null, missing_rows: 0, suspension_rows: 0 }
     ];
     const refreshedCoverage = [
-      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 120 },
-      { dataset: "capital_flow", symbols: 4800, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 300 },
-      { dataset: "market_cap", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 120, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 4800, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 300, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 0, suspension_rows: 0 }
     ];
     const onCoverageChange = vi.fn();
     apiMocks.loadDataServiceHealth
@@ -214,14 +214,14 @@ describe("DataCenter", () => {
 
   it("keeps polling while a large warehouse coverage refresh is still running", async () => {
     const emptyRefreshingCoverage = [
-      { dataset: "daily_bars", symbols: 0, start_date: null, end_date: null, missing_rows: 0 },
-      { dataset: "capital_flow", symbols: 0, start_date: null, end_date: null, missing_rows: 0 },
-      { dataset: "market_cap", symbols: 0, start_date: null, end_date: null, missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 0, start_date: null, end_date: null, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 0, start_date: null, end_date: null, missing_rows: 0, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 0, start_date: null, end_date: null, missing_rows: 0, suspension_rows: 0 }
     ];
     const refreshedCoverage = [
-      { dataset: "daily_bars", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 2930 },
-      { dataset: "capital_flow", symbols: 5530, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 19338 },
-      { dataset: "market_cap", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 48959 }
+      { dataset: "daily_bars", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 2930, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 5530, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 19338, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 48959, suspension_rows: 0 }
     ];
     const onCoverageChange = vi.fn();
     apiMocks.loadDataServiceHealth
@@ -265,12 +265,12 @@ describe("DataCenter", () => {
   it("keeps polling after sync completion until the refreshed coverage snapshot arrives", async () => {
     const user = setupUser();
     const oldCoverage = [
-      { dataset: "daily_bars", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 2930 },
-      { dataset: "market_cap", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 48959 }
+      { dataset: "daily_bars", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 2930, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 48959, suspension_rows: 0 }
     ];
     const refreshedCoverage = [
-      { dataset: "daily_bars", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 2704 },
-      { dataset: "market_cap", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 48718 }
+      { dataset: "daily_bars", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 2704, suspension_rows: 0 },
+      { dataset: "market_cap", symbols: 5469, start_date: "2015-01-05", end_date: "2026-06-18", missing_rows: 48718, suspension_rows: 0 }
     ];
     const onCoverageChange = vi.fn();
     apiMocks.loadDataServiceHealth.mockReset();
@@ -454,8 +454,8 @@ describe("DataCenter", () => {
   it("keeps full-market missing rows authoritative while syncing", async () => {
     const user = setupUser();
     const missingCoverage = [
-      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 100 },
-      { dataset: "capital_flow", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 60 }
+      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 100, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 60, suspension_rows: 0 }
     ];
     apiMocks.loadDataServiceHealth.mockResolvedValue({
       ok: true,
@@ -496,8 +496,8 @@ describe("DataCenter", () => {
   it("keeps capital-flow missing rows authoritative while syncing", async () => {
     const user = setupUser();
     const missingCoverage = [
-      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 100 },
-      { dataset: "capital_flow", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 60 }
+      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 100, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-01", missing_rows: 60, suspension_rows: 0 }
     ];
     apiMocks.loadDataServiceHealth.mockResolvedValue({
       ok: true,
@@ -620,8 +620,8 @@ describe("DataCenter", () => {
     const user = setupUser();
     const onCoverageChange = vi.fn();
     const refreshedCoverage = [
-      { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 2 },
-      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 2, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 0, suspension_rows: 0 }
     ];
     apiMocks.loadDataServiceHealth
       .mockResolvedValueOnce({
@@ -695,8 +695,8 @@ describe("DataCenter", () => {
     const user = setupUser();
     const onCoverageChange = vi.fn();
     const refreshedCoverage = [
-      { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 2 },
-      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 2, suspension_rows: 0 },
+      { dataset: "capital_flow", symbols: 2, start_date: "2024-01-02", end_date: "2024-01-03", missing_rows: 0, suspension_rows: 0 }
     ];
     apiMocks.fetchCapitalFlow.mockResolvedValue({
       status: "ok",
@@ -911,7 +911,7 @@ describe("DataCenter", () => {
   it("uses a recent business-day range and moves the date inputs after successful fetch coverage", async () => {
     const user = setupUser();
     const updatedCoverage = [
-      { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2026-06-05", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 1, start_date: "2024-01-02", end_date: "2026-06-05", missing_rows: 0, suspension_rows: 0 }
     ];
     apiMocks.fetchDailyBars.mockResolvedValue({
       status: "ok",
@@ -990,7 +990,7 @@ describe("DataCenter", () => {
   it("keeps manually edited dates aligned with coverage details after a successful fetch", async () => {
     const user = setupUser();
     const updatedCoverage = [
-      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 0 }
+      { dataset: "daily_bars", symbols: 5000, start_date: "2015-01-05", end_date: "2026-06-05", missing_rows: 0, suspension_rows: 0 }
     ];
     apiMocks.fetchDailyBars.mockResolvedValue({
       status: "ok",

@@ -475,6 +475,33 @@ pub fn hidden_process_creation_flags() -> u32 {
     0
 }
 
+fn nine_router_gateway_script_path(user_profile: &str) -> PathBuf {
+    Path::new(user_profile).join(".9router").join("start-9router.cmd")
+}
+
+/// Fire-and-forget launch of the local 9router gateway at app startup.
+///
+/// start-9router.cmd is idempotent — it exits immediately when the gateway
+/// port is already listening — so spawning it unconditionally is safe. The
+/// child handle is dropped without wait/kill on purpose: the tray gateway
+/// must outlive the desktop app, and null stdio keeps us from holding any
+/// file handle the launcher script forbids redirecting.
+pub fn ensure_nine_router_gateway() {
+    let Some(user_profile) = env::var_os("USERPROFILE") else {
+        return;
+    };
+    let script = nine_router_gateway_script_path(&user_profile.to_string_lossy());
+    if !script.exists() {
+        return;
+    }
+    let mut command = Command::new("cmd");
+    command.args(["/C", script.to_string_lossy().as_ref()]);
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(hidden_process_creation_flags());
+    let _ = command.spawn();
+}
+
 fn packaged_service_path(app: &AppHandle) -> Result<PathBuf, String> {
     let resource_dir = app
         .path()
@@ -652,7 +679,7 @@ impl DataServiceManager {
 mod tests {
     use super::{
         build_service_args, cached_service_matches, choose_populated_cache_dir, health_request,
-        file_sha256, packaged_service_relative_path, read_service_lock, service_health_request,
+        file_sha256, nine_router_gateway_script_path, packaged_service_relative_path, read_service_lock, service_health_request,
         hidden_process_creation_flags, locked_service_expected_identity, require_recreated_service_lock, service_lock_path, should_use_packaged_service,
         service_startup_timeout, stop_child_after_start_failure, try_create_service_lock, runtime_data_candidates_from,
         validate_service_health, workspace_cache_candidates_from_root, ServiceLockPayload,
@@ -970,6 +997,40 @@ mod tests {
             source.contains("command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())"),
             "unread sidecar stderr pipes can fill and stall the local data service"
         );
+    }
+
+    #[test]
+    fn nine_router_gateway_script_resolves_under_user_profile() {
+        assert_eq!(
+            nine_router_gateway_script_path(r"C:\Users\demo"),
+            std::path::PathBuf::from(r"C:\Users\demo")
+                .join(".9router")
+                .join("start-9router.cmd")
+        );
+    }
+
+    #[test]
+    fn gateway_autostart_launches_idempotent_script_fire_and_forget() {
+        let source = include_str!("service_manager.rs");
+
+        assert!(
+            source.contains("pub fn ensure_nine_router_gateway"),
+            "app startup must ensure the local 9router gateway is running"
+        );
+        assert!(
+            source.contains("let _ = command.spawn();"),
+            "gateway autostart must be fire-and-forget without wait/kill"
+        );
+    }
+
+    #[test]
+    fn gateway_autostart_without_script_or_profile_is_silent_noop() {
+        // No panic and no spawn when USERPROFILE is unset on a bare platform.
+        std::env::remove_var("USERPROFILE");
+        super::ensure_nine_router_gateway();
+        std::env::set_var("USERPROFILE", unique_temp_dir("gateway-no-profile"));
+        super::ensure_nine_router_gateway();
+        std::env::remove_var("USERPROFILE");
     }
 
     #[test]

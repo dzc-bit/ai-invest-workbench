@@ -26,7 +26,7 @@ from astock_backtester.ai.memory import MemoryStore, plan_memory_ops
 from astock_backtester.ai.models import AiChatRequest, AiStatusResponse
 from astock_backtester.ai.oneshot import ONESHOT_SCENES, insight_oneshot
 from astock_backtester.ai.overfit import assess_overfit
-from astock_backtester.ai.prompts import build_system_prompt
+from astock_backtester.ai.prompts import RESEARCH_STYLE_LABELS, build_system_prompt
 from astock_backtester.ai.rag.retriever import KnowledgeIndex, build_knowledge_tool
 from astock_backtester.ai.reports import ReportStore, ScheduledReportEngine
 from astock_backtester.ai.sessions import SessionStore, sanitize_session_id
@@ -134,6 +134,9 @@ class AiService:
         self._reports.start()
         self._session_locks: dict[str, _SessionLockEntry] = {}
         self._session_locks_guard = threading.Lock()
+        # 动态清理的忙碌判定只有这里知道（会话锁表在 facade 手上）：正在生成中的
+        # 会话绝不能被 prune 掉，否则 worker 的 finally 会把文件重新写回来。
+        self._sessions.set_busy_check(self._session_busy)
         self._log = log
         self._log("info", f"AI 子系统已初始化：{len(self._registry.names())} 个工具（未配置模型前仅提供状态与快讯通道）")
 
@@ -236,7 +239,10 @@ class AiService:
         if scene not in ONESHOT_SCENES:
             raise ValueError(f"未知点评场景：{scene}（可选：{', '.join(ONESHOT_SCENES)}）")
         model = self._require_model()
-        text = insight_oneshot(model, scene, context)
+        # 风格必须贯穿所有 AI 出口：只作用于 chat 时，点评/寻优/复盘会退回同一腔调，
+        # 用户切风格几乎感知不到差别（1.5.2 起统一注入）。
+        style = self._config_store.load().research_style
+        text = insight_oneshot(model, scene, context, style)
         return {"ok": True, "scene": scene, "text": text, "generated_at": datetime.now(UTC).isoformat()}
 
     # ------------------------------------------------------------------ chat
@@ -318,12 +324,28 @@ class AiService:
             yield {"type": "session", "session_id": session_id, "title": session.get("title")}
 
             system_prompt = f"{build_system_prompt(self._knowledge.is_ready(), config.research_style)}\n\n{today_context()}"
-            profile = self._memory.profile_context()
+            profile, facts, recalled_ids = self._memory.recall()
             if profile:
                 system_prompt += f"\n\n## 用户画像（长期记忆，越用越准）\n{profile}"
-            facts = self._memory.facts_context()
             if facts:
                 system_prompt += f"\n\n## 已知用户事实（长期记忆）\n{facts}"
+            if profile or facts:
+                # 记忆里常有一条自述的"交易风格"，它与本次设置的研究风格会互相拉扯：
+                # 不定优先级的话，模型永远把两种风格揉成一个中间态，切风格等于没切。
+                system_prompt += (
+                    "\n\n## 风格与记忆的优先级（必须遵守）\n"
+                    f"本次研究风格（{RESEARCH_STYLE_LABELS.get(config.research_style, config.research_style)}）"
+                    "是用户当下的显式选择，优先级高于长期记忆里关于交易风格/风险偏好的自述：\n"
+                    "- 输出骨架、取证清单、术语与决策口径一律按本次风格执行。\n"
+                    "- 长期记忆只用来个性化与本风格不冲突的部分（关注标的、持仓、已确认的事实）。\n"
+                    "- 若记忆与本次风格直接冲突（例如记忆说偏好妖股、本次是保守风格），"
+                    "按本次风格作答，并在结尾用一句话点明该冲突（如“按你的保守设置，这类标的我不建议参与；"
+                    "你此前提到偏好情绪妖股，若要按那个口径看，请在设置里切到激进风格”）。"
+                )
+            # 本轮真正进了 system prompt 的记忆计入 hit-boost：不记的话
+            # recall_score 的 hits 项恒为 1，长期记忆的"越用越准"只剩时间衰减。
+            if recalled_ids:
+                self._memory.bump_hits(recalled_ids)
 
             events: queue.Queue[dict[str, Any] | None] = queue.Queue()
             error_holder: list[dict[str, Any]] = []
@@ -409,7 +431,14 @@ class AiService:
                 return
             turns = session.get("display", [])[-4:]
             dialogue = "\n".join(f"{turn.get('role')}: {str(turn.get('content'))[:400]}" for turn in turns)
-            ops = plan_memory_ops(self._model, dialogue, self._memory.load())
+            # 提炼调用不带 chat 的 system prompt，模型拿不到"今天是几号"：不补日期锚点，
+            # "9/21 卖了 X" 这类时间性事实会以无日期形式落库，之后无从判断是否已过期。
+            ops = plan_memory_ops(
+                self._model,
+                dialogue,
+                self._memory.load(),
+                reference_date=datetime.now(BEIJING_TZ).strftime("%Y-%m-%d"),
+            )
             if ops:
                 applied = self._memory.apply_ops(ops)
                 if applied:
@@ -420,24 +449,35 @@ class AiService:
         except Exception:  # noqa: BLE001 - memory must never break a chat turn
             pass
 
+    def _session_busy(self, session_id: str) -> bool:
+        """会话是否仍有轮次在生成（动态清理与删除共用的唯一判定）。
+
+        判定必须同时看 ``refs`` 与锁：``chat_stream`` 先 ``retain()`` 再
+        ``acquire()``，"已认领、还没拿到锁"的窗口里 ``lock.locked()`` 是 False，
+        只看锁会把即将开跑的会话判成空闲 —— 那正是本文件 ``_SessionLockEntry``
+        注释里否决过的判定方式（会造成同一会话两把锁 / 生成中的会话被清理）。
+        """
+        with self._session_locks_guard:
+            entry = self._session_locks.get(session_id)
+            return entry is not None and (entry.refs > 0 or entry.lock.locked())
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a stored session.
 
-        Refuses while that session still has a turn generating: the worker saves
-        the session in its ``finally`` block, which would resurrect the file
-        right after the delete and leave a "deleted" transcript on screen.
+        Refuses while that session still has a turn generating (busy check via
+        :meth:`_session_busy`): the worker saves the session in its ``finally``
+        block, and that save rewrites the *same* file — deleting underneath it
+        would simply resurrect the file and leave a "deleted" transcript on
+        screen.  忙判定与 unlink 之间仍有毫秒级 TOCTOU（判定后新请求可抢锁
+        开跑），这是 best-effort 边界，不是强保证。
 
-        忙判定与 unlink 之间存在毫秒级 TOCTOU（判定后新请求可抢锁开跑），
-        这是 best-effort 边界：删除后的陈旧 session_id 在 worker 收尾时会落到
-        全新 uuid 会话，不会复活已删除的文件。
+        1.5.2 起 UI 不再提供逐条删除入口，日常回收由 ``SessionStore.prune`` 在
+        每次 save 后自动完成；本接口保留给脚本/测试与未来的显式清理入口。
         """
         safe = sanitize_session_id(session_id)
         if safe is None:
             return False
-        with self._session_locks_guard:
-            entry = self._session_locks.get(safe)
-            busy = entry is not None and entry.lock.locked()
-        if busy:
+        if self._session_busy(safe):
             raise AiSessionBusy("该会话仍在生成回答，请先停止后再删除。")
         return self._sessions.delete(safe)
 
