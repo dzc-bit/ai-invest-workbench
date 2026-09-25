@@ -38,13 +38,28 @@ if (-not (Test-Path $assetPath)) {
 # 红线（AGENTS.md §12）：签名缺失时不得复用旧 .sig。bundle/nsis 里永久堆着
 # 多个历史版本的 exe+sig——校验 .sig 内嵌的 file 名与 -AssetName 一致、
 # .sig mtime 不早于 .exe mtime，防止"旧签名配新版本号"静默过检。
+# tauri v2 的 .sig 是 base64(minisign 明文) 的单行文件：解码后从
+# "file:<name>" 注释行取签名对象名，不能按 JSON 解析（首次 v1.6.0 发布实测
+# 踩到——校验逻辑曾按 JSON 读，真实签名上必然 throw）。
 $signatureContent = (Get-Content -Raw $signaturePath).Trim()
+$signedFile = ""
 try {
-  $signaturePayload = $signatureContent | ConvertFrom-Json
+  $minisignText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($signatureContent))
+  foreach ($line in ($minisignText -split "`n")) {
+    # minisign 明文第三行是 "trusted comment: timestamp:...\tfile:<名字>"，
+    # file: 字段在行中间而不是行首。
+    $marker = $line.IndexOf("file:")
+    if ($marker -ge 0) {
+      $signedFile = $line.Substring($marker + 5).Trim()
+      break
+    }
+  }
 } catch {
-  throw "signature file is not valid minisign JSON content: $signaturePath"
+  throw "signature file is not base64-encoded minisign content: $signaturePath"
 }
-$signedFile = [string]$signaturePayload.file
+if (-not $signedFile) {
+  throw "signature file has no 'file:' comment line: $signaturePath"
+}
 if ($signedFile -ne $AssetName) {
   throw "signature was generated for '$signedFile' but AssetName is '$AssetName' (stale signature reuse)"
 }
