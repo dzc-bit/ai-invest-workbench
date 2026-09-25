@@ -19,7 +19,7 @@ from astock_backtester.ai.condition_dsl import parse_conditions_with_llm
 from astock_backtester.ai.config import AiConfig, AiConfigStore, ai_base_dir_from_cache_dir
 from astock_backtester.ai.context import ContextBudget, ToolResultStore
 from astock_backtester.ai.digest import DigestEngine, DigestStore
-from astock_backtester.ai.errors import AiError, AiNotConfigured, AiSessionBusy, AiSessionNotFound, ai_error_code
+from astock_backtester.ai.errors import AiError, AiMemoryNotFound, AiNotConfigured, AiSessionBusy, AiSessionNotFound, ai_error_code
 from astock_backtester.ai.insights import HEARTBEAT_INTERVAL_SECONDS, EventBroker, InsightEngine
 from astock_backtester.ai.llm_client import OpenAiCompatibleClient
 from astock_backtester.ai.memory import MemoryStore, plan_memory_ops
@@ -34,6 +34,7 @@ from astock_backtester.ai.tools.astock_data_tools import build_astock_data_tools
 from astock_backtester.ai.tools.local_tools import build_local_tools
 from astock_backtester.ai.tools.query_tools import build_query_tools
 from astock_backtester.ai.tools.registry import ToolRegistry, build_read_result_tool
+from astock_backtester.ai.tools.research_tools import build_memory_tools, build_research_tools
 
 # 同一会话上一轮仍在生成时，新一轮最多等待多久（用户点“停止”后 worker 仍在收尾）。
 AI_SESSION_LOCK_TIMEOUT_SECONDS = 90.0
@@ -94,14 +95,16 @@ class AiService:
         self._registry.register_all(build_local_tools(backend))
         self._registry.register_all(build_astock_data_tools(backend))
         self._registry.register_all(build_query_tools(backend))
+        self._registry.register_all(build_research_tools(backend))
         self._registry.register(build_read_result_tool(self._result_store))
         self._knowledge = KnowledgeIndex(
             embedder=self._model.embed,
             cache_dir=base_dir / "AI缓存",
         )
         self._registry.register(build_knowledge_tool(self._knowledge, self._budget))
-        self._agent = AgentRunner(self._model, self._registry, self._result_store, self._budget)
         self._memory = MemoryStore(base_dir)
+        self._registry.register_all(build_memory_tools(self._memory))
+        self._agent = AgentRunner(self._model, self._registry, self._result_store, self._budget)
         self._digest_store = DigestStore(base_dir)
         self._broker = EventBroker()
         self._digest = DigestEngine(
@@ -448,6 +451,51 @@ class AiService:
                         pass
         except Exception:  # noqa: BLE001 - memory must never break a chat turn
             pass
+
+    # -------------------------------------------------------------- memories
+    def list_memories(self) -> dict[str, Any]:
+        """长期记忆全量列表（本机治理端点：查看/修改/删除用户自己的记忆）。"""
+        records = sorted(self._memory.load(), key=lambda record: record.updated_at, reverse=True)
+        return {
+            "items": [
+                {
+                    "id": record.id,
+                    "category": record.category,
+                    "content": record.content,
+                    "weight": record.weight,
+                    "hits": record.hits,
+                    "created_at": record.created_at,
+                    "updated_at": record.updated_at,
+                }
+                for record in records
+            ],
+            "rejected_market_facts_total": self._memory.rejected_market_facts,
+        }
+
+    def update_memory(self, memory_id: str, *, content: str, category: str | None = None, weight: float | None = None) -> dict[str, Any]:
+        """显式修改一条记忆（用户操作，与模型提炼分离；校验在 MemoryStore）。"""
+        from astock_backtester.ai.memory import CATEGORIES, MAX_CONTENT_CHARS
+
+        content = str(content or "").strip()[:MAX_CONTENT_CHARS]
+        if not content:
+            raise ValueError("记忆内容不能为空。")
+        if category is not None and str(category) not in CATEGORIES:
+            raise ValueError(f"未知记忆类别：{category}")
+        if weight is not None:
+            try:
+                weight = min(3.0, max(1.0, float(weight)))
+            except (TypeError, ValueError):
+                raise ValueError("weight 必须是 1~3 之间的数字。") from None
+        try:
+            record = self._memory.update_record(str(memory_id), content=content, category=category, weight=weight)
+        except KeyError as exc:
+            raise AiMemoryNotFound(f"记忆 {memory_id} 不存在或已被删除。") from exc
+        return {"ok": True, "id": record.id}
+
+    def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        if not self._memory.delete_record(str(memory_id)):
+            raise AiMemoryNotFound(f"记忆 {memory_id} 不存在或已被删除。")
+        return {"ok": True, "id": str(memory_id), "deleted": True}
 
     def _session_busy(self, session_id: str) -> bool:
         """会话是否仍有轮次在生成（动态清理与删除共用的唯一判定）。

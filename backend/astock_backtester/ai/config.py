@@ -11,12 +11,17 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from astock_backtester.ai.prompts import RESEARCH_STYLES
+
 CONFIG_DIR_NAME = "AI配置"
 CONFIG_FILE_NAME = "ai-config.json"
 
 
 SUPPORTED_API_STYLES = ("chat-completions", "responses", "anthropic")
-SUPPORTED_RESEARCH_STYLES = ("conservative", "balanced", "aggressive")
+# 风格的单一事实来源在 prompts.RESEARCH_STYLES（那里有导入期一致性守卫）；
+# 这里只做别名转发——曾经是两份独立元组且守卫只查其中一份，新增风格漏改
+# 本文件会静默降级为 balanced。
+SUPPORTED_RESEARCH_STYLES = RESEARCH_STYLES
 
 
 def normalize_hhmm(value: str, fallback: str) -> str:

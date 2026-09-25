@@ -1,10 +1,11 @@
 import { useRef } from "react";
 import { Activity, Radio, TrendingDown, TrendingUp } from "lucide-react";
 import { marketPhaseLabel } from "../marketRefresh";
-import type { MarketBreadth, MarketRefreshMeta, RealtimeMarketSnapshot } from "../types";
+import type { MarketBreadth, MarketCommentaryResponse, MarketRefreshMeta, RealtimeMarketSnapshot } from "../types";
 
 type Props = {
   snapshot: RealtimeMarketSnapshot | null;
+  commentary?: MarketCommentaryResponse | null;
   isLoading?: boolean;
   refreshMeta?: MarketRefreshMeta;
 };
@@ -141,7 +142,27 @@ function isYesterdaySectorTracking(snapshot: RealtimeMarketSnapshot | null): boo
   );
 }
 
-export function MarketDashboard({ snapshot, isLoading = false, refreshMeta }: Props) {
+/** 行情评价的状态语义（§6）：mode 决定"这是谁说的话"。
+ * 非实时来源必须显式标注，绝不把回退包装成实时盘面。 */
+function commentaryModeMeta(mode: MarketCommentaryResponse["mode"]): { label: string; live: boolean } {
+  switch (mode) {
+    case "intraday":
+    case "post_close":
+      return { label: mode === "intraday" ? "实时快照评价" : "收盘评价", live: true };
+    case "lunch_break_review":
+      return { label: "午间小结", live: false };
+    case "non_trading_review":
+      return { label: "休市回顾", live: false };
+    case "news_fallback":
+      return { label: "公开行情兜底 · 非实时", live: false };
+    case "local_brief_review":
+      return { label: "本地简短判断 · 非实时", live: false };
+    default:
+      return { label: "评价", live: false };
+  }
+}
+
+export function MarketDashboard({ snapshot, commentary, isLoading = false, refreshMeta }: Props) {
   // 本轮快照缺红绿家数时沿用最近一次有数据的宽度并明确标注“沿用”，
   // 避免部分成功场景下长时间显示 "--"（AGENTS.md §5：缓存只能以 stale 标注使用）。
   const lastBreadthRef = useRef<{ breadth: MarketBreadth; at: string } | null>(null);
@@ -175,6 +196,36 @@ export function MarketDashboard({ snapshot, isLoading = false, refreshMeta }: Pr
           <span>{phase ? marketPhaseLabel(phase) : "行情时段待确认"}</span>
           <strong>{refreshMeta?.message ?? snapshot?.message ?? "等待行情刷新"}</strong>
           {refreshMeta?.last_success_at ? <small>最近成功 {formatTime(refreshMeta.last_success_at)}</small> : null}
+        </div>
+      ) : null}
+
+      {commentary ? (
+        <div className="market-commentary" aria-label="行情评价">
+          <div className="market-commentary-head">
+            <span className="section-kicker">行情评价</span>
+            <span
+              className={`status-pill compact ${commentary.mode === "intraday" || commentary.mode === "post_close" ? "market-status live" : "market-status stale"}`}
+            >
+              {commentaryModeMeta(commentary.mode).label}
+            </span>
+          </div>
+          <p>{commentary.summary}</p>
+          {commentary.drivers.length > 0 ? (
+            <ul>
+              {commentary.drivers.slice(0, 3).map((driver) => (
+                <li key={driver.title}>
+                  <strong>{driver.title}</strong> {driver.detail}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {commentary.risks.length > 0 ? (
+            <p className="market-commentary-risks">主要风险：{commentary.risks.slice(0, 3).join("；")}</p>
+          ) : null}
+          <small>
+            生成于 {formatTime(commentary.updated_at)}（{commentary.trade_date}）
+            {commentaryModeMeta(commentary.mode).live ? "" : " · 非实时结论，仅供参考"}
+          </small>
         </div>
       ) : null}
 

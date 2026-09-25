@@ -2,30 +2,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from astock_backtester.data.astock_adapter import AStockDataAdapter
-from astock_backtester.data.providers import ADataProvider
-from astock_backtester.data.warehouse import Warehouse
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BACKEND_ROOT = PROJECT_ROOT / "backend"
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from astock_backtester.data.astock_adapter import AStockDataAdapter  # noqa: E402
+from astock_backtester.data.providers import ADataProvider  # noqa: E402
+from astock_backtester.data.symbols import normalize_symbol  # noqa: E402
+from astock_backtester.data.warehouse import Warehouse  # noqa: E402
 
 
 def append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def normalize_symbol(symbol: object) -> str:
-    code = str(symbol).strip().upper()
-    if code.startswith(("SH", "SZ", "BJ")):
-        code = code[2:]
-    if "." in code:
-        code = code.split(".", 1)[0]
-    return code.zfill(6) if code.isdigit() else code
 
 
 def unique_symbols(symbols: list[object]) -> list[str]:

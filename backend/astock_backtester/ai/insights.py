@@ -185,7 +185,9 @@ class InsightEngine:
         if model is None:
             return
         content = ""
-        for event in model.chat(build_insight_messages(data), tools=None):
+        # 快讯面向用户播报，允许带轻量人设语气；聚合要点（DIGEST_PROMPT）保持
+        # 中立——口径登记在 prompts.STYLE_FREE_PROMPTS，两者不是一个出口。
+        for event in model.chat(build_insight_messages(data, style=config.research_style), tools=None):
             if event[0] == "final":
                 content = str(event[1].get("content") or "")
         content = content.strip()

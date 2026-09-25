@@ -3,8 +3,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from astock_backtester.ai.agent import SHORT_TERM_MAX_CHARS, AgentRunner
-from astock_backtester.ai.context import ContextBudget, ToolResultStore
+from astock_backtester.ai.agent import AgentRunner
+from astock_backtester.ai.context import ContextBudget, ToolResult, ToolResultStore
 from astock_backtester.ai.tools.registry import AiTool, ToolRegistry
 
 
@@ -347,23 +347,128 @@ def test_agent_caps_pending_archive_when_compaction_keeps_failing():
     assert "已丢弃" in archived[0]
 
 
-def test_agent_char_budget_archives_when_no_user_boundary_follows():
-    """字符预算不得因为没有 user 边界就静默失效（S1 形态 A）。
+def test_agent_archives_nothing_when_no_safe_cut_point_exists(caplog):
+    """找不到 user 边界就归档 0 条并留 warning，绝不产生非法窗口（1.6.1）。
 
-    裁剪点会被推到下一个 user 边界，以免切断 assistant(tool_calls)/tool 配对。
-    但窗口里全是 assistant/tool 消息（工具长跑很常见）时，推到末尾会让整个
-    字符预算变成空操作 —— 25 条 x 5000 字 = 125k 字仍留在窗口里，远超 36k 预算。
+    旧实现回退到字符裁剪点：1 条 user + 28 组 assistant(tool_calls)/tool、无尾部
+    user 的长工具轮形态下，窗口头会变成 ['tool', ...]——孤儿 tool 不被窗口内任何
+    assistant 声明，OpenAI/Anthropic 都拒绝该请求，整条会话从此每轮必败。协议
+    合法性优先于字符预算：宁可一轮超预算，绝不归档出非法窗口。
     """
+    runner = AgentRunner(FakeModel([]), _registry(), ToolResultStore(), ContextBudget())
+    session = _session()
+    session["messages"] = [{"role": "user", "content": "q0"}]
+    for step in range(28):
+        session["messages"].append(
+            {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{step}", "function": {"name": "x"}}]}
+        )
+        session["messages"].append({"role": "tool", "tool_call_id": f"c{step}", "content": "r" * 400})
+
+    with caplog.at_level("WARNING", logger="astock_backtester.ai.agent"):
+        runner._archive_overflow(session, lambda event: None)
+
+    messages = session["messages"]
+    assert messages[0]["role"] == "user", "窗口头必须仍是 user（归档 0 条）"
+    assert len(messages) == 57, "没有安全切点时不得归档任何消息"
+    for message in messages:
+        if message.get("role") == "tool":
+            assert any(
+                prior.get("role") == "assistant" and any(
+                    call.get("id") == message["tool_call_id"] for call in (prior.get("tool_calls") or [])
+                )
+                for prior in messages
+            ), f"孤儿 tool 消息：{message['tool_call_id']}"
+    assert any("user 边界" in record.message for record in caplog.records)
+
+
+def test_agent_repair_drops_orphan_tool_messages():
+    """历史遗留的孤儿 tool（如旧版归档切出的窗口头 ['tool', ...]）必须被清理，
+    否则下次请求被上游以协议错误拒绝——_repair 只补缺失结果不清理孤儿曾让
+    该会话永久不可用。"""
     model = FakeModel([[_final(content="答案")]])
     runner = AgentRunner(model, _registry(), ToolResultStore(), ContextBudget())
     session = _session()
-    session["messages"] = [{"role": "assistant", "content": "a" * 5000} for _ in range(25)]
+    session["messages"] = [
+        {"role": "tool", "tool_call_id": "orphan-1", "content": "无主结果"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "x"}}]},
+        {"role": "user", "content": "下一问"},
+    ]
 
-    runner._archive_overflow(session, lambda event: None)
+    runner._repair_interrupted_turn(session)
 
-    remaining = sum(len(str(m.get("content") or "")) for m in session["messages"])
-    assert remaining <= SHORT_TERM_MAX_CHARS, f"字符预算被静默跳过：窗口仍剩 {remaining} 字"
-    assert len(session.get("pending_archive") or []) > 0
+    roles = [message["role"] for message in session["messages"]]
+    assert roles == ["assistant", "tool", "user"], f"孤儿 tool 应被丢弃：{roles}"
+    # 缺失的 c1 结果也被补上（interrupted 占位）
+    assert session["messages"][1]["tool_call_id"] == "c1"
+    assert "interrupted" in session["messages"][1]["content"]
+
+
+def test_agent_repair_pairs_duplicate_call_ids_per_assistant():
+    """跨轮重复的 tool_call_id（llm_client 在供应商不回 id 时自造 call_{index}）
+    必须按各自的 assistant 配对，不做全局 answered 集合——旧实现里第二个
+    assistant 的结果会被第一个轮次的同名 id 吞掉，永远等不到配对。"""
+    runner = AgentRunner(FakeModel([]), _registry(), ToolResultStore(), ContextBudget())
+    session = _session()
+    session["messages"] = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "function": {"name": "a"}}]},
+        {"role": "tool", "tool_call_id": "call_0", "content": "r1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "function": {"name": "b"}}]},
+        {"role": "user", "content": "q3"},
+    ]
+
+    runner._repair_interrupted_turn(session)
+
+    tools = [message for message in session["messages"] if message.get("role") == "tool"]
+    assert len(tools) == 2, f"每个 assistant 的调用都必须有配对结果：{[t['tool_call_id'] for t in tools]}"
+    # 第一条是第一轮的真实结果，第二条才是为第二个 assistant 补的 interrupted 占位
+    assert "interrupted" not in tools[0]["content"]
+    assert "interrupted" in tools[1]["content"]
+    assert tools[0]["tool_call_id"] == "call_0" and tools[1]["tool_call_id"] == "call_0"
+
+
+def test_agent_replay_of_untrusted_tool_results_is_fenced():
+    """read_tool_result 续读的是原工具的全量行集：原工具声明 untrusted_body
+    时，续读内容同样必须过不可信围栏——否则爬取正文以无围栏形态二次进入
+    上下文（§15-8 隔离缺口）。"""
+    from astock_backtester.ai.context import UNTRUSTED_OPEN
+    from astock_backtester.ai.tools.registry import build_read_result_tool
+
+    registry = _registry()
+    store = ToolResultStore()
+    registry.register(build_read_result_tool(store))
+    registry.register(
+        AiTool(
+            name="crawly",
+            description="crawled body tool",
+            parameters={"type": "object", "properties": {}},
+            executor=lambda _args: {"ok": True, "rows": [{"title": "外部正文"}]},
+            summarizer=lambda _payload: "外部正文摘要",
+            untrusted_body=True,
+        )
+    )
+    store.put(
+        ToolResult(
+            call_id="crawly-1",
+            name="crawly",
+            arguments={},
+            payload={"ok": True, "rows": [{"title": "外部正文"}, {"title": "第二行"}], "total": 2},
+            summary="外部正文摘要",
+        )
+    )
+    runner = AgentRunner(FakeModel([]), registry, store, ContextBudget())
+    session = _session()
+
+    runner._execute_tool_calls(
+        session,
+        [{"id": "replay-1", "function": {"name": "read_tool_result", "arguments": '{"call_id": "crawly-1"}'}}],
+        lambda event: None,
+        {},
+    )
+
+    replayed = [m for m in session["messages"] if m.get("role") == "tool"]
+    assert replayed and UNTRUSTED_OPEN in replayed[0]["content"], "续读的爬取正文必须被围栏包裹"
 
 
 def test_agent_avoids_splitting_tool_pair_at_window_edge():

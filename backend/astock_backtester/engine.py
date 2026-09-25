@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_right
 from collections.abc import Callable
 
 import pandas as pd
@@ -194,10 +195,11 @@ def _candidate_prefilter_mask(strategy: StrategyConfig, data: pd.DataFrame) -> p
 
 
 def _next_trade_date(dates: list[pd.Timestamp], signal_date: pd.Timestamp) -> pd.Timestamp | None:
-    for trade_date in dates:
-        if trade_date > signal_date:
-            return trade_date
-    return None
+    # dates 已排序（run_backtest 入口处 sorted）：二分查找替代线性扫描。
+    # 回测日循环每个交易日都会调用本函数，线性扫描是 O(days²)
+    #（2500 日 ≈ 300 万次 Timestamp 比较）。
+    index = bisect_right(dates, signal_date)
+    return dates[index] if index < len(dates) else None
 
 
 def _numeric_value(row: pd.Series, column: str) -> float:

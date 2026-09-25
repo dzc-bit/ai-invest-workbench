@@ -224,6 +224,66 @@ def fetch_limit_up_rows(pool_type: str, trade_date: str | None = None) -> list[d
     return items
 
 
+def fetch_dragon_tiger_records(symbol: str, trade_date: str, look_back: int) -> tuple[list[dict[str, Any]], list[str]]:
+    """东财龙虎榜上榜记录（公共助手：龙虎榜工具与 stock_timeline 共用）。"""
+    start = datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=look_back)
+    diagnostics: list[str] = []
+    filter_records = f"(TRADE_DATE>='{start:%Y-%m-%d}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{symbol}\")"
+    rows = _eastmoney_datacenter(
+        "RPT_DAILYBILLBOARD_DETAILSNEW",
+        filter_str=filter_records,
+        page_size=20,
+        sort_columns="TRADE_DATE",
+        diagnostics=diagnostics,
+    )
+    records = [
+        {
+            "date": str(row.get("TRADE_DATE", ""))[:10],
+            "reason": row.get("EXPLANATION", ""),
+            "net_buy_wan": _wan(row.get("BILLBOARD_NET_AMT")),
+            "turnover_rate": row.get("TURNOVERRATE"),
+        }
+        for row in rows[:10]
+    ]
+    return records, diagnostics
+
+
+def fetch_research_reports(symbol: str, max_items: int) -> list[dict[str, Any]]:
+    """东财机构研报列表（公共助手：研报工具与 stock_timeline 共用）。"""
+    params = {
+        "industryCode": "*",
+        "pageSize": "100",
+        "industry": "*",
+        "rating": "*",
+        "ratingChange": "*",
+        "beginTime": "2020-01-01",
+        "endTime": "2030-01-01",
+        "pageNo": "1",
+        "fields": "",
+        "qType": "0",
+        "orgCode": "",
+        "code": symbol,
+        "rcode": "",
+        "p": "1",
+        "pageNum": "1",
+        "pageNumber": "1",
+    }
+    response = _em_get(REPORT_API, params=params, headers={"Referer": "https://data.eastmoney.com/"}, timeout=15)
+    response.raise_for_status()
+    rows = response.json().get("data") or []
+    return [
+        {
+            "date": str(row.get("publishDate", ""))[:10],
+            "org": row.get("orgSName", ""),
+            "rating": row.get("emRatingName", ""),
+            "title": html_to_plaintext(str(row.get("title", ""))),
+            "eps_this_year": row.get("predictThisYearEps"),
+            "industry": row.get("indvInduName", ""),
+        }
+        for row in rows[:max_items]
+    ]
+
+
 def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
     def stock_valuation(args: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = [str(s) for s in args.get("symbols", [])][:10]
@@ -251,45 +311,14 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
         if not symbol.isdigit():
             return {"ok": False, "error": f"无法识别股票代码：{args.get('symbol')!r}"}
         max_items = max(1, min(int(args.get("max_items", 8)), 20))
-        params = {
-            "industryCode": "*",
-            "pageSize": "100",
-            "industry": "*",
-            "rating": "*",
-            "ratingChange": "*",
-            "beginTime": "2020-01-01",
-            "endTime": "2030-01-01",
-            "pageNo": "1",
-            "fields": "",
-            "qType": "0",
-            "orgCode": "",
-            "code": symbol,
-            "rcode": "",
-            "p": "1",
-            "pageNum": "1",
-            "pageNumber": "1",
-        }
         diagnostics: list[str] = []
         try:
-            response = _em_get(REPORT_API, params=params, headers={"Referer": "https://data.eastmoney.com/"}, timeout=15)
-            response.raise_for_status()
-            rows = response.json().get("data") or []
+            reports = fetch_research_reports(symbol, max_items)
         except (requests.RequestException, ValueError) as exc:
             return {"ok": False, "error": f"东财研报接口失败：{exc}", "diagnostics": diagnostics}
-        if not rows:
+        if not reports:
             return {"ok": True, "reports": [], "note": "东财无该标的研报覆盖或接口返回为空", "diagnostics": diagnostics}
-        reports = [
-            {
-                "date": str(row.get("publishDate", ""))[:10],
-                "org": row.get("orgSName", ""),
-                "rating": row.get("emRatingName", ""),
-                "title": html_to_plaintext(str(row.get("title", ""))),
-                "eps_this_year": row.get("predictThisYearEps"),
-                "industry": row.get("indvInduName", ""),
-            }
-            for row in rows[:max_items]
-        ]
-        return {"ok": True, "symbol": symbol, "count": len(rows), "reports": reports, "diagnostics": diagnostics}
+        return {"ok": True, "symbol": symbol, "count": len(reports), "reports": reports, "diagnostics": diagnostics}
 
     def summarize_reports(payload: dict[str, Any]) -> str:
         if not payload.get("reports"):
@@ -305,30 +334,10 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             return {"ok": False, "error": f"无法识别股票代码：{args.get('symbol')!r}"}
         look_back = max(7, min(int(args.get("look_back", 30)), 90))
         trade_date = str(args.get("trade_date") or date.today().isoformat())
-        start = datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=look_back)
-        diagnostics: list[str] = []
-        filter_records = (
-            f"(TRADE_DATE>='{start:%Y-%m-%d}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{symbol}\")"
-        )
         try:
-            rows = _eastmoney_datacenter(
-                "RPT_DAILYBILLBOARD_DETAILSNEW",
-                filter_str=filter_records,
-                page_size=20,
-                sort_columns="TRADE_DATE",
-                diagnostics=diagnostics,
-            )
+            records, diagnostics = fetch_dragon_tiger_records(symbol, trade_date, look_back)
         except requests.RequestException as exc:
-            return {"ok": False, "error": f"龙虎榜接口失败：{exc}", "diagnostics": diagnostics}
-        records = [
-            {
-                "date": str(row.get("TRADE_DATE", ""))[:10],
-                "reason": row.get("EXPLANATION", ""),
-                "net_buy_wan": _wan(row.get("BILLBOARD_NET_AMT")),
-                "turnover_rate": row.get("TURNOVERRATE"),
-            }
-            for row in rows[:10]
-        ]
+            return {"ok": False, "error": f"龙虎榜接口失败：{exc}", "diagnostics": []}
         return {"ok": True, "symbol": symbol, "records": records, "diagnostics": diagnostics}
 
     def summarize_dragon_tiger(payload: dict[str, Any]) -> str:
@@ -444,6 +453,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             executor=stock_research_reports,
             summarizer=summarize_reports,
             digest_chars=2_600,
+            untrusted_body=True,
         ),
         AiTool(
             name="dragon_tiger_board",
@@ -460,6 +470,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             executor=dragon_tiger_board,
             summarizer=summarize_dragon_tiger,
             digest_chars=2_600,
+            untrusted_body=True,
         ),
         AiTool(
             name="limit_up_pool",
@@ -474,6 +485,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             executor=limit_up_pool,
             summarizer=summarize_limit_up,
             digest_chars=3_000,
+            untrusted_body=True,
         ),
         AiTool(
             name="compare_stocks",

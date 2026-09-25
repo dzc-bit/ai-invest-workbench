@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from astock_backtester.ai.context import retain_rows
+from astock_backtester.ai.context import retain_rows, truncate_text
 
 Executor = Callable[[dict[str, Any]], dict[str, Any]]
 Summarizer = Callable[[dict[str, Any]], str]
@@ -30,6 +30,10 @@ class AiTool:
     # 表格/榜单类工具的摘要预算（0 = 用 ContextBudget 默认）：默认 1200 字会把
     # 20 行摘要切成 8 行，模型于是"看不见"它刚查到的数据。
     digest_chars: int = 0
+    # 摘要含爬取正文时必须为 True：agent 据此在进上下文前套不可信分隔符
+    # （注入隔离的单一事实来源在工具自声明，而不是 agent 里一份手工名单——
+    # 手工名单漏更新时隔离会静默退化）。
+    untrusted_body: bool = False
 
     def openai_schema(self) -> dict[str, Any]:
         return {
@@ -63,6 +67,7 @@ class ToolExecution:
 
 READ_PAGE_ROWS = 40
 MAX_PAGE_ROWS = 80
+READ_TOOL_DIGEST_CHARS = 3_600
 
 
 def build_read_result_tool(store: Any) -> AiTool:
@@ -124,7 +129,11 @@ def build_read_result_tool(store: Any) -> AiTool:
             if more
             else "\n（该结果已全部读完）"
         )
-        return f"{head}\n{payload.get('table')}{tail}"
+        # 表体先按 digest 预算截断、再拼尾注：整条摘要曾直接交给 agent 的
+        # truncate_text 兜底，rows=80 的行情行集摘要（7181 字）被压到 3585 字时
+        # 恰好切掉"还剩 M 行"那句——模型读到半份数据却没有任何"还有剩"的信号。
+        body = truncate_text(payload.get("table") or "", READ_TOOL_DIGEST_CHARS - len(head) - len(tail) - 40)
+        return f"{head}\n{body}{tail}"
 
     return AiTool(
         name="read_tool_result",
@@ -144,7 +153,7 @@ def build_read_result_tool(store: Any) -> AiTool:
         },
         executor=read_tool_result,
         summarizer=summarize_read,
-        digest_chars=3_600,
+        digest_chars=READ_TOOL_DIGEST_CHARS,
     )
 
 

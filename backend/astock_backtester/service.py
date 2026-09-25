@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -847,6 +847,9 @@ class DataServiceHandler(BaseHTTPRequestHandler):
         if self.path == "/ai/sessions":
             self._send_json({"items": self.server.state.ai_service().list_sessions()})
             return
+        if self.path == "/ai/memories":
+            self._send_json(self.server.state.ai_service().list_memories())
+            return
         if self.path.startswith("/ai/session"):
             query = parse_qs(urlsplit(self.path).query)
             session_id = str((query.get("session_id") or [""])[0])
@@ -1081,6 +1084,66 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                     raise ValueError("缺少要删除的 session_id。")
                 deleted = self.server.state.ai_service().delete_session(session_id)
                 self._send_json({"session_id": session_id, "deleted": deleted})
+                return
+            if self.path == "/ai/memory/update":
+                memory_id = str(payload.get("id", "")).strip()
+                if not memory_id:
+                    raise ValueError("缺少要修改的记忆 id。")
+                self._send_json(
+                    self.server.state.ai_service().update_memory(
+                        memory_id,
+                        content=str(payload.get("content", "")),
+                        category=payload.get("category"),
+                        weight=payload.get("weight"),
+                    )
+                )
+                return
+            if self.path == "/ai/memory/delete":
+                memory_id = str(payload.get("id", "")).strip()
+                if not memory_id:
+                    raise ValueError("缺少要删除的记忆 id。")
+                self._send_json(self.server.state.ai_service().delete_memory(memory_id))
+                return
+            if self.path == "/sync/missing-only":
+                # 「只补缺口」：补齐入口以缺口为基准（§9）——只对
+                # incomplete_symbols 名单发起抓取，不做全量扫描。
+                # 注意：incomplete_symbols 本身是一次窗口完整性快照（真实仓
+                # 秒级~十几秒），这里**有意**同步执行——它是显式低频按钮
+                # （前端 LONG_RUNNING 超时），且名单算出后抓取转后台作业；
+                # 与 /health 那条"不得同步阻塞重型扫描"的红线不冲突，因为
+                # 本端点不承载任何轮询/连接性判定。
+                end_date = str(payload.get("end_date") or date.today().isoformat())
+                start_date = str(payload.get("start_date") or (date.today() - timedelta(days=30)).isoformat())
+                missing = self.server.state.sync_manager.incomplete_symbols(start_date, end_date)
+                if not missing:
+                    self._send_json(
+                        {
+                            "started": False,
+                            "reason": "窗口内没有不完整的股票，无需补齐。",
+                            "missing_symbols": 0,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                        }
+                    )
+                    return
+                job = self.server.state.sync_manager.start_full_market(
+                    symbols=missing,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                self.server.state.log(
+                    "info",
+                    f"Missing-only sync {job.status}: {len(missing)} incomplete symbols",
+                )
+                self._send_json(
+                    {
+                        "started": True,
+                        "missing_symbols": len(missing),
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "job": job.model_dump(mode="json"),
+                    }
+                )
                 return
             if self.path == "/ai/chat/stream":
                 self._run_ai_chat_stream(payload)

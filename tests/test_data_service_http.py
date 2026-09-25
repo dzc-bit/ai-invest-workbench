@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from datetime import UTC
+from threading import Event
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -250,22 +251,19 @@ def test_service_ping_is_lightweight(tmp_path):
 
 
 def test_service_identity_is_lightweight_and_reports_process_identity(tmp_path):
-    class SlowWarehouse:
+    class MustNotScanWarehouse:
         def coverage(self):
-            time.sleep(0.2)
-            return []
+            raise AssertionError("/identity 不得同步触发全仓 coverage 扫描")
 
     server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
-    server.state.warehouse = SlowWarehouse()
+    server.state.warehouse = MustNotScanWarehouse()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         port = server.server_address[1]
-        started = time.perf_counter()
         response = _request_json("GET", f"http://127.0.0.1:{port}/identity")
-        elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.2
+        # 旧断言 elapsed < 0.2 与耗时竞速；改为"coverage 从未被调用"的强断言
         assert response["ok"] is True
         assert response["port"] == port
         assert response["cache_path"] == str(tmp_path.resolve())
@@ -280,9 +278,13 @@ def test_service_identity_is_lightweight_and_reports_process_identity(tmp_path):
 
 
 def test_service_health_returns_cached_snapshot_while_coverage_refresh_is_slow(tmp_path):
+    entered = Event()
+    release = Event()
+
     class SlowWarehouse:
         def coverage(self):
-            time.sleep(0.4)
+            entered.set()
+            assert release.wait(timeout=5), "coverage 扫描未被释放（测试收尾失败）"
             return [
                 DatasetCoverage(dataset="daily_bars", symbols=99, start_date=None, end_date=None),
                 DatasetCoverage(dataset="market_cap", symbols=0, start_date=None, end_date=None),
@@ -290,19 +292,21 @@ def test_service_health_returns_cached_snapshot_while_coverage_refresh_is_slow(t
             ]
 
     server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
-    server.state.warehouse = SlowWarehouse()
+    warehouse = SlowWarehouse()
+    server.state.warehouse = warehouse
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         port = server.server_address[1]
-        started = time.perf_counter()
         health = _request_json("GET", f"http://127.0.0.1:{port}/health")
-        elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.3
+        # 握手断言替代 elapsed 竞速：health 返回时扫描肯定还没被放行——
+        # 证明 /health 没有等待 60 秒级全仓扫描。
+        assert release.is_set() is False
         assert health["ok"] is True
         assert health["coverage"][0]["dataset"] == "daily_bars"
     finally:
+        release.set()
         server.shutdown()
         thread.join(timeout=5)
 
@@ -2592,6 +2596,12 @@ def test_realtime_provider_rejects_partial_local_breadth_against_warehouse_cover
     class PartialLatestWarehouse:
         def read_latest_daily_bars(self, days=3):
             return bars
+
+        def cached_symbol_count(self):
+            return 5100
+
+        def refresh_symbol_count(self):
+            return 5100
 
         def coverage(self):
             return [

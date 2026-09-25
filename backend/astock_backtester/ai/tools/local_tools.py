@@ -58,7 +58,8 @@ class AiBackend(Protocol):
     def start_coverage_refresh(self, *, force: bool = False) -> Any | None: ...
 
 
-def _validated_nodes(expressions: list[str], *, mode: str) -> tuple[list[ConditionNode], list[dict[str, Any]]]:
+def validated_condition_nodes(expressions: list[str], *, mode: str) -> tuple[list[ConditionNode], list[dict[str, Any]]]:
+    """校验自然语言改写的条件 DSL 并转为 ConditionNode（screen_stocks 复用）。"""
     nodes: list[ConditionNode] = []
     failures: list[dict[str, Any]] = []
     for index, text in enumerate(expressions):
@@ -310,8 +311,8 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
         exit_rules = [str(text) for text in args.get("exit_expressions", [])][:MAX_CONDITION_EXPRESSIONS]
         if not entry:
             return {"ok": False, "error": "至少需要一条入场条件"}
-        entry_nodes, entry_failures = _validated_nodes(entry, mode="entry")
-        exit_nodes, exit_failures = _validated_nodes(exit_rules, mode="exit")
+        entry_nodes, entry_failures = validated_condition_nodes(entry, mode="entry")
+        exit_nodes, exit_failures = validated_condition_nodes(exit_rules, mode="exit")
         return {
             "ok": not entry_failures and not exit_failures,
             "entry_valid": [node.expression for node in entry_nodes],
@@ -331,8 +332,8 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
         exit_rules = [str(text) for text in args.get("exit_expressions", [])][:MAX_CONDITION_EXPRESSIONS]
         if not entry:
             return {"ok": False, "error": "至少需要一条入场条件"}
-        entry_nodes, entry_failures = _validated_nodes(entry, mode="entry")
-        exit_nodes, exit_failures = _validated_nodes(exit_rules, mode="exit")
+        entry_nodes, entry_failures = validated_condition_nodes(entry, mode="entry")
+        exit_nodes, exit_failures = validated_condition_nodes(exit_rules, mode="exit")
         if entry_failures or exit_failures:
             return {
                 "ok": False,
@@ -429,6 +430,7 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
             },
             executor=market_news,
             summarizer=summarize_news,
+            untrusted_body=True,
         ),
         AiTool(
             name="market_briefing",
@@ -440,6 +442,7 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
             },
             executor=market_briefing,
             summarizer=summarize_briefing,
+            untrusted_body=True,
         ),
         AiTool(
             name="risk_alerts",

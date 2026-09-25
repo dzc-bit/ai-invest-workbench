@@ -2574,3 +2574,58 @@ def test_realtime_provider_does_not_cache_yesterday_limit_up_logical_failure():
     assert calls == 2
     assert provider._yesterday_sector_cache_date is None
     assert any("rc=1" in item for item in diagnostics)
+
+
+# ===========================================================================
+# 本地股票池计数缓存（1.6.1）：coverage() 全仓扫描实测 ~10s，不得占用
+# breadth_time_budget=8s 的预算；缓存 600s TTL + 写入失效。
+# ===========================================================================
+
+
+def test_symbol_count_cache_refresh_and_write_invalidation(tmp_path):
+    warehouse = Warehouse(tmp_path / "warehouse-root")
+
+    # 空仓：现算走 coverage 退化路径，结果写入缓存
+    assert warehouse.refresh_symbol_count() == 0
+    assert warehouse.cached_symbol_count() == 0
+
+    # 写入使缓存失效：cached 回到未热（None），再 refresh 得到新计数
+    frame = pd.DataFrame(
+        {
+            "symbol": ["600000", "600000", "000001"],
+            "trade_date": pd.to_datetime(["2026-09-21", "2026-09-22", "2026-09-22"]),
+            "open": [1.0, 1.1, 2.0],
+            "high": [1.2, 1.3, 2.2],
+            "low": [0.9, 1.0, 1.9],
+            "close": [1.1, 1.2, 2.1],
+            "volume": [100.0, 110.0, 200.0],
+        }
+    )
+    warehouse.write_daily_bars(frame)
+    assert warehouse.cached_symbol_count() is None
+    assert warehouse.refresh_symbol_count() == 2
+
+
+def test_live_breadth_partial_source_skips_coverage_scan_and_notes_diagnostics(tmp_path, monkeypatch):
+    """主源只给出局部样本时，本地股票池计数只吃缓存：缓存未热转后台预热，
+    不在红绿家数预算内做全仓扫描，且 diagnostics 留痕（1.6.1）。"""
+    warehouse = Warehouse(tmp_path / "warehouse-root")
+    provider = RealtimeMarketProvider(warehouse=warehouse)
+
+    def forbidden_coverage():
+        raise AssertionError("breadth 链路不得同步扫 coverage()")
+
+    monkeypatch.setattr(warehouse, "coverage", forbidden_coverage)
+    provider._call_cls_breadth = lambda *args, **kwargs: None
+    provider._call_ths_market_summary_breadth = lambda *args, **kwargs: None
+    provider._fetch_ths_indexflash_breadth = lambda *args, **kwargs: None
+    provider._fetch_sina_breadth = lambda: MarketBreadth(up=60, down=40, flat=0, total=100, source="sina-a-share-live")
+    provider._fetch_tencent_breadth = lambda _diagnostics: None
+    provider._fetch_akshare_breadth_with_timeout = lambda _diagnostics: None
+    provider._fetch_heavy_breadth = lambda _diagnostics: None
+
+    diagnostics = []
+    breadth = provider._fetch_live_breadth(diagnostics, deadline=monotonic() + 2.0, cancel_event=Event())
+
+    assert breadth is None  # 局部样本不被包装成全市场 live
+    assert any("缓存未热" in item for item in diagnostics)

@@ -44,6 +44,12 @@ class AiSessionNotFound(AiError):
     code = "ai_session_not_found"
 
 
+class AiMemoryNotFound(AiError):
+    """Raised when a memory record update/delete targets an unknown id."""
+
+    code = "ai_memory_not_found"
+
+
 def ai_error_code(exc: Exception) -> str:
     if isinstance(exc, AiError):
         return exc.code

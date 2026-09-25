@@ -916,6 +916,19 @@ def test_write_latest_json_supports_distinct_release_asset_name():
     assert "url = \"https://github.com/$RepoSlug/releases/download/$Tag/$ReleaseAssetName\"" in script
 
 
+def test_write_latest_json_guards_against_stale_signature_reuse():
+    """旧签名复用防线：.sig 内嵌 file 名必须与 -AssetName 一致、mtime 不得早于
+    安装包、-Version 缺省读 package.json（bundle/nsis 里堆着多个历史版本的
+    exe+sig，传错 -AssetName 就会把旧 .sig 配上新版本号——AGENTS.md §12 明令禁止）。"""
+    script = Path("scripts/write-latest-json.ps1").read_text(encoding="utf-8")
+
+    assert "if (-not $Version) {" in script
+    assert "$packageJson.version" in script
+    assert "signature was generated for" in script
+    assert "stale signature reuse" in script
+    assert "signature file is older than the installer" in script
+
+
 def test_service_manager_defines_and_uses_packaged_sidecar_relative_helper():
     source = Path("src-tauri/src/service_manager.rs").read_text(encoding="utf-8")
 
@@ -963,7 +976,9 @@ def test_release_manifests_use_one_version():
         tauri_version,
         init_version,
     }
-    assert all_versions == {"1.6.0"}
+    # 不再硬编码具体版本号：每次升版都要手改这里，而文档从没写——
+    # 版本一致性以 package.json 为锚点做跨文件校验。
+    assert all_versions == {package_version}
 
 
 def test_deprecated_full_array_strategy_mutation_is_removed():

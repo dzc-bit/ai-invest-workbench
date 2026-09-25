@@ -81,7 +81,10 @@ def test_fetch_fund_flow_returns_empty_rows_for_missing_payload():
         crawler.fetch_fund_flow("600519", "2024-01-01", "2024-01-31")
 
 
-def test_fetch_many_fund_flows_reports_empty_payload_and_empty_klines_as_failures():
+def test_fetch_many_fund_flows_reports_empty_payload_and_empty_klines_as_failures(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("astock_backtester.data.capital_flow_crawler.time.sleep", sleeps.append)
+
     def fake_json_get(url, params, headers, timeout):
         if params["secid"] == "1.600519":
             return {"data": None}
@@ -96,6 +99,8 @@ def test_fetch_many_fund_flows_reports_empty_payload_and_empty_klines_as_failure
         {"symbol": "600519", "code": "empty_payload", "error": "empty_payload: Eastmoney payload missing data for 600519"},
         {"symbol": "000001", "code": "empty_klines", "error": "empty_klines: Eastmoney payload has no klines for 000001"},
     ]
+    # 退避序列被显式断言（此前放过真实 sleep，三个用例各白等 6 秒）
+    assert sleeps == [2.0, 4.0]
 
 
 def test_fetch_many_fund_flows_fetches_remaining_symbols_with_bounded_parallelism(monkeypatch):
@@ -388,7 +393,10 @@ def test_fetch_fund_flow_uses_push2_kline_fallback_when_daykline_fails():
     assert calls[-1][1]["lmt"] == "40"
 
 
-def test_fetch_many_fund_flows_keeps_successful_rows_and_reports_failures():
+def test_fetch_many_fund_flows_keeps_successful_rows_and_reports_failures(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("astock_backtester.data.capital_flow_crawler.time.sleep", sleeps.append)
+
     def fake_json_get(url, params, headers, timeout):
         if params["secid"] == "1.600519":
             return {
@@ -411,6 +419,7 @@ def test_fetch_many_fund_flows_keeps_successful_rows_and_reports_failures():
     assert "https://data.eastmoney.com/zjlx/detail.html [base]: remote disconnected" in result["failures"][0]["error"]
     assert "https://quote.eastmoney.com/ [base]: remote disconnected" in result["failures"][0]["error"]
     assert "https://data.eastmoney.com/zjlx/detail.html [ut]: remote disconnected" in result["failures"][0]["error"]
+    assert sleeps == [2.0, 4.0]
 
 
 def test_fetch_many_fund_flows_uses_baidu_history_fallback_without_terminal_failure():
@@ -958,7 +967,9 @@ def test_fetch_many_fund_flows_uses_recent_success_cache_after_disconnect():
     )
 
 
-def test_fetch_many_fund_flows_does_not_reuse_recent_success_cache_after_empty_klines():
+def test_fetch_many_fund_flows_does_not_reuse_recent_success_cache_after_empty_klines(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("astock_backtester.data.capital_flow_crawler.time.sleep", sleeps.append)
     calls = 0
 
     def fake_json_get(url, params, headers, timeout):
@@ -984,6 +995,8 @@ def test_fetch_many_fund_flows_does_not_reuse_recent_success_cache_after_empty_k
     assert second["failures"][0]["symbol"] == "600519"
     assert second["failures"][0]["code"] == "empty_klines"
     assert not any(item["code"] == "recent_success_cache_used" for item in second["diagnostics"])
+    # 同一符号连续重试：退避从 2.0 起步翻倍（第二次重试 4.0）
+    assert sleeps == [2.0, 4.0]
 
 
 def test_normalize_code_accepts_common_a_share_symbol_forms():

@@ -31,9 +31,11 @@ export interface UpdateApi {
   relaunch(): Promise<void>;
 }
 
-export function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
-}
+// 运行时检测只有一个家（tauriRuntime.ts）：这里曾各自重写一遍，判断口径
+// 漂移时浏览器预览与桌面端会静默分叉。
+import { isTauriRuntime } from "./tauriRuntime";
+
+export { isTauriRuntime };
 
 function messageFrom(caught: unknown): string {
   if (caught instanceof Error) {

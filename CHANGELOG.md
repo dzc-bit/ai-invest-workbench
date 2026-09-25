@@ -2,6 +2,24 @@
 
 发布历史的归档地。`README.md` 只讲"现在能做什么"，每轮发布的新增内容写在这里，不再往 README 上堆。
 
+## 未发布
+
+- **研究风格升级为"人设规格"（本轮重点）**：1.5.2 只让三种风格的骨架不同，实测语气/情绪温度仍高度趋同——均衡块 623 字是三块里最薄的（与激进差 2.4 倍）、短点评口吻指令只有 18~51 字（却要驱动 80~120 字的输出）、均衡几乎"没有作者"。现在每个风格块写满六节：**我是谁**（具体职业背景，让模型"演"这个人）、**怎么说话**（句式层面区分：保守=短判断句+审计口径、均衡=对照句+设问+对价句式、激进=短句动宾开头+行情黑话）、**情绪怎么出来**（看多/看空/不确定/遇险四处境逐一写清）、**专属词汇表**、**禁用词表**（防串味最有效的单条约束：保守禁打板/卡位/满仓，激进禁安全边际/股息率，均衡两套黑话都不沾）、**承压与认错方式**。口吻指令加厚到 146~168 字。新增语域指纹守卫（块厚比 ≤1.6、指令长度 ≥140、情绪温度可量化差异、专属词汇不串味、全表面无确定性承诺词），"像不像不同的人"从此可回归。情绪纪律五条边界全部保留并写入测试：数字来自工具、免责声明与风险段落齐全、保守显式拒绝进攻性打法、激进声明不作持有型建议、任何表面无"必然/必涨/稳赚"。
+- **风格事实来源收敛**：`config.SUPPORTED_RESEARCH_STYLES` 不再是第二份独立元组，直接复用 `prompts.RESEARCH_STYLES`（此前一致性守卫只查 prompts 侧，新增风格漏改 config 会静默降级为 balanced）；"无风格场景"从隐式契约升级为显式声明 `STYLE_FREE_ONESHOT_SCENES` + 导入期校验。
+- **风格贯穿第四个出口**：AI 快讯（INSIGHT_PROMPT）注入轻量口吻指令；聚合要点（DIGEST）是事实归纳，按登记口径保持中立。`build_review_prompt` 改为返回 messages，与 chat/oneshot/insight 三出口签名一致，新增风格不再需要隐性知识。
+- **定时复盘报告的「风险提示」修复（静默失效两版）**：拼行用了 `RiskAlertItem.summary`——该字段根本不存在，抛出的 AttributeError 被紧邻的 `except Exception: pass` 吞掉，每一份定时复盘（含数据摘要版兜底）的风险提示段都只剩一行表头。改用真实字段（symbol/name/risk_type/severity/reason）拼行，并补上同文件其余段落都有的 `_crawled_review_block` 不可信围栏。
+- **归档窗口不再产生孤儿 tool 消息（会话永久不可用的根因）**：`_archive_overflow` 在长工具轮中段（1 条 user + 28 组 assistant(tool_calls)/tool、无尾部 user）找不到 user 边界时回退到字符裁剪点，窗口头变成无主 tool 消息——OpenAI/Anthropic 都拒绝首条为 tool 的请求，该会话此后每轮必败。现在找不到安全切点就归档 0 条并留 warning，宁可一轮超预算也绝不产生非法窗口。配套修复 `_repair_interrupted_turn`：孤儿 tool 直接丢弃；`answered` 集合不再全局共享（`llm_client` 在供应商不回 id 时自造 `call_{index}`，跨轮重复 id 曾让后面的 assistant 永远等不到配对结果）。
+- **红绿家数链路不再被 10 秒全仓扫描拖死**：`_coverage_symbol_count` 每次实时请求都可能触发 `warehouse.coverage()`（真实数据仓实测 ~10s），而红绿家数总预算只有 8s——主源不完整时这条路径吃光预算，把后面本可用的 Sina/Tencent/AKShare 全部判超时。现在股票池计数走仓库侧 600s TTL 缓存（与缺口画像同族：TTL + 写入失效），缓存未热转后台预热、diagnostics 留痕，绝不在行情链路上现算。
+- **AI 投研原语三件套**：`screen_stocks`（全市场横向筛选，复用 conditions.py 双注册语义与回测同款指标增强，替代手写 SQL 逐条件拼）、`stock_timeline`（单股事件时间轴：本地日线+龙虎榜+涨停池+研报按日期倒序一次合并，跨源失败逐源标注不整体失败，摘要进上下文前压缩再包不可信围栏）、`my_positions`（只读长期记忆中的持仓/自选，明示"记忆是用户自述非行情事实"）。注册表增至 23 个工具，`/ai/status` 与前端 mock 清单同步并有防漂移守卫。
+- **AI 记忆治理**：新增 `GET /ai/memories`、`POST /ai/memory/update`、`POST /ai/memory/delete`（此前全仓无任何路由/UI 能查看或修改记忆，前端只有一句"N 条"计数）；写侧拦截"把行情数字当持久事实"的记录（真实记忆文件里已有"9/22 主力净流出 4.44 亿"这类过夜即错的事实），非 profile 类命中行情数字模式即拒绝并计数，不再静默；同标的重叠记录（同 category + 相同 6 位代码）走 update 合并而不是新增。AI 抽屉新增「记忆」视图（进入现有切换条，不常驻堆叠），可编辑/删除；`MEMORY_OPS_PROMPT` 明确"行情数字绝不写入"。
+- **后端能力接线**：`/market/commentary`（451 行四段状态机此前前端引用数为 0）接入行情区——状态语义显式：非 intraday/post_close 的 mode 一律标注"非实时"，本地简短判断不包装成实时盘面；`MarketCommentaryResponse` 补齐 TS 类型。`SyncJobManager.incomplete_symbols`（此前是死 API）补 `POST /sync/missing-only` 路由与数据中心「只补缺口」按钮——以缺口为基准只对名单发起抓取，不做小时级全量扫描。`corrupt_partitions` 补 TS 类型并在缺失数据监控折叠区展示，有损坏时明确"先修损坏再补数据"。新增组件级守卫：覆盖表 missing_rows 只能来自刷新后的真实仓库 coverage，绝不能用本次 imported_rows 抵扣。
+- **Mock 层退出生产包**：`apiMocks/aiMocks` 此前被无条件静态 import，dist 里能搜到"示例股份 / sk-demo-key / 预览模式"，且 `mockAiStatus` 只列 4 个工具名（真实 23 个）漂移不可见。现在经 `previewMocks` 动态 import + `import.meta.env.DEV` 门控，生产构建整个摇掉；非 Tauri 环境页面常驻"浏览器预览：演示数据"横幅，`callBackend` 在无 mock 的生产浏览器里明确报错而非静默返回假回测结果。`isTauriRuntime` 三处重复实现收敛到 `tauriRuntime.ts`。
+- **测试与门禁提效**：资金流爬虫三个用例放过真实退避各睡 6 秒（全量 18 秒），改 monkeypatch 并断言退避序列（比静默等待更强）；`/identity`、`/health` 的耗时断言与 0.4s 假延时互相竞速，改为"coverage 从未被调用"/Event 握手的确定性断言；vitest 覆盖率开 `all: true`——此前 15 个源文件（整个 AI 抽屉面）不在分母里，"90.4%"掩盖 AI 面零覆盖（真实值 84.8%），并为 `AiEquityChart`（83 行 ECharts 生命周期）补测；CI 新增 `package` job 真正跑一次 `build-data-service.ps1` 并断言 sidecar 四件套（exe/node.exe/ths-cookie-worker.cjs/xhr-sync-worker.js）存在——§5 的安装版红线此前只被脚本文本 substring 断言守着，CI 永远验证不到；新增静默吞异常棘轮（`tests/test_no_silent_swallow.py`，借 deepseek-harness"失败必须响亮"纪律）：`except Exception: pass` 圈定在显式豁免名单里（基线 17 处，只许减不许增），新代码再写静默吞必须先登记理由——P1-① 静默失效两版无人发现正是这类形态。
+- **发布脚本防旧签名复用**：`write-latest-json.ps1` 校验 .sig 内嵌 file 名与 -AssetName 一致、.sig mtime 不早于安装包、-Version 缺省读 package.json——bundle/nsis 里堆着多个历史版本的 exe+sig，此前传错参数就会把旧 .sig 配上新版本号。
+- **性能与协议卫生**：回测 `_next_trade_date` 线性扫描改二分（2500 日 O(days²)≈300 万次比较 → 二分）；`providers.py` 两处全市场 iterrows 改 itertuples；AI `truncate_text` 删掉"cut=limit"硬切兜底——无安全边界时整段丢弃，绝不把 `"close": 12.34` 切成 `12.`（该兜底正是 1.5.2 修的病留下的后门）；`read_tool_result` 摘要先截表体再拼"还剩 M 行"尾注，避免尾注被硬截切掉（模型读到半份数据却不知道还有剩）；工具自声明 `untrusted_body` 取代 agent 手工名单，新增爬取类工具忘加围栏会静默退化隔离；未知工具串行执行（不再扇出线程池只为返回 unknown_tool）。
+- **脚本符号收敛**：`run-capital-flow-backfill.py` 与 `run-full-market-import.py` 各自逐字节复制的 `normalize_symbol` 删除，统一从 `data/symbols.py` 导入（§15-1）；后者补上 sys.path 引导。
+- **文档履约（§17.2）**：本文件 `## 未发布` 移回顶部（此前排在 1.6.0 之后，读者无法判断归属版本）；AGENTS.md §15-4 依赖白名单措辞修正、§15-9 补 metadata.sqlite 具体路径；`test_release_manifests_use_one_version` 不再硬编码版本号（以 package.json 为锚点校验跨文件一致性）。
+
 ## 1.6.0
 
 - **研究风格真正改变输出**：三种风格此前各只有约 150 字（占 system prompt 4.7%~5.4%），被 3000 字通用人设里写死的"四维框架 + 评股报告结构"压平——切风格几乎感知不到差别，激进风格也不像龙头选手。现在每种风格自带**独立输出骨架 + 取证清单 + 决策口径**（占比提到 19%~36%），通用人设只保留硬性规则与工具口径并删掉写死的模板。激进风格写成龙头选手口径：情绪周期定位 → 梯队结构（总龙头/板块龙头/卡位补涨 + 断层）→ 龙头辨识度三项 → 参与语义（打板/低吸/半路）→ 断板预案 → 纪律约束，必查涨停池 zt/yzt/zb/dt 四类 + 市场宽度 + 龙虎榜席位，并明确**禁止用基本面尺子裁剪情绪妖股**。
@@ -13,9 +31,6 @@
 - **修复 AI 抽屉横向溢出**：根因是 `styles.css` 里一条无作用域的全局 `table { min-width: 680px }`（服务数据中心宽表）命中了 Markdown 表格，把 2 列表格也硬撑到 680px；同时 `rehype-sanitize` 默认放行 `pre`/`img` 而 `<pre>` 的 `white-space: pre` 让 `overflow-wrap` 失效；容器只写 `overflow-y` 时另一轴被规范推成 `auto`，把溢出兜成隐蔽的横向滚动条（页面级不滚动，所以掩盖了问题）。现在表格显式 `min-width:0 + table-layout:fixed`、`pre`/`img` 补 `max-width:100%`、容器补 `min-width:0` 与显式 `overflow-x:hidden`，新增 `AiOverflow.test.tsx` 守约。
 - **间距/宽度 token 化**：`design.md` 里挂账的"间距 token 化"已落地——新增 `--space-1..6`（4/8/12/16/20/24px）与 `--drawer-width`，AI 面板的裸字号（11.5/12.5/13.5px）全部收编到 `--text-*` 字阶。
 - **顺带修复两处既有失败**：DataCenter 测试夹具补齐 `DatasetCoverage.suspension_rows`（1.5.2 起类型已变，`tsc` 因此报错）；`DataCenter.lifecycle` 用例冻结系统时间（"未上市"徽标依赖真实今天，越过夹具日期后必然失效）。
-
-## 未发布
-
 - **交易日历节假日表补录 2015-2023**：表曾只从 2024 年起，2022-2023 年的春节/国庆/端午等休市日被当成交易日——仅 2022-2024 窗口就制造了 ~17.5 万行"节假日幽灵缺口"，并被 thin-day 规则误判为可补（每行都无法补齐）。补录后用数据仓自校验（真节假日当天仓库行数≈0、相邻交易日数千行）确认无误；日线可行动缺口从 574,281 行降到 **10,105 行**（剩余为早年真实稀疏洞），缺口基准补齐名单同步缩水（2022-2024 从 5,379 只降到 791 只）。日历同时影响回测：2015-2023 的节假日不再被当成有行情的交易日。范围告警从"只查上界"扩展为上下界都查。
 - **覆盖缺口口径修订（停牌类缺行单列）**：实测发现 2025 年 15,095 个缺口对 **100%** 落在"市场正常日"（当日全市场行数正常）——它们是停牌日的缺行，公开渠道天然没有，旧"累计真实缺口"口径把它们全数计为缺失，导致覆盖卡显示数十万"缺口"而任何补齐手段都无能为力。新口径：日线缺口拆分为**可行动缺口**（停更尾部 + thin day 疑似写入失败的内部洞，记入 `missing_rows`）与**停牌类缺行**（市场正常日的内部洞，单列 `suspension_rows`，明确不可补、非数据质量问题）；停更尾部保持独立可行动口径。`DatasetCoverage` 新增 `suspension_rows` 字段，数据中心覆盖卡与 AI `data_health_report` 同步展示。同时新增缺口基准补齐入口 `SyncJobManager.incomplete_symbols(start, end)`：返回窗口内不完整的股票名单，补齐只对名单发起抓取，不再全量扫描。
 
