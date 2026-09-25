@@ -13,7 +13,8 @@ const apiMocks = vi.hoisted(() => ({
   loadDataServiceLogs: vi.fn(),
   loadDailyBarsCoverage: vi.fn(),
   loadSyncJob: vi.fn(),
-  startFullMarketSync: vi.fn()
+  startFullMarketSync: vi.fn(),
+  startMissingOnlySync: vi.fn()
 }));
 
 // Spread the real api module so newly added exports (e.g. BackendError) stay
@@ -541,7 +542,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={missingCoverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    const capitalFlowButton = screen.getAllByRole("button")[3];
+    const capitalFlowButton = screen.getByRole("button", { name: "补齐资金流" });
     await user.click(capitalFlowButton);
 
     await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalled());
@@ -1022,6 +1023,48 @@ describe("DataCenter", () => {
       ["600519"],
       "2026-05-26",
       "2026-06-05"
+    ));
+  });
+
+  it("覆盖表 missing_rows 只能来自刷新后的真实仓库 coverage，绝不能用本次 imported_rows 抵扣", async () => {
+    // §9 红线（被踩过两次）：fetch 报告 imported_rows=3，但刷新后的真实 coverage
+    // 仍有 missing_rows=2——覆盖表必须按仓库口径显示 2。旧实现曾用本次
+    // imported_rows 抵扣缺失数，出现"任务没补完却显示缺失为 0"的错误。
+    const user = setupUser();
+    const onCoverageChange = vi.fn();
+    render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={onCoverageChange} />);
+
+    await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
+    await user.type(screen.getByLabelText("股票代码"), "600519");
+    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+
+    await waitFor(() => expect(apiMocks.fetchDailyBars).toHaveBeenCalled());
+    expect(onCoverageChange).toHaveBeenCalledWith(coverage);
+
+    // 覆盖表按 coverage 原样展示：日线缺失 2（不被 3 行 imported 抵扣成 0）
+    const dailyRow = screen.getByText("日线行情", { selector: "strong" }).closest("tr");
+    expect(dailyRow).not.toBeNull();
+    expect(within(dailyRow!).getByText("2")).toBeTruthy();
+    expect(within(dailyRow!).queryByText("0")).toBeNull();
+  });
+
+  it("「只补缺口」入口以缺口名单发起，完成后显示缺口数量", async () => {
+    apiMocks.startMissingOnlySync.mockResolvedValue({
+      started: true,
+      missing_symbols: 3,
+      start_date: "2026-05-26",
+      end_date: "2026-06-05"
+    });
+    const user = setupUser();
+    render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
+
+    await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
+    await user.click(screen.getByRole("button", { name: "只补缺口" }));
+
+    await waitFor(() => expect(apiMocks.startMissingOnlySync).toHaveBeenCalledWith(
+      "http://127.0.0.1:9011",
+      expect.any(String),
+      expect.any(String)
     ));
   });
 });

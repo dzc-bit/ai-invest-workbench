@@ -183,8 +183,16 @@ def _gather_review_sources(backend: Any, digest_items: list[dict[str, Any]]) -> 
     try:
         alerts = backend.risk_provider.current_alerts()
         if alerts.items:
-            sections.append(f"【风险提示】共 {len(alerts.items)} 条，前 5 条：")
-            sections.extend(f"- {item.summary}" for item in alerts.items[:5])
+            # RiskAlertItem 的真实字段是 symbol/name/risk_type/reason/severity，
+            # 没有 summary——旧代码拼 item.summary 抛 AttributeError 且被
+            # except Exception 吞掉，每一份定时复盘的"风险提示"都只剩表头
+            # 一行。reason 是上游影响文本，与同文件其余爬取段落一样必须过
+            # 不可信围栏（此前只有这一块是裸拼）。
+            lines = [
+                f"- {item.symbol} {item.name}（{item.risk_type}｜{item.severity}）：{item.reason}"
+                for item in alerts.items[:5]
+            ]
+            sections.append(_crawled_review_block(f"【风险提示】共 {len(alerts.items)} 条，前 5 条：", "\n".join(lines)))
     except Exception:  # noqa: BLE001
         pass
     if digest_items:
@@ -432,12 +440,13 @@ class ScheduledReportEngine:
         model = self._model_provider() if config.is_configured() else None
         if model is not None:
             try:
+                # build_review_prompt 与另外两个风格出口签名一致（返回 messages）。
                 prompt = build_review_prompt(
                     config.research_style,
                     date_text=now_local.strftime("%Y-%m-%d"),
                     data_text=sources,
                 )
-                for event in model.chat([{"role": "user", "content": prompt}], tools=None):
+                for event in model.chat(prompt, tools=None):
                     if event[0] == "final":
                         content = str((event[1] or {}).get("content") or "")
             except Exception:  # noqa: BLE001 - 模型失败回退数据摘要版

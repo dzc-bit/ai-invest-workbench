@@ -66,10 +66,24 @@ MEMORY_OPS_PROMPT = """你是用户记忆管理员。根据“最新对话”维
 - weight 1-3：3=用户明确强调（如“我只做低估值”），2=明确陈述，1=顺带提及。
 - 用户表明风险偏好、交易风格、加减仓习惯的变化时必须更新。
 - 时间性事实（某日买卖、某日的判断）必须带上绝对日期，否则以后无法判断是否过时。
+- 行情数字（某日的主力净流入、涨跌幅、成交额、价格等）绝不写入记忆——那些是数据仓工具的职责，\
+写入后会被系统拒绝。
 - 没有值得记忆的变化就输出 []。
 - 只输出 JSON 数组，格式：\
 [{{"op": "add", "content": "...", "category": "watchlist", "weight": 2}}, \
 {{"op": "update", "id": "...", "content": "..."}}, {{"op": "delete", "id": "..."}}]"""
+
+# 行情数字模式：非 profile 类记忆命中即拒绝（"把行情数字当持久事实"的记录会被
+# 每轮注入 system prompt 当权威，而数字第二天就过时）。两条途径命中任意一条：
+# 1) 行情语境词后紧跟数字（主力净流出 4.44 / 涨停 3 天 / 换手 12%）；
+# 2) 亿/万 计数与资金流词语同现（4.44 亿 的主力净流出）。
+_MARKET_CONTEXT_BEFORE_NUMBER = re.compile(
+    r"(?:主力净[流入卖出]|主力|净[流入卖出]|净买|涨停|跌停|封板|炸板|换手|量比|振幅|"
+    r"涨幅|跌幅|涨跌|收盘|成交额|成交量|封成比)[^0-9]{0,12}\d"
+)
+_MARKET_UNIT_BEFORE_CONTEXT = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:亿|万)(?:元)?.{0,8}(?:主力|净流|净买|资金|成交|封单|流入|流出)"
+)
 
 
 @dataclass
@@ -89,6 +103,23 @@ def _now_iso() -> str:
 
 def _normalize(content: str) -> str:
     return re.sub(r"\s+", "", content)[:MAX_CONTENT_CHARS]
+
+
+def looks_like_market_fact(content: str) -> bool:
+    """是否像"把行情数字当持久事实"的记录（写侧拦截口径，详见常量注释）。"""
+    return bool(_MARKET_CONTEXT_BEFORE_NUMBER.search(content) or _MARKET_UNIT_BEFORE_CONTEXT.search(content))
+
+
+def _extract_symbols(content: str) -> set[str]:
+    """从记忆文本里提取 6 位股票代码（同标的合并去重的依据）。
+
+    首位限定 A 股代码前缀族（0/3/4/6/8/9），避免把 "260922" 这类日期缩写
+    当成标的。"""
+    return {
+        code
+        for code in re.findall(r"(?<!\d)\d{6}(?!\d)", content)
+        if code[0] in ("0", "3", "4", "6", "8", "9")
+    }
 
 
 def recall_score(record: MemoryRecord, now: datetime | None = None) -> float:
@@ -113,6 +144,9 @@ class MemoryStore:
     def __init__(self, ai_base_dir: str | Path) -> None:
         self._path = Path(ai_base_dir) / MEMORY_DIR_NAME / MEMORY_FILE_NAME
         self._lock = threading.Lock()
+        # 写侧行情数字拦截计数（进程内累计，随 /ai/memories 暴露）：
+        # 拒绝必须可见，静默丢弃会让用户/模型都以为写入成功了。
+        self.rejected_market_facts = 0
 
     def load(self) -> list[MemoryRecord]:
         if not self._path.exists():
@@ -151,17 +185,31 @@ class MemoryStore:
                 kind = str(op.get("op", "")).lower()
                 content = str(op.get("content", "")).strip()[:MAX_CONTENT_CHARS]
                 if kind == "add" and content:
-                    normalized = _normalize(content)
-                    if any(_normalize(record.content) == normalized for record in records):
-                        continue
+                    # 写侧拦截：行情数字不是持久事实（示例反面记录：
+                    # "纠正超声电子数据：9/22 主力净流出 4.44 亿…"）。拒绝并计数。
                     category = str(op.get("category", "fact"))
                     if category not in CATEGORIES:
                         category = "fact"
+                    if category not in PROFILE_CATEGORIES and looks_like_market_fact(content):
+                        self.rejected_market_facts += 1
+                        continue
+                    normalized = _normalize(content)
+                    if any(_normalize(record.content) == normalized for record in records):
+                        continue
+                    # 同标的合并：同 category 且含相同 6 位代码的旧记录走 update
+                    # 而不是新增（真实记忆文件里已有"同标的、不同措辞"的重复条目）。
+                    duplicate = self._find_same_subject(records, category, content, normalized)
                     try:
                         weight = min(3.0, max(1.0, float(op.get("weight", 1.0))))
                     except (TypeError, ValueError):
                         weight = 1.0
                     now = _now_iso()
+                    if duplicate is not None:
+                        duplicate.content = content
+                        duplicate.weight = weight
+                        duplicate.updated_at = now
+                        applied += 1
+                        continue
                     records.append(
                         MemoryRecord(
                             id=uuid4().hex[:12],
@@ -176,6 +224,9 @@ class MemoryStore:
                 elif kind == "update" and content:
                     target = next((record for record in records if record.id == str(op.get("id", ""))), None)
                     if target is None:
+                        continue
+                    if target.category not in PROFILE_CATEGORIES and looks_like_market_fact(content):
+                        self.rejected_market_facts += 1
                         continue
                     target.content = content
                     if str(op.get("category", "")) in CATEGORIES:
@@ -195,6 +246,62 @@ class MemoryStore:
             records.sort(key=lambda item: item.updated_at, reverse=True)
             self.save(records[:MAX_RECORDS])
         return applied
+
+    @staticmethod
+    def _find_same_subject(
+        records: list[MemoryRecord], category: str, content: str, normalized: str
+    ) -> MemoryRecord | None:
+        """同标的判定：新记录的**全部**代码都被旧记录包含才合并——交集判定会
+        把"600519 和 000825 各半仓"这类多标的记录整体覆写成只提一只的新条目。"""
+        new_codes = _extract_symbols(content)
+        for record in records:
+            if _normalize(record.content) == normalized:
+                return record
+            if record.category != category:
+                continue
+            existing_codes = _extract_symbols(record.content)
+            if new_codes and existing_codes and new_codes <= existing_codes:
+                return record
+        return None
+
+    # --------------------------------------------------- explicit user ops
+    def update_record(
+        self,
+        memory_id: str,
+        *,
+        content: str,
+        category: str | None = None,
+        weight: float | None = None,
+    ) -> MemoryRecord:
+        """显式修改一条记忆（用户在治理面板操作，与模型提炼的 apply_ops 分离）。
+
+        与写侧自动提炼不同，用户显式输入不做行情数字拦截——那是用户对自己
+        记忆的编辑权；但内容长度、类别与权重仍然校验。
+        """
+        with self._lock:
+            records = self.load()
+            target = next((record for record in records if record.id == str(memory_id)), None)
+            if target is None:
+                raise KeyError(memory_id)
+            target.content = content
+            if category is not None:
+                target.category = category
+            if weight is not None:
+                target.weight = min(3.0, max(1.0, float(weight)))
+            target.updated_at = _now_iso()
+            records.sort(key=lambda item: item.updated_at, reverse=True)
+            self.save(records)
+            return target
+
+    def delete_record(self, memory_id: str) -> bool:
+        """显式删除一条记忆；id 不存在返回 False（不抛错，幂等）。"""
+        with self._lock:
+            records = self.load()
+            remaining = [record for record in records if record.id != str(memory_id)]
+            if len(remaining) == len(records):
+                return False
+            self.save(remaining)
+            return True
 
     # --------------------------------------------------------------- recall
     def _ranked(self) -> list[MemoryRecord]:

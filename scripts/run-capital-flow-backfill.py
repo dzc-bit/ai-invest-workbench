@@ -26,6 +26,7 @@ from astock_backtester.data.providers import (
     CompositeProvider,
     HttpAStockProvider,
 )
+from astock_backtester.data.symbols import normalize_symbol
 from astock_backtester.data.warehouse import KNOWN_CAPITAL_FLOW_SOURCE_GAP_DATES, Warehouse
 
 DEFAULT_BATCH_SIZE = 20
@@ -41,15 +42,6 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def normalize_symbol(symbol: object) -> str:
-    code = str(symbol).strip().upper()
-    if code.startswith(("SH", "SZ", "BJ")):
-        code = code[2:]
-    if "." in code:
-        code = code.split(".", 1)[0]
-    return code.zfill(6) if code.isdigit() else code
 
 
 def unique_symbols(symbols: Sequence[object]) -> list[str]:

@@ -36,14 +36,21 @@ def truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     # 绝不按字符硬切：`"close": 12.34` 切成 `12.` 会让模型读到一个格式合法但
-    # 数值错误的价格/百分比，在行情场景里比整行丢弃危险得多。
+    # 数值错误的价格/百分比，在行情场景里比整行丢弃危险得多。旧兜底分支
+    # `cut = limit` 正是这条保证的漏洞——最后一个换行/逗号落在 limit//2 之前时
+    # 会退回硬切。现在逐级放宽到空格/冒号等次级边界；仍找不到就整段丢弃
+    # （只保留提示行），宁可少给信息也不给错误的数字。
     cut = text.rfind("\n", 0, limit)
     if cut < limit // 2:
-        cut = max(text.rfind(",", 0, limit), text.rfind("}", 0, limit))
+        cut = max(text.rfind(",", 0, limit), text.rfind("}", 0, limit), text.rfind("]", 0, limit))
     if cut < limit // 2:
-        cut = limit
+        cut = max(text.rfind("，", 0, limit), text.rfind(" ", 0, limit), text.rfind("：", 0, limit), text.rfind(":", 0, limit))
+    if cut < limit // 2:
+        cut = 0
     dropped = len(text) - cut
-    return f"{text[:cut].rstrip()}\n...[已截断，后续 {dropped} 字符未提供]"
+    body = text[:cut].rstrip()
+    note = f"\n...[已截断，后续 {dropped} 字符未提供]"
+    return f"{body}{note}" if body else note.lstrip()
 
 
 @dataclass(frozen=True)

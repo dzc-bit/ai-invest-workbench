@@ -1,5 +1,6 @@
 import { BackendError, consumeNdjsonStream } from "./api";
 import { isTauriRuntime } from "./tauriRuntime";
+import { previewAiMocks } from "./previewMocks";
 import type {
   AiChatEvent,
   AiChatHandlers,
@@ -10,6 +11,7 @@ import type {
   AiEventStreamEvent,
   AiInsightOneshotResult,
   AiInsightScene,
+  AiMemoriesResponse,
   AiNewsDigest,
   AiOverfitResult,
   AiReportsResponse,
@@ -18,20 +20,6 @@ import type {
   AiStatus
 } from "./aiTypes";
 import type { BacktestSettingsConfig, OptimizeStreamHandlers, StrategyConfig } from "./types";
-import {
-  mockAiChatEvents,
-  mockAiConfig,
-  mockAiConditionParse,
-  mockAiEventStream,
-  mockAiInsightOneshot,
-  mockAiNewsDigest,
-  mockAiOptimizeEvents,
-  mockAiReports,
-  mockAiSaveConfig,
-  mockAiSessionDetail,
-  mockAiSessions,
-  mockAiStatus
-} from "./aiMocks";
 
 const AI_CHAT_STREAM_IDLE_TIMEOUT_MS = 180_000;
 const AI_EVENTS_IDLE_TIMEOUT_MS = 40_000;
@@ -55,7 +43,8 @@ async function aiPostJson<T>(baseUrl: string, path: string, body: Record<string,
 
 export async function loadAiStatus(baseUrl: string): Promise<AiStatus> {
   if (!isTauriRuntime()) {
-    return mockAiStatus();
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiStatus();
   }
   const response = await fetch(`${baseUrl}/ai/status`);
   const json = await response.json();
@@ -67,7 +56,8 @@ export async function loadAiStatus(baseUrl: string): Promise<AiStatus> {
 
 export async function loadAiConfig(baseUrl: string): Promise<AiConfigView> {
   if (!isTauriRuntime()) {
-    return mockAiConfig();
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiConfig();
   }
   const response = await fetch(`${baseUrl}/ai/config`);
   const json = await response.json();
@@ -79,7 +69,8 @@ export async function loadAiConfig(baseUrl: string): Promise<AiConfigView> {
 
 export async function saveAiConfig(baseUrl: string, payload: AiConfigUpdatePayload): Promise<AiConfigView> {
   if (!isTauriRuntime()) {
-    return mockAiSaveConfig(payload);
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiSaveConfig(payload);
   }
   const response = await fetch(`${baseUrl}/ai/config`, {
     method: "POST",
@@ -95,7 +86,11 @@ export async function saveAiConfig(baseUrl: string, payload: AiConfigUpdatePaylo
 
 export async function revealAiKey(baseUrl: string): Promise<string> {
   if (!isTauriRuntime()) {
-    return "sk-demo-key-123456";
+    // 演示 Key 只在 DEV 预览存在；生产构建不含该字面量。
+    if (import.meta.env.DEV) {
+      return "sk-demo-key-123456";
+    }
+    throw new BackendError("forbidden", "仅桌面端可读取本机 API Key。");
   }
   const response = await fetch(`${baseUrl}/ai/config/reveal`);
   const json = await response.json();
@@ -107,7 +102,8 @@ export async function revealAiKey(baseUrl: string): Promise<string> {
 
 export async function loadAiNewsDigest(baseUrl: string): Promise<AiNewsDigest> {
   if (!isTauriRuntime()) {
-    return mockAiNewsDigest();
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiNewsDigest();
   }
   const response = await fetch(`${baseUrl}/ai/news`);
   const json = await response.json();
@@ -119,7 +115,8 @@ export async function loadAiNewsDigest(baseUrl: string): Promise<AiNewsDigest> {
 
 export async function loadAiReports(baseUrl: string): Promise<AiReportsResponse> {
   if (!isTauriRuntime()) {
-    return mockAiReports();
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiReports();
   }
   const response = await fetch(`${baseUrl}/ai/reports`);
   const json = await response.json();
@@ -131,7 +128,10 @@ export async function loadAiReports(baseUrl: string): Promise<AiReportsResponse>
 
 export async function loadAiReportFile(baseUrl: string, name: string): Promise<string> {
   if (!isTauriRuntime()) {
-    return `# ${name}\n\n（预览模式：示例报告内容。）`;
+    if (import.meta.env.DEV) {
+      return `# ${name}\n\n（预览模式：示例报告内容。）`;
+    }
+    throw new BackendError("no_local_data", "本地数据服务未连接（当前不是桌面端运行环境）。");
   }
   const response = await fetch(`${baseUrl}/ai/report/file?name=${encodeURIComponent(name)}`);
   const json = await response.json();
@@ -143,7 +143,8 @@ export async function loadAiReportFile(baseUrl: string, name: string): Promise<s
 
 export async function loadAiSessions(baseUrl: string): Promise<AiSessionsResponse> {
   if (!isTauriRuntime()) {
-    return mockAiSessions();
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiSessions();
   }
   const response = await fetch(`${baseUrl}/ai/sessions`);
   const json = await response.json();
@@ -155,7 +156,8 @@ export async function loadAiSessions(baseUrl: string): Promise<AiSessionsRespons
 
 export async function loadAiSession(baseUrl: string, sessionId: string): Promise<AiSessionDetail> {
   if (!isTauriRuntime()) {
-    return mockAiSessionDetail(sessionId);
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiSessionDetail(sessionId);
   }
   const response = await fetch(`${baseUrl}/ai/session?session_id=${encodeURIComponent(sessionId)}`);
   const json = await response.json();
@@ -163,6 +165,35 @@ export async function loadAiSession(baseUrl: string, sessionId: string): Promise
     throw new BackendError(typeof json.code === "string" ? json.code : "request_failed", "历史对话回读失败");
   }
   return json as AiSessionDetail;
+}
+
+export async function loadAiMemories(baseUrl: string): Promise<AiMemoriesResponse> {
+  if (!isTauriRuntime()) {
+    return { items: [], rejected_market_facts_total: 0 };
+  }
+  const response = await fetch(`${baseUrl}/ai/memories`);
+  const json = await response.json();
+  if (!response.ok) {
+    throw new BackendError(typeof json.code === "string" ? json.code : "request_failed", "长期记忆列表读取失败");
+  }
+  return json as AiMemoriesResponse;
+}
+
+export async function updateAiMemory(
+  baseUrl: string,
+  payload: { id: string; content: string; category?: string; weight?: number }
+): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  await aiPostJson(baseUrl, "/ai/memory/update", payload as Record<string, unknown>, "记忆修改失败");
+}
+
+export async function deleteAiMemory(baseUrl: string, id: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  await aiPostJson(baseUrl, "/ai/memory/delete", { id }, "记忆删除失败");
 }
 
 export async function aiOverfitCheck(
@@ -177,7 +208,8 @@ export async function aiOverfitCheck(
 
 export async function aiParseConditions(baseUrl: string, text: string): Promise<AiConditionParseResult> {
   if (!isTauriRuntime()) {
-    return mockAiConditionParse(text);
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiConditionParse(text);
   }
   return aiPostJson<AiConditionParseResult>(baseUrl, "/ai/conditions/parse", { text }, "AI 条件解析失败");
 }
@@ -188,7 +220,8 @@ export async function aiInsightOneshot(
   context: Record<string, unknown>
 ): Promise<string> {
   if (!isTauriRuntime()) {
-    return mockAiInsightOneshot(scene);
+    const mocks = await previewAiMocks();
+    if (mocks) return mocks.mockAiInsightOneshot(scene);
   }
   const result = await aiPostJson<AiInsightOneshotResult>(baseUrl, "/ai/insight/oneshot", { scene, context }, "AI 点评生成失败");
   return result.text;
@@ -201,10 +234,15 @@ export async function runAiOptimizeStream(
   options: { signal?: AbortSignal } = {}
 ): Promise<void> {
   if (!isTauriRuntime()) {
-    for (const event of mockAiOptimizeEvents(request)) {
-      dispatchOptimizeEvent(event, handlers);
+    const mocks = await previewAiMocks();
+    if (mocks) {
+      for (const event of mocks.mockAiOptimizeEvents(request)) {
+        dispatchOptimizeEvent(event, handlers);
+      }
+      return;
     }
-    return;
+    // 不用 ai_not_configured：那会让用户被引去填 API Key，而这里是环境问题。
+    throw new BackendError("request_failed", "本地数据服务未连接（当前不是桌面端运行环境）。");
   }
   await consumeNdjsonStream(
     `${baseUrl}/ai/optimize`,
@@ -273,10 +311,15 @@ export async function runAiChatStream(
   options: { signal?: AbortSignal } = {}
 ): Promise<void> {
   if (!isTauriRuntime()) {
-    for (const event of mockAiChatEvents(request)) {
-      dispatchChatEvent(event, handlers);
+    const mocks = await previewAiMocks();
+    if (mocks) {
+      for (const event of mocks.mockAiChatEvents(request)) {
+        dispatchChatEvent(event, handlers);
+      }
+      return;
     }
-    return;
+    // 不用 ai_not_configured：那会让用户被引去填 API Key，而这里是环境问题。
+    throw new BackendError("request_failed", "本地数据服务未连接（当前不是桌面端运行环境）。");
   }
   await consumeNdjsonStream(
     `${baseUrl}/ai/chat/stream`,
@@ -324,12 +367,20 @@ export async function openAiEventStream(
   options: { signal?: AbortSignal } = {}
 ): Promise<void> {
   if (!isTauriRuntime()) {
-    for (const event of mockAiEventStream()) {
-      if (options.signal?.aborted) {
-        return;
+    const mocks = await previewAiMocks();
+    if (mocks) {
+      for (const event of mocks.mockAiEventStream()) {
+        if (options.signal?.aborted) {
+          return;
+        }
+        onEvent(event);
       }
-      onEvent(event);
+      return;
     }
+    // 生产构建非 Tauri：没有任何事件源，直接等待调用方放弃。
+    await new Promise<void>((resolve) => {
+      options.signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
     return;
   }
   await consumeNdjsonStream(

@@ -148,6 +148,7 @@ export function AiSettingsModal({ open, config, isSaving = false, errorMessage, 
                 >
                   <strong>{style.label}</strong>
                   <span>{style.description}</span>
+                  <em className="ai-style-sample">例：{style.sample}</em>
                 </button>
               ))}
             </div>

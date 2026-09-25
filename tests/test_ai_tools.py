@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -302,6 +303,76 @@ def test_stock_valuation_parses_tencent_payload(monkeypatch):
     assert "贵州茅台" in execution.summary
 
 
+def test_realtime_stock_detail_flags_limit_status_and_range(monkeypatch):
+    """实时个股快照必须带涨跌停判定与当日分位，这是"实时优先"的个股读数。"""
+    def make_line(*, price: str, high: str, low: str, limit_up: str, limit_down: str) -> str:
+        fields = ["0"] * 53
+        fields[1] = "测试股"
+        fields[3] = price
+        fields[4] = "10.00"
+        fields[5] = "10.10"
+        fields[30] = "20260925103000"
+        fields[31] = "0.10"
+        fields[32] = "1.00"
+        fields[33] = high
+        fields[34] = low
+        fields[37] = "8000"
+        fields[38] = "1.5"
+        fields[43] = "5.0"
+        fields[44] = "100.0"
+        fields[45] = "120.0"
+        fields[47] = limit_up
+        fields[48] = limit_down
+        fields[49] = "2.5"
+        return 'v_sh600519="' + "~".join(fields) + '"'
+
+    lines = [
+        make_line(price="11.00", high="11.00", low="10.10", limit_up="11.00", limit_down="9.00"),
+        make_line(price="10.50", high="11.00", low="10.10", limit_up="11.00", limit_down="9.00"),
+        make_line(price="9.00", high="10.90", low="9.00", limit_up="11.00", limit_down="9.00"),
+    ]
+    payload_text = ";\n".join(
+        f"v_sh60051{i}={line}" for i, line in enumerate([line.split('"')[1] for line in lines])
+    )
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        content = payload_text.encode("gbk")
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(astock_data_tools, "create_scraping_session", lambda: FakeSession())
+    registry = ToolRegistry()
+    registry.register_all(build_astock_data_tools())
+    execution = registry.execute(
+        "realtime_stock_detail", '{"symbols": ["600519"]}'
+    )
+    assert execution.ok is False  # 请求 3 只代码但 fake 只覆盖 1 个 key，返回空 → 失败路径也受控
+
+    # 用同 key 的三段拼接不可行（腾讯协议一行一只），改为逐次单只验证。
+    statuses = []
+    summaries = []
+    for line in lines:
+        FakeResponse.content = line.encode("gbk")
+        execution = registry.execute("realtime_stock_detail", '{"symbols": ["600519"]}')
+        assert execution.ok is True
+        quote = execution.payload["quotes"][0]
+        statuses.append(quote["limit_status"])
+        summaries.append(execution.summary)
+        if quote["limit_status"] == "":
+            assert quote["intraday_position"] is not None
+    assert statuses[0] == "涨停"
+    assert "炸板" in statuses[1]
+    assert statuses[2] == "跌停"
+    assert "涨停" in summaries[0]
+    assert "跌停" in summaries[2]
+    assert "区间" in summaries[1]
+
+
 def test_research_reports_and_pools_handle_failure(monkeypatch):
     def failing_em_get(url, **kwargs):
         raise RuntimeError("blocked")
@@ -549,3 +620,190 @@ def test_update_stock_data_full_market_capital_flow_starts_background_job():
     assert started["symbols"] == ["600001", "600002"]
     assert "job-1" in execution.summary
     assert "sync_job_status" in execution.summary
+
+
+# ===========================================================================
+# AI 投研原语（1.6.1）：screen_stocks / stock_timeline / my_positions
+# ===========================================================================
+
+
+def _screen_frame() -> pd.DataFrame:
+    rows = []
+    for symbol, base in (("600001", 10.0), ("600002", 20.0), ("600003", 30.0)):
+        for index in range(30):
+            close = base * (1 + 0.01 * index)
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "stock_name": f"股票{symbol}",
+                    "trade_date": pd.Timestamp("2026-06-01") + pd.Timedelta(days=index),
+                    "open": close * 0.99,
+                    "high": close * 1.02,
+                    "low": close * 0.98,
+                    "close": close,
+                    "volume": 1000.0 + index,
+                    "amount": 5000.0 + index,
+                    "change_pct": 0.01 if symbol == "600001" else 0.001,
+                    "turnover_rate": 0.05,
+                    "main_net_inflow": 1_000_000.0 if symbol == "600001" else -500_000.0,
+                    "float_market_cap": 5_000_000_000.0,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_screen_stocks_uses_condition_semantics_and_returns_rows():
+    from astock_backtester.ai.tools.research_tools import build_research_tools
+
+    backend = FakeBackend()
+    backend.frame = _screen_frame()
+    registry = ToolRegistry()
+    registry.register_all(build_research_tools(backend))
+
+    execution = registry.execute(
+        "screen_stocks",
+        '{"entry_expressions": ["收盘价站上5日均线", "近3日主力净流入大于0"], "end_date": "2026-06-30"}',
+    )
+    assert execution.ok is True, execution.summary
+    assert "扫描" in execution.summary
+    assert execution.payload["matched_count"] >= 1
+    rows = execution.payload["rows"]
+    assert rows and rows[0]["symbol"] == "600001"  # 涨幅降序
+    assert execution.payload["shown_rows"] <= len(rows)
+
+
+def test_screen_stocks_rejects_unparsable_condition():
+    from astock_backtester.ai.tools.research_tools import build_research_tools
+
+    backend = FakeBackend()
+    registry = ToolRegistry()
+    registry.register_all(build_research_tools(backend))
+    execution = registry.execute("screen_stocks", '{"entry_expressions": ["KDJ金叉"]}')
+    assert execution.ok is False
+    assert execution.code == "bad_arguments"
+
+
+def test_screen_stocks_handles_cross_row_conditions_like_macd_dead_cross(monkeypatch):
+    """跨行条件（groupby(symbol).shift(1)）必须在整帧上算掩码再切目标日：
+    旧实现在单日帧上算，shift 后全 NaN → 恒 False，表现为"永远没有匹配"的假阴性。
+    （MACD死叉属于离场 DSL，入场文本解析本就拒绝；这里注入节点直测掩码路径，
+    防的是将来新条件跨行时复发。）"""
+    import astock_backtester.ai.tools.research_tools as research_tools
+    from astock_backtester.ai.tools.research_tools import build_research_tools
+    from astock_backtester.models import ConditionNode
+
+    rows = []
+    for symbol, closes in (("600001", [10.0, 11.0, 10.0, 9.0]), ("600002", [20.0, 21.0, 22.0, 23.0])):
+        for index, close in enumerate(closes):
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "stock_name": f"股票{symbol}",
+                    "trade_date": pd.Timestamp("2026-06-01") + pd.Timedelta(days=index),
+                    "open": close,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 1000.0,
+                    "amount": 5000.0,
+                    "change_pct": 0.001,
+                    "turnover_rate": 0.05,
+                    "main_net_inflow": 100.0,
+                    "float_market_cap": 1_000_000_000.0,
+                }
+            )
+    backend = FakeBackend()
+    backend.frame = pd.DataFrame(rows)
+    registry = ToolRegistry()
+    registry.register_all(build_research_tools(backend))
+
+    node = ConditionNode(id="ai-x", condition_id="macd_dead_cross", params={}, data_lag_days=0)
+    monkeypatch.setattr(
+        research_tools,
+        "validated_condition_nodes",
+        lambda expressions, *, mode: ([node], []),
+    )
+    execution = registry.get("screen_stocks").executor({"entry_expressions": ["注入节点"], "end_date": "2026-06-04"})
+
+    assert execution["ok"] is True
+    assert execution["matched_count"] == 1
+    assert execution["rows"][0]["symbol"] == "600001"
+
+
+def test_my_positions_reads_memory_and_reports_no_data(tmp_path):
+    from astock_backtester.ai.memory import MemoryStore
+    from astock_backtester.ai.tools.research_tools import build_memory_tools
+
+    store = MemoryStore(tmp_path)
+    registry = ToolRegistry()
+    registry.register_all(build_memory_tools(store))
+
+    empty = registry.execute("my_positions", "{}")
+    assert empty.ok is False and empty.code == "no_data"
+
+    store.apply_ops(
+        [
+            {"op": "add", "content": "持有 600519，成本不低", "category": "holding", "weight": 2},
+            {"op": "add", "content": "自选 300750", "category": "watchlist"},
+        ]
+    )
+    execution = registry.execute("my_positions", "{}")
+    assert execution.ok is True
+    assert "600519" in execution.summary and "300750" in execution.summary
+    assert "自述" in execution.summary  # 明示记忆不是行情事实
+
+
+def test_research_tools_declare_untrusted_and_read_only():
+    from astock_backtester.ai.memory import MemoryStore
+    from astock_backtester.ai.tools.research_tools import build_memory_tools, build_research_tools
+
+    backend = FakeBackend()
+    tools = {tool.name: tool for tool in (*build_research_tools(backend), *build_memory_tools(MemoryStore("x")))}
+    assert tools["stock_timeline"].untrusted_body is True
+    assert tools["screen_stocks"].untrusted_body is False
+    assert tools["my_positions"].untrusted_body is False
+    assert all(tool.read_only for tool in tools.values())
+
+
+def test_frontend_mock_status_lists_every_registered_tool():
+    """aiMocks 的 tool_names 必须与真实注册表一致：漂移曾让 mock 只列 4 个工具
+    而真实是 17+，预览模式的工具面与产品脱节完全不可见。"""
+    from pathlib import Path
+
+    from astock_backtester.ai.memory import MemoryStore
+    from astock_backtester.ai.tools.astock_data_tools import build_astock_data_tools
+    from astock_backtester.ai.tools.local_tools import build_local_tools
+    from astock_backtester.ai.tools.query_tools import build_query_tools
+    from astock_backtester.ai.tools.research_tools import build_memory_tools, build_research_tools
+
+    be = SimpleNamespace(
+        warehouse=SimpleNamespace(read_daily_bars=lambda **k: pd.DataFrame()),
+        provider=SimpleNamespace(fetch_daily_bars=lambda *a: pd.DataFrame()),
+        capital_flow_crawler=SimpleNamespace(fetch_many_fund_flows=lambda *a, **k: {}),
+        sync_manager=SimpleNamespace(get_job=lambda i: None),
+        realtime_provider=None,
+        news_provider=None,
+        briefing_provider=None,
+        risk_provider=None,
+    )
+    registered = {
+        tool.name
+        for tool in (
+            *build_local_tools(be),
+            *build_astock_data_tools(be),
+            *build_query_tools(be),
+            *build_research_tools(be),
+            *build_memory_tools(MemoryStore("/tmp/ai-memory-mock-check")),
+        )
+    }
+    # facade 另注册的 3 个（read_tool_result / retrieve_knowledge / latest_market_digest）
+    registered |= {"read_tool_result", "retrieve_knowledge", "latest_market_digest"}
+
+    mock_source = (Path(__file__).resolve().parents[1] / "frontend" / "src" / "aiMocks.ts").read_text(encoding="utf-8")
+    status_index = mock_source.index("mockAiStatus")
+    array_match = re.search(r"tool_names:\s*\[(.*?)\]", mock_source[status_index:], re.DOTALL)
+    assert array_match, "mockAiStatus 缺少 tool_names"
+    mock_names = set(re.findall(r'"([a-z_]+)"', array_match.group(1)))
+    assert mock_names == registered, (
+        f"前端 mock 工具清单漂移：缺 {sorted(registered - mock_names)}，多 {sorted(mock_names - registered)}"
+    )

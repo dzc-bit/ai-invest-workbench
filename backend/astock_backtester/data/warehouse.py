@@ -23,6 +23,10 @@ OHLC_COLUMNS = ["open", "high", "low", "close"]
 GAP_PROFILE_TTL_SECONDS = 600.0
 GAP_PROFILE_DEFAULT_PARTITION_YEARS = 2
 GAP_PROFILE_TOP_STALE = 12
+# 本地股票池计数的缓存 TTL：与缺口画像同一模式（TTL + 写入失效）。真实数据仓
+# coverage() 全仓扫描实测 ~10s，而红绿家数 provider 循环的总预算只有 8s——
+# 计数绝不能在行情链路上现算。
+SYMBOL_COUNT_TTL_SECONDS = 600.0
 KNOWN_CAPITAL_FLOW_SOURCE_GAP_DATES = {
     pd.Timestamp("2018-08-07"),
     pd.Timestamp("2019-04-04"),
@@ -46,6 +50,8 @@ class Warehouse:
         self._init_db()
         self._gap_profile_lock = threading.Lock()
         self._gap_profile_cache: tuple[float, dict[str, object]] | None = None
+        self._symbol_count_lock = threading.Lock()
+        self._symbol_count_cache: tuple[float, int] | None = None
         self._corrupt_partitions_lock = threading.Lock()
         self._corrupt_partitions: dict[str, str] = {}
 
@@ -161,9 +167,50 @@ class Warehouse:
             raise
 
     def invalidate_gap_profile(self) -> None:
-        """写入后丢弃缺口画像缓存，让下一次读取反映最新数据。"""
+        """写入后丢弃缺口画像与股票池计数缓存，让下一次读取反映最新数据。"""
         with self._gap_profile_lock:
             self._gap_profile_cache = None
+        with self._symbol_count_lock:
+            self._symbol_count_cache = None
+
+    def cached_symbol_count(self) -> int | None:
+        """本地 OHLC 股票池规模（只读缓存；``None`` = 缓存未热）。
+
+        供热路径（红绿家数 provider 循环等有 deadline 的链路）消费：缓存未热时
+        返回 ``None`` 而不是现算，调用方应记一条 diagnostics 并继续走自己的链路。
+        现算请走 :meth:`refresh_symbol_count`（应在后台线程调用）。
+        """
+        with self._symbol_count_lock:
+            cached = self._symbol_count_cache
+            if cached is not None and time.monotonic() - cached[0] < SYMBOL_COUNT_TTL_SECONDS:
+                return cached[1]
+        return None
+
+    def refresh_symbol_count(self) -> int:
+        """现算本地股票池规模并写入缓存（TTL 600s，写入失效）。
+
+        取最新年分区的 ``symbol`` 列做去重计数——单列扫描远轻于 coverage() 的
+        全仓多列扫描；最新分区读不出来时退回 coverage() 口径。真实数据仓
+        coverage() 实测 ~10s，本方法只应在后台预热等非 deadline 路径调用。
+        """
+        paths = self._partition_paths_for_range(None, None)
+        count: int | None = None
+        if paths:
+            try:
+                table = pq.read_table(paths[-1], columns=["symbol"])
+                if table.num_rows:
+                    count = len(set(table.column("symbol").to_pylist()))
+            except Exception:  # noqa: BLE001 - 退化路径走 coverage() 全口径
+                count = None
+        if count is None:
+            for item in self.coverage():
+                if item.dataset == "daily_bars":
+                    count = int(item.symbols or 0)
+                    break
+        count = int(count or 0)
+        with self._symbol_count_lock:
+            self._symbol_count_cache = (time.monotonic(), count)
+        return count
 
     def read_daily_bars(
         self,

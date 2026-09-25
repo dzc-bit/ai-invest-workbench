@@ -23,6 +23,7 @@ import type {
   FetchResult,
   ImportResult,
   MarketBriefingResponse,
+  MarketCommentaryResponse,
   MarketNewsResponse,
   NewsSummaryResponse,
   RealtimeMarketSnapshot,
@@ -174,6 +175,22 @@ export function mockMarketNews(): MarketNewsResponse {
       { title: "美股三大指数期货窄幅震荡", summary: "市场等待本周 CPI 数据落地。", source: "环球市场播报", published_at: at(136), url: "https://example.test/news/9", tags: ["海外"], sentiment: "neutral" },
       { title: "某白酒龙头公告中期分红方案", summary: "分红比例高于市场预期，高股息方向获支撑。", source: "东方财富", published_at: at(150), url: "https://example.test/news/10", tags: ["个股"], sentiment: "positive" }
     ]
+  };
+}
+
+export function mockMarketCommentary(): MarketCommentaryResponse {
+  // 预览模式刻意用 news_fallback 档：让"非实时"标注在预览里也是显式的。
+  return {
+    updated_at: new Date("2026-06-01T15:30:00+08:00").toISOString(),
+    trade_date: "2026-06-01",
+    source: "browser-preview",
+    mode: "news_fallback",
+    stance: "neutral",
+    summary: "预览数据：这是行情评价模块的回退示例，不来自实时盘面。",
+    drivers: [{ title: "示例驱动", detail: "仅供预览版式确认", weight: "low" }],
+    risks: ["示例风险条目"],
+    next_watch: ["示例观察点"],
+    diagnostics: ["browser-preview"]
   };
 }
 

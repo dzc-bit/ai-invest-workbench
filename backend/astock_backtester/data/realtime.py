@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any
 
 import pandas as pd
@@ -250,6 +250,11 @@ class RealtimeMarketProvider:
     _yesterday_sector_lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _yesterday_sector_executor: ThreadPoolExecutor | None = field(default=None, init=False, repr=False)
     _yesterday_sector_in_flight: bool = field(default=False, init=False, repr=False)
+    # 本地股票池计数的后台预热闸门：缓存未热时起一次性 daemon 线程现算
+    # （warehouse.refresh_symbol_count，真实数据仓 ~10s），绝不在红绿家数
+    # provider 循环里同步算——那会吃光 breadth_time_budget（8s），把后面
+    # 本可用的 Sina/Tencent/AKShare 全部判超时。
+    _symbol_count_warmup_lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def _get_breadth_executor(self) -> ThreadPoolExecutor:
         if self._breadth_executor is None:
@@ -1537,7 +1542,13 @@ class RealtimeMarketProvider:
             if breadth.total >= MIN_FULL_MARKET_BREADTH_TOTAL:
                 return breadth
             if local_symbol_count is None:
-                local_symbol_count = max(self._latest_local_symbol_count(), self._coverage_symbol_count())
+                coverage_count = self._coverage_symbol_count()
+                if coverage_count < 0:
+                    diagnostics.append(
+                        "本地股票池计数缓存未热（已转后台预热，不在红绿家数预算内现算全仓扫描），本轮不参与完整性校验。"
+                    )
+                    coverage_count = 0
+                local_symbol_count = max(self._latest_local_symbol_count(), coverage_count)
             if self._breadth_is_complete(breadth, local_symbol_count, diagnostics):
                 return breadth
         return None
@@ -2346,14 +2357,29 @@ class RealtimeMarketProvider:
         return int(latest["symbol"].astype(str).nunique())
 
     def _coverage_symbol_count(self) -> int:
-        try:
-            coverage = self.warehouse.coverage()
-        except Exception:
-            return 0
-        for item in coverage:
-            if getattr(item, "dataset", None) == "daily_bars":
-                return int(getattr(item, "symbols", 0) or 0)
-        return 0
+        """本地股票池规模（仓库侧 10 分钟 TTL 缓存 + 写入失效）。
+
+        只吃缓存：缓存未热返回 -1（哨兵，调用方据此留 diagnostics）并触发
+        后台预热，绝不阻塞行情链路；真实为 0（空仓）与"未热"必须可区分，
+        否则排障信息会误导。"""
+        cached = self.warehouse.cached_symbol_count()
+        if cached is not None:
+            return cached
+        self._warm_symbol_count_in_background()
+        return -1
+
+    def _warm_symbol_count_in_background(self) -> None:
+        if not self._symbol_count_warmup_lock.acquire(blocking=False):
+            return  # 已有预热在跑
+        def _warm() -> None:
+            try:
+                self.warehouse.refresh_symbol_count()
+            except Exception:  # noqa: BLE001 - 预热失败不影响行情链路
+                pass
+            finally:
+                self._symbol_count_warmup_lock.release()
+
+        Thread(target=_warm, name="realtime-symbol-count-warmup", daemon=True).start()
 
     def _build_live_message(
         self,
@@ -2445,6 +2471,9 @@ class RealtimeMarketProvider:
         breadth = MarketBreadth(up=up, down=down, flat=flat, total=int(len(latest)), source="local-latest")
         diagnostics = [f"已使用本地最近交易日 {latest_date.date()} 作为兜底快照。"]
         coverage_symbol_count = self._coverage_symbol_count()
+        if coverage_symbol_count < 0:
+            diagnostics.append("本地股票池计数缓存未热（后台预热中），本轮无法校验兜底宽度的完整性。")
+            coverage_symbol_count = 0
         if not is_valid_full_market_breadth(breadth, coverage_symbol_count):
             ratio_text = (
                 f"，本地股票池={coverage_symbol_count}，比例={breadth.total / coverage_symbol_count:.1%}"

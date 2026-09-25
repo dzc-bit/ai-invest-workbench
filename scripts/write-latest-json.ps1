@@ -1,7 +1,8 @@
 param(
-  [Parameter(Mandatory = $true)][string]$Version,
   [Parameter(Mandatory = $true)][string]$AssetName,
   [Parameter(Mandatory = $true)][string]$Notes,
+  # -Version 缺省读 package.json：曾经必须手传，传错会把旧 .sig 配上新版本号。
+  [string]$Version = "",
   [string]$Tag = "",
   [string]$ReleaseAssetName = "",
   [string]$RepoSlug = "dzc-bit/ai-invest-workbench",
@@ -11,6 +12,11 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+if (-not $Version) {
+  $packageJson = Get-Content -Raw (Join-Path $repoRoot "package.json") | ConvertFrom-Json
+  $Version = $packageJson.version
+}
+
 if (-not $Tag) {
   $Tag = "v$Version"
 }
@@ -19,19 +25,42 @@ if (-not $ReleaseAssetName) {
   $ReleaseAssetName = $AssetName
 }
 
-$signaturePath = Join-Path $repoRoot "src-tauri\target\release\bundle\nsis\$AssetName.sig"
+$bundleDir = Join-Path $repoRoot "src-tauri\target\release\bundle\nsis"
+$signaturePath = Join-Path $bundleDir "$AssetName.sig"
+$assetPath = Join-Path $bundleDir $AssetName
 if (-not (Test-Path $signaturePath)) {
   throw "signature file not found: $signaturePath"
 }
+if (-not (Test-Path $assetPath)) {
+  throw "installer not found: $assetPath"
+}
 
-$signature = (Get-Content -Raw $signaturePath).Trim()
+# 红线（AGENTS.md §12）：签名缺失时不得复用旧 .sig。bundle/nsis 里永久堆着
+# 多个历史版本的 exe+sig——校验 .sig 内嵌的 file 名与 -AssetName 一致、
+# .sig mtime 不早于 .exe mtime，防止"旧签名配新版本号"静默过检。
+$signatureContent = (Get-Content -Raw $signaturePath).Trim()
+try {
+  $signaturePayload = $signatureContent | ConvertFrom-Json
+} catch {
+  throw "signature file is not valid minisign JSON content: $signaturePath"
+}
+$signedFile = [string]$signaturePayload.file
+if ($signedFile -ne $AssetName) {
+  throw "signature was generated for '$signedFile' but AssetName is '$AssetName' (stale signature reuse)"
+}
+$assetTime = (Get-Item $assetPath).LastWriteTimeUtc
+$signatureTime = (Get-Item $signaturePath).LastWriteTimeUtc
+if ($signatureTime -lt $assetTime) {
+  throw "signature file is older than the installer; regenerate the signature for this build"
+}
+
 $latest = @{
   version = $Version
   notes = $Notes
   pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
   platforms = @{
     "windows-x86_64" = @{
-      signature = $signature
+      signature = $signatureContent
       url = "https://github.com/$RepoSlug/releases/download/$Tag/$ReleaseAssetName"
     }
   }
@@ -41,3 +70,4 @@ $latestJson = $latest | ConvertTo-Json -Depth 5
 $resolvedOutput = Join-Path $repoRoot $OutputPath
 New-Item -ItemType Directory -Force (Split-Path -Parent $resolvedOutput) | Out-Null
 [System.IO.File]::WriteAllText($resolvedOutput, $latestJson, [System.Text.UTF8Encoding]::new($false))
+Write-Host "latest.json written for $Version (asset $AssetName, signature verified)"

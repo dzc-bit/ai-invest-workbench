@@ -13,10 +13,11 @@ from astock_backtester.ai.context import (
 
 
 def test_truncate_text_marks_dropped_chars():
-    text = "a" * 500
-    result = truncate_text(text, 100)
-    assert result.startswith("a" * 100)
-    assert "后续 400 字符未提供" in result
+    # 无任何安全边界的纯字符流：整段丢弃而不是硬切出前 100 个字符——
+    # 旧兜底 cut=limit 会按字符硬切，"close": 12.34 被切成 12. 正是这条路。
+    result = truncate_text("a" * 500, 100)
+    assert "a" not in result
+    assert "后续 500 字符未提供" in result
 
     # 截断只能落在行边界：把"收盘价 12.34"切成"收盘价 12."会让模型读到格式
     # 合法但数值错误的价格，比整行丢弃危险得多。
@@ -47,9 +48,19 @@ def test_tool_result_store_evicts_oldest():
 
 def test_budget_digest_and_over_budget():
     budget = ContextBudget(total_chars=100, digest_chars=10)
+    # 无任何安全边界（无换行/逗号/空格）：整段丢弃，绝不按字符硬切——
+    # 旧兜底 "cut = limit" 曾把 "close": 12.34 切成 12.，模型读到格式合法
+    # 但数值错误的价格。
     digest = budget.digest("b" * 500)
-    assert digest.startswith("b" * 10)
     assert "已截断" in digest
+    assert "b" not in digest
+    # 有字段边界（逗号落在 [limit//2, limit) 内）：切点落在逗号处，绝不会
+    # 留下半个数字/半个 token
+    budget16 = ContextBudget(total_chars=100, digest_chars=16)
+    safe = budget16.digest("abcdefghij,rest-of-payload")
+    assert safe.startswith("abcdefghij")
+    assert not safe.startswith("abcdefghij,r")  # 没有越过逗号再硬切
+    assert "已截断" in safe
     messages = [{"role": "user", "content": "x" * 200}]
     assert budget.over_budget(messages) is True
     assert budget.over_budget([{"role": "user", "content": "short"}]) is False

@@ -11,7 +11,8 @@ import {
   loadDiagnosticsDataGaps,
   loadDiagnosticsSources,
   loadSyncJob,
-  startFullMarketSync
+  startFullMarketSync,
+  startMissingOnlySync
 } from "../api";
 import { aiInsightOneshot } from "../aiApi";
 import type { DataSourceHealth, DiagnosticsDataGapsResponse, DiagnosticsSourcesResponse } from "../types";
@@ -25,7 +26,7 @@ type Props = {
   onServiceReady?: (service: DataServiceStatus) => void;
 };
 
-type BusyAction = "refresh" | "fetch" | "capital-flow" | "sample" | "file" | "sync" | null;
+type BusyAction = "refresh" | "fetch" | "capital-flow" | "sample" | "file" | "sync" | "missing-only" | null;
 
 const COVERAGE_REFRESH_RETRY_MS = 1200;
 const COVERAGE_REFRESH_MAX_ATTEMPTS = 150;
@@ -609,6 +610,34 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     await runFullMarketSync("sync");
   };
 
+  const handleMissingOnlySync = async () => {
+    if (!service) {
+      return;
+    }
+    setBusyAction("missing-only");
+    setMessage("正在按缺口计算补齐名单");
+    try {
+      const result = await startMissingOnlySync(service.base_url, startDate, endDate);
+      if (!result.started) {
+        setMessage(result.reason ?? "窗口内没有不完整的股票，无需补齐。");
+        return;
+      }
+      if (result.job) {
+        setSyncJob(result.job);
+      }
+      setMessage(`缺口补齐已启动：窗口内 ${result.missing_symbols} 只不完整（不扫描全市场）`);
+      if (result.job && !isSyncRunning(result.job)) {
+        setMessage(syncFinishedMessage(result.job));
+        await refreshAfterOperation(service);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "缺口补齐启动失败");
+      await refreshLogs(service);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const runFullMarketSync = async (action: "fetch" | "sync") => {
     if (!service) {
       return;
@@ -713,6 +742,9 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
           </button>
           <button className="primary-button" type="button" onClick={handleFetch} disabled={!service || busy}>
             {busyAction === "fetch" ? "正在补全缺失数据" : "补全缺失数据"}
+          </button>
+          <button className="secondary-button" type="button" onClick={handleMissingOnlySync} disabled={!service || busy}>
+            {busyAction === "missing-only" ? "正在只补缺口" : "只补缺口"}
           </button>
           <button className="secondary-button" type="button" onClick={handleCapitalFlowBackfill} disabled={!service || busy}>
             {busyAction === "capital-flow" ? "\u6b63\u5728\u8865\u9f50\u8d44\u91d1\u6d41" : "\u8865\u9f50\u8d44\u91d1\u6d41"}
@@ -885,6 +917,18 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
             ? `（停更 ${dataGaps.profile.daily_bars.symbols_stale} 只）`
             : ""}
         </summary>
+        {dataGaps?.warehouse_health && !dataGaps.warehouse_health.healthy ? (
+          <div className="data-gap-section corrupt-partitions" role="alert">
+            <strong>检测到损坏分区（先修损坏，再补数据——补齐无法修复损坏）</strong>
+            <ul>
+              {Object.entries(dataGaps.warehouse_health.corrupt_partitions).map(([partition, error]) => (
+                <li key={partition}>
+                  <span className="muted-code">{partition}</span>：{error}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
         {dataGaps?.profile?.available ? (
           <div className="data-gap-panel">
             <p className="muted-code">

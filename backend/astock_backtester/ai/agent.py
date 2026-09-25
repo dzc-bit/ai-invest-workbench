@@ -42,15 +42,10 @@ CONSOLIDATE_MIN_CHARS = 6_000
 # 这是长久的内存/落盘膨胀风险，按条数兜底裁剪。
 ARCHIVE_MAX_ENTRIES = 400
 
-# 摘要里含爬取正文的工具：digest 进入上下文前必须套不可信分隔符（AGENTS.md §15-8）
-UNTRUSTED_DIGEST_TOOLS = frozenset(
-    {"market_news", "market_briefing", "stock_research_reports", "dragon_tiger_board", "limit_up_pool"}
-)
-
-# 必须独占执行、不与其他工具并发的两个工具：update_stock_data 是唯一写路径（并发写
-# 同一数据仓会撞 parquet 分区），run_strategy_backtest 把整表读进 pandas（并发等于
-# 双份内存 + 磁盘 IO 抢占）。其余都是只读查询，可以并发。
-SERIAL_TOOLS = frozenset({"update_stock_data", "run_strategy_backtest"})
+# 必须独占执行、不与其他工具并发的工具：update_stock_data 是唯一写路径（并发写
+# 同一数据仓会撞 parquet 分区），run_strategy_backtest 与 screen_stocks 把整表
+# 读进 pandas（并发等于双份内存 + 磁盘 IO 抢占）。其余都是只读查询，可以并发。
+SERIAL_TOOLS = frozenset({"update_stock_data", "run_strategy_backtest", "screen_stocks"})
 MAX_PARALLEL_TOOLS = 4
 
 
@@ -231,7 +226,7 @@ class AgentRunner:
                     f"\n（另有 {more_rows} 行未展开，可调用 "
                     f'read_tool_result(call_id="{plan.call_id}", offset={resume}) 续读）'
                 )
-            if plan.name in UNTRUSTED_DIGEST_TOOLS:
+            if plan.name in self._untrusted_tool_names() or self._replay_is_untrusted(plan, execution):
                 # 先压到预算内再包不可信围栏：反过来的话围栏闭合标记几乎总是被
                 # 二次截断切掉，注入隔离退化成“只有开标记”（AGENTS.md §15-8）。
                 session_tool_content = wrap_untrusted(
@@ -264,13 +259,35 @@ class AgentRunner:
                 return list(pool.map(lambda plan: self._registry.execute(plan.name, plan.arguments), plans))
         return [self._registry.execute(plan.name, plan.arguments) for plan in plans]
 
+    def _untrusted_tool_names(self) -> set[str]:
+        """摘要含爬取正文、进上下文前必须套不可信围栏的工具集合。
+
+        单一事实来源是工具自声明（``AiTool.untrusted_body``）——手工 frozenset
+        曾是注入隔离的唯一防线：新增一个返回爬取正文的工具而忘了改这一行，
+        隔离就会静默退化。"""
+        return {name for name in self._registry.names() if bool(self._registry.get(name) and self._registry.get(name).untrusted_body)}
+
+    def _replay_is_untrusted(self, plan: _ToolCall, execution: Any) -> bool:
+        """``read_tool_result`` 续读的是**原工具的全量行集**：原工具声明
+        untrusted_body 时，续读回上下文的内容同样必须过围栏——否则爬取正文
+        （龙虎榜/涨停池/研报/新闻原文行）会以无围栏形态二次进入上下文。"""
+        if plan.name != "read_tool_result" or not execution.ok:
+            return False
+        payload = execution.payload if isinstance(execution.payload, dict) else {}
+        stored_name = str(payload.get("name") or "")
+        if not stored_name:
+            return False
+        tool = self._registry.get(stored_name)
+        return bool(tool and tool.untrusted_body)
+
     def _must_serialize(self, plan: _ToolCall) -> bool:
         """并发判定的单一事实来源是 registry 的 ``read_only`` 标志；
-        ``SERIAL_TOOLS`` 保留为显式串行名单（防御“新增只读但实际重”的工具）。"""
+        ``SERIAL_TOOLS`` 保留为显式串行名单（防御“新增只读但实际重”的工具）。
+        未知工具一律串行：它们必然失败，不值得为返回 unknown_tool 扇出线程池。"""
         if plan.name in SERIAL_TOOLS:
             return True
         tool = self._registry.get(plan.name)
-        return tool is not None and not tool.read_only
+        return tool is None or not tool.read_only
 
     # ----------------------------------------------------------- messages
     def _build_request_messages(self, session: dict[str, Any], system_prompt: str) -> list[dict[str, Any]]:
@@ -281,51 +298,60 @@ class AgentRunner:
         return [{"role": "system", "content": system}, *session["messages"]]
 
     def _repair_interrupted_turn(self, session: dict[str, Any]) -> None:
-        """Heal a session interrupted mid-tool-call.
+        """Heal protocol-invalid message history before the next model call.
 
-        If the previous run died between an assistant ``tool_calls`` message and
-        its tool results, the OpenAI-protocol history is invalid and every
-        following request in this session would be rejected upstream — the user
-        experiences this as the session "losing its memory".  Insert synthetic
-        tool results for unanswered call ids so the next turn can proceed with
-        the full history intact.
+        两类非法形态都会让上游 API 拒绝请求，用户看到的就是会话"失忆"：
+
+        1. assistant(tool_calls) 之后缺 tool 结果——上一轮运行中断（客户端断开/
+           进程退出/模型异常）。补一条 ``[code=interrupted]`` 占位结果。
+        2. 孤儿 tool 消息——前面没有任何 assistant 声明这个 call_id（历史版本
+           的归档在 tool 消息处切窗口会批量产生，窗口头变成 ['tool', ...]）。
+           直接丢弃：它没有可归属的调用，补不出合法配对。
+
+        配对判定按"紧随其后的 tool 消息"逐条消费，不做全局 answered 集合：
+        ``llm_client`` 在供应商不返回 id 时会自造 ``call_{index}``，跨轮重复的
+        id 曾让后面的 assistant 永远等不到配对结果（协议非法的另一个来源）。
         """
         messages = session.get("messages") or []
         repaired: list[dict[str, Any]] = []
-        index = 0
+        pending: dict[str, str] = {}
         changed = False
-        while index < len(messages):
-            message = messages[index]
-            repaired.append(message)
-            index += 1
-            calls = message.get("tool_calls") or []
-            if not calls:
+        for message in messages:
+            if message.get("role") == "tool":
+                call_id = str(message.get("tool_call_id", ""))
+                if call_id in pending:
+                    pending.pop(call_id, None)
+                    repaired.append(message)
+                else:
+                    changed = True
+                    logger.warning("丢弃孤儿 tool 消息（call_id=%s 无配对的 assistant 调用）", call_id)
                 continue
-            # 吃掉紧随其后的既有 tool 结果。
-            while index < len(messages) and messages[index].get("role") == "tool":
-                repaired.append(messages[index])
-                index += 1
-            answered = {
-                str(item.get("tool_call_id")) for item in repaired if item.get("role") == "tool"
+            if pending:
+                for call_id, name in pending.items():
+                    repaired.append(self._interrupted_tool_message(call_id, name))
+                    changed = True
+                pending = {}
+            repaired.append(message)
+            pending = {
+                str(call.get("id", "")): str(call.get("function", {}).get("name", ""))
+                for call in (message.get("tool_calls") or [])
             }
-            for call in calls:
-                call_id = str(call.get("id", ""))
-                if call_id in answered:
-                    continue
-                name = str(call.get("function", {}).get("name", ""))
-                repaired.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": (
-                            f"[code=interrupted] （上一次运行在调用 {name or '工具'} 时被中断，没有返回结果；"
-                            "如需该数据请重新调用。）"
-                        ),
-                    }
-                )
-                changed = True
+        for call_id, name in pending.items():
+            repaired.append(self._interrupted_tool_message(call_id, name))
+            changed = True
         if changed:
             session["messages"] = repaired
+
+    @staticmethod
+    def _interrupted_tool_message(call_id: str, name: str) -> dict[str, str]:
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": (
+                f"[code=interrupted] （上一次运行在调用 {name or '工具'} 时被中断，没有返回结果；"
+                "如需该数据请重新调用。）"
+            ),
+        }
 
     def _forced_final_answer(self, session: dict[str, Any], system_prompt: str, on_event: EventHandler) -> bool:
         """One no-tools closing call after the step budget is exhausted."""
@@ -369,8 +395,11 @@ class AgentRunner:
     def _archive_overflow(self, session: dict[str, Any], on_event: EventHandler) -> None:
         """Keep the live window within both the message-count and char budget.
 
-        The cut point is extended to the next user-message boundary so an
-        assistant(tool_calls)/tool pair is never split across the window edge.
+        不变量：归档后的剩余窗口必须**以 user 消息开头**——assistant(tool_calls)
+        /tool 配对因此天然完整，且不会在 tool 消息处切出孤儿（OpenAI/Anthropic
+        都拒绝首条为 tool 的请求，孤儿 tool 一旦进窗口，该会话此后每轮必败）。
+        找不到安全切点（长工具轮中段没有 user 边界）就归档 0 条并留 warning：
+        宁可一轮超预算，绝不产生非法窗口。
         """
         messages = session["messages"]
         overflow = max(len(messages) - SHORT_TERM_WINDOW, 0)
@@ -385,15 +414,17 @@ class AgentRunner:
                 overflow = max(overflow, index + 1)
         if overflow <= 0:
             return
-        # 把裁剪点推到下一个 user 边界，避免 assistant(tool_calls)/tool 配对被切断。
-        # 但若后面**没有** user 消息（例如窗口里全是 assistant/tool），推到末尾会
-        # 让整段字符预算静默失效（窗口仍严重超预算却不归档）。此时退回字符裁剪点。
-        boundary = overflow
-        while boundary < len(messages) and messages[boundary].get("role") != "user":
-            boundary += 1
-        overflow = boundary if boundary < len(messages) else overflow
-        if overflow >= len(messages):
+        boundary = next(
+            (index for index in range(overflow, len(messages)) if messages[index].get("role") == "user"),
+            None,
+        )
+        if boundary is None:
+            logger.warning(
+                "短期窗口 %s 条超出阈值但找不到 user 边界（长工具轮中段），本轮不归档以保持协议合法",
+                len(messages),
+            )
             return
+        overflow = boundary
         dropped = messages[:overflow]
         session["messages"] = messages[overflow:]
         archive = session.setdefault("pending_archive", [])

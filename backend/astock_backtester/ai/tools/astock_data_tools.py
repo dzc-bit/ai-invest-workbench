@@ -116,6 +116,32 @@ def _fmt_zt_time(value: Any) -> str:
     return f"{digits[0:2]}:{digits[2:4]}:{digits[4:6]}"
 
 
+def _limit_status(price: float, limit_up: float | None, limit_down: float | None, high: float | None) -> str:
+    """Classify a quote against its limit prices.
+
+    ``limit_up``/``limit_down`` come from the exchange-published bounds in the
+    Tencent payload, so this is a direct comparison — no heuristic board-size
+    math that would break on ST (5%) or Beijing (30%) names.
+    """
+    if price <= 0:
+        return "停牌/无成交"
+    if limit_up and price >= limit_up:
+        return "涨停"
+    if limit_down and price <= limit_down:
+        return "跌停"
+    if limit_up and high and high >= limit_up:
+        # 盘中触及涨停但未封住，即"炸板"。
+        return "炸板（盘中触及涨停后回落）"
+    return ""
+
+
+def _intraday_position(price: float, high: float | None, low: float | None) -> float | None:
+    """Where the price sits inside today's range: 1.0 = at high, 0.0 = at low."""
+    if not price or high is None or low is None or high <= low:
+        return None
+    return round((price - low) / (high - low), 3)
+
+
 def fetch_tencent_quotes(raw_symbols: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
     """Batch Tencent realtime valuation quotes. Returns (quotes, diagnostics)."""
     prefixed: list[str] = []
@@ -158,22 +184,36 @@ def fetch_tencent_quotes(raw_symbols: list[str]) -> tuple[list[dict[str, Any]], 
         price = _num(values, 3) or 0.0
         last_close = _num(values, 4) or 0.0
         amount_wan = _num(values, 37) or 0.0
+        high = _num(values, 33)
+        low = _num(values, 34)
+        limit_up = _num(values, 47)
+        limit_down = _num(values, 48)
         stale = amount_wan == 0 and price == last_close and price > 0
         quotes.append(
             {
                 "symbol": code,
                 "name": values[1],
                 "price": price,
+                "prev_close": last_close or None,
+                "open": _num(values, 5),
+                "high": high,
+                "low": low,
+                "change": _num(values, 31),
                 "change_pct": _num(values, 32),
+                "amplitude_pct": _num(values, 43),
                 "turnover_pct": _num(values, 38),
+                "amount_wan": amount_wan or None,
                 "pe_ttm": _num(values, 39),
                 "float_mcap_yi": _num(values, 44),
                 "total_mcap_yi": _num(values, 45),
                 "pb": _num(values, 46),
-                "limit_up": _num(values, 47),
-                "limit_down": _num(values, 48),
+                "limit_up": limit_up,
+                "limit_down": limit_down,
                 "vol_ratio": _num(values, 49),
                 "pe_static": _num(values, 52),
+                "quote_time": values[30] if len(values) > 30 else None,
+                "limit_status": _limit_status(price, limit_up, limit_down, high),
+                "intraday_position": _intraday_position(price, high, low),
                 "is_stale": stale,
                 "stale_reason": "成交量为 0（停牌/未开盘/废码），非当日真实成交" if stale else "",
             }
@@ -224,6 +264,66 @@ def fetch_limit_up_rows(pool_type: str, trade_date: str | None = None) -> list[d
     return items
 
 
+def fetch_dragon_tiger_records(symbol: str, trade_date: str, look_back: int) -> tuple[list[dict[str, Any]], list[str]]:
+    """东财龙虎榜上榜记录（公共助手：龙虎榜工具与 stock_timeline 共用）。"""
+    start = datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=look_back)
+    diagnostics: list[str] = []
+    filter_records = f"(TRADE_DATE>='{start:%Y-%m-%d}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{symbol}\")"
+    rows = _eastmoney_datacenter(
+        "RPT_DAILYBILLBOARD_DETAILSNEW",
+        filter_str=filter_records,
+        page_size=20,
+        sort_columns="TRADE_DATE",
+        diagnostics=diagnostics,
+    )
+    records = [
+        {
+            "date": str(row.get("TRADE_DATE", ""))[:10],
+            "reason": row.get("EXPLANATION", ""),
+            "net_buy_wan": _wan(row.get("BILLBOARD_NET_AMT")),
+            "turnover_rate": row.get("TURNOVERRATE"),
+        }
+        for row in rows[:10]
+    ]
+    return records, diagnostics
+
+
+def fetch_research_reports(symbol: str, max_items: int) -> list[dict[str, Any]]:
+    """东财机构研报列表（公共助手：研报工具与 stock_timeline 共用）。"""
+    params = {
+        "industryCode": "*",
+        "pageSize": "100",
+        "industry": "*",
+        "rating": "*",
+        "ratingChange": "*",
+        "beginTime": "2020-01-01",
+        "endTime": "2030-01-01",
+        "pageNo": "1",
+        "fields": "",
+        "qType": "0",
+        "orgCode": "",
+        "code": symbol,
+        "rcode": "",
+        "p": "1",
+        "pageNum": "1",
+        "pageNumber": "1",
+    }
+    response = _em_get(REPORT_API, params=params, headers={"Referer": "https://data.eastmoney.com/"}, timeout=15)
+    response.raise_for_status()
+    rows = response.json().get("data") or []
+    return [
+        {
+            "date": str(row.get("publishDate", ""))[:10],
+            "org": row.get("orgSName", ""),
+            "rating": row.get("emRatingName", ""),
+            "title": html_to_plaintext(str(row.get("title", ""))),
+            "eps_this_year": row.get("predictThisYearEps"),
+            "industry": row.get("indvInduName", ""),
+        }
+        for row in rows[:max_items]
+    ]
+
+
 def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
     def stock_valuation(args: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = [str(s) for s in args.get("symbols", [])][:10]
@@ -251,45 +351,14 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
         if not symbol.isdigit():
             return {"ok": False, "error": f"无法识别股票代码：{args.get('symbol')!r}"}
         max_items = max(1, min(int(args.get("max_items", 8)), 20))
-        params = {
-            "industryCode": "*",
-            "pageSize": "100",
-            "industry": "*",
-            "rating": "*",
-            "ratingChange": "*",
-            "beginTime": "2020-01-01",
-            "endTime": "2030-01-01",
-            "pageNo": "1",
-            "fields": "",
-            "qType": "0",
-            "orgCode": "",
-            "code": symbol,
-            "rcode": "",
-            "p": "1",
-            "pageNum": "1",
-            "pageNumber": "1",
-        }
         diagnostics: list[str] = []
         try:
-            response = _em_get(REPORT_API, params=params, headers={"Referer": "https://data.eastmoney.com/"}, timeout=15)
-            response.raise_for_status()
-            rows = response.json().get("data") or []
+            reports = fetch_research_reports(symbol, max_items)
         except (requests.RequestException, ValueError) as exc:
             return {"ok": False, "error": f"东财研报接口失败：{exc}", "diagnostics": diagnostics}
-        if not rows:
+        if not reports:
             return {"ok": True, "reports": [], "note": "东财无该标的研报覆盖或接口返回为空", "diagnostics": diagnostics}
-        reports = [
-            {
-                "date": str(row.get("publishDate", ""))[:10],
-                "org": row.get("orgSName", ""),
-                "rating": row.get("emRatingName", ""),
-                "title": html_to_plaintext(str(row.get("title", ""))),
-                "eps_this_year": row.get("predictThisYearEps"),
-                "industry": row.get("indvInduName", ""),
-            }
-            for row in rows[:max_items]
-        ]
-        return {"ok": True, "symbol": symbol, "count": len(rows), "reports": reports, "diagnostics": diagnostics}
+        return {"ok": True, "symbol": symbol, "count": len(reports), "reports": reports, "diagnostics": diagnostics}
 
     def summarize_reports(payload: dict[str, Any]) -> str:
         if not payload.get("reports"):
@@ -305,30 +374,10 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             return {"ok": False, "error": f"无法识别股票代码：{args.get('symbol')!r}"}
         look_back = max(7, min(int(args.get("look_back", 30)), 90))
         trade_date = str(args.get("trade_date") or date.today().isoformat())
-        start = datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=look_back)
-        diagnostics: list[str] = []
-        filter_records = (
-            f"(TRADE_DATE>='{start:%Y-%m-%d}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{symbol}\")"
-        )
         try:
-            rows = _eastmoney_datacenter(
-                "RPT_DAILYBILLBOARD_DETAILSNEW",
-                filter_str=filter_records,
-                page_size=20,
-                sort_columns="TRADE_DATE",
-                diagnostics=diagnostics,
-            )
+            records, diagnostics = fetch_dragon_tiger_records(symbol, trade_date, look_back)
         except requests.RequestException as exc:
-            return {"ok": False, "error": f"龙虎榜接口失败：{exc}", "diagnostics": diagnostics}
-        records = [
-            {
-                "date": str(row.get("TRADE_DATE", ""))[:10],
-                "reason": row.get("EXPLANATION", ""),
-                "net_buy_wan": _wan(row.get("BILLBOARD_NET_AMT")),
-                "turnover_rate": row.get("TURNOVERRATE"),
-            }
-            for row in rows[:10]
-        ]
+            return {"ok": False, "error": f"龙虎榜接口失败：{exc}", "diagnostics": []}
         return {"ok": True, "symbol": symbol, "records": records, "diagnostics": diagnostics}
 
     def summarize_dragon_tiger(payload: dict[str, Any]) -> str:
@@ -369,6 +418,43 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
                 f"炸板{item.get('break_times')}次 {item.get('industry')}"
             )
         return "\n".join(lines)
+
+    def realtime_stock_detail(args: dict[str, Any]) -> dict[str, Any]:
+        """One call that answers "this stock right now" without touching the warehouse."""
+        raw_symbols = [str(s) for s in args.get("symbols", [])][:8]
+        if not raw_symbols:
+            return {"ok": False, "error": "symbols 不能为空"}
+        try:
+            quotes, diagnostics = fetch_tencent_quotes(raw_symbols)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc), "diagnostics": []}
+        if not quotes:
+            return {
+                "ok": False,
+                "error": "实时行情未返回有效数据（代码不可识别或全部停牌）。",
+                "diagnostics": diagnostics,
+            }
+        return {"ok": True, "quotes": quotes, "diagnostics": diagnostics}
+
+    def summarize_realtime_detail(payload: dict[str, Any]) -> str:
+        lines: list[str] = []
+        for quote in payload.get("quotes", []):
+            limit = f"，{quote['limit_status']}" if quote.get("limit_status") else ""
+            stale = "（无成交：停牌或未开盘）" if quote.get("is_stale") else ""
+            position = quote.get("intraday_position")
+            position_text = (
+                f"，位于当日区间 {position * 100:.0f}% 分位" if isinstance(position, (int, float)) else ""
+            )
+            lines.append(
+                f"- {quote.get('symbol')} {quote.get('name')}{stale}：{quote.get('price')} "
+                f"({quote.get('change_pct'):+.2f}%){limit}，"
+                f"开 {quote.get('open')} / 高 {quote.get('high')} / 低 {quote.get('low')}"
+                f"{position_text}，成交额 {quote.get('amount_wan')} 万，"
+                f"量比 {quote.get('vol_ratio')}，换手 {quote.get('turnover_pct')}%，"
+                f"总市值 {quote.get('total_mcap_yi')} 亿"
+            )
+        head = f"实时个股快照（腾讯公开行情，{len(payload.get('quotes', []))} 只）："
+        return head + "\n" + "\n".join(lines)
 
     def compare_stocks(args: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = [str(s) for s in args.get("symbols", [])][:6]
@@ -417,6 +503,29 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
 
     return [
         AiTool(
+            name="realtime_stock_detail",
+            description=(
+                "查询个股**当前**实时盘面（腾讯公开行情，不读本地数据仓）：现价、涨跌幅、开高低、"
+                "当日区间分位、成交额、量比、换手率、市值，以及涨停/跌停/炸板状态与停牌识别。"
+                "行情类问题（现在怎么样/今天强不强/是不是涨停/放量没有）先调用本工具；"
+                "本地数据仓只用于历史区间与回测。最多 8 只。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "symbols": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "最多 8 个 6 位代码，如 600519",
+                    },
+                },
+                "required": ["symbols"],
+            },
+            executor=realtime_stock_detail,
+            summarizer=summarize_realtime_detail,
+            digest_chars=2_600,
+        ),
+        AiTool(
             name="stock_valuation",
             description="批量查询 A 股实时估值：现价、涨跌幅、PE(TTM)/静态、PB、总市值/流通市值、换手率、涨跌停价（腾讯财经公开接口）。",
             parameters={
@@ -444,6 +553,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             executor=stock_research_reports,
             summarizer=summarize_reports,
             digest_chars=2_600,
+            untrusted_body=True,
         ),
         AiTool(
             name="dragon_tiger_board",
@@ -460,6 +570,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             executor=dragon_tiger_board,
             summarizer=summarize_dragon_tiger,
             digest_chars=2_600,
+            untrusted_body=True,
         ),
         AiTool(
             name="limit_up_pool",
@@ -474,6 +585,7 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             executor=limit_up_pool,
             summarizer=summarize_limit_up,
             digest_chars=3_000,
+            untrusted_body=True,
         ),
         AiTool(
             name="compare_stocks",

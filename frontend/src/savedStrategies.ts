@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ConditionGroup, ConditionNode, SavedStrategyPreset, StrategyConfig } from "./types";
 import { defaultStrategy } from "./strategyDefaults";
+import { isTauriRuntime } from "./tauriRuntime";
 
 const STORAGE_KEY = "astock-saved-strategies";
 const BUILTIN_ID_PREFIX = "builtin-";
@@ -104,10 +105,6 @@ const builtInStrategies: SavedStrategyPreset[] = [
 
 function sortParams(params: ConditionNode["params"]): ConditionNode["params"] {
   return Object.fromEntries(Object.entries(params).sort(([left], [right]) => left.localeCompare(right)));
-}
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
 }
 
 function normalizeCondition(condition: ConditionNode) {

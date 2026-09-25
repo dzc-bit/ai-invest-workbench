@@ -212,3 +212,54 @@ def test_plan_memory_ops_anchors_relative_time_to_a_reference_date():
     prompt_text = model.prompts[0][0]["content"]
     assert "2026-09-22" in prompt_text
     assert "绝对日期" in prompt_text or "换算成绝对日期" in prompt_text
+
+
+def test_apply_ops_rejects_market_numbers_for_non_profile_categories(tmp_path):
+    """写侧拦截：行情数字不是持久事实——它会被每轮注入 system prompt 当权威，
+    而数字第二天就过时（真实记忆文件里出现过
+    "纠正超声电子数据：9/22 主力净流出 4.44 亿…"）。拒绝必须计数，不静默。"""
+    store = MemoryStore(tmp_path)
+    applied = store.apply_ops(
+        [
+            {"op": "add", "content": "纠正数据：9/22 主力净流出 4.44 亿", "category": "fact"},
+            {"op": "add", "content": "600206 今天涨停 3 天了", "category": "watchlist"},
+            # profile 类（holding/risk_preference/style）豁免：成本、偏好可含数字
+            {"op": "add", "content": "持有 600206，2026-09-22 买入", "category": "holding"},
+            # 语境词但无数字：不拦（关注资金流偏好是持久事实）
+            {"op": "add", "content": "用户关注 600206 的主力净流入变化", "category": "watchlist"},
+        ]
+    )
+    records = store.load()
+    assert len(records) == 2
+    categories = {record.category for record in records}
+    assert categories == {"holding", "watchlist"}
+    assert store.rejected_market_facts == 2
+    assert applied == 2
+
+
+def test_apply_ops_merges_same_symbol_watchlist_records(tmp_path):
+    """同标的合并：同 category 且含相同 6 位代码的旧记录走 update 而不是新增——
+    真实记忆文件里已有"同标的、不同措辞"的重叠条目。"""
+    store = MemoryStore(tmp_path)
+    store.apply_ops([{"op": "add", "content": "用户关注 600206", "category": "watchlist"}])
+    before = len(store.load())
+    applied = store.apply_ops([{"op": "add", "content": "关注 600206 的新高突破", "category": "watchlist"}])
+    records = store.load()
+    assert applied == 1
+    assert len(records) == before, "同标的同类别的记忆应合并，不应新增一条"
+    assert "新高突破" in records[0].content
+
+
+def test_explicit_user_ops_update_and_delete_records(tmp_path):
+    store = MemoryStore(tmp_path)
+    store.apply_ops([{"op": "add", "content": "用户关注 600206", "category": "watchlist"}])
+    record = store.load()[0]
+
+    # 用户显式编辑不做行情数字拦截（编辑权在用户），但内容仍生效
+    updated = store.update_record(record.id, content="用户关注 600206 的龙虎榜席位", weight=3.0)
+    assert updated.content.endswith("席位")
+    assert updated.weight == 3.0
+
+    assert store.delete_record(record.id) is True
+    assert store.load() == []
+    assert store.delete_record(record.id) is False

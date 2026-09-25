@@ -14,7 +14,7 @@ import pandas as pd
 import requests
 
 from astock_backtester.data.http_transport import USER_AGENT as UA
-from astock_backtester.data.http_transport import create_scraping_session
+from astock_backtester.data.http_transport import create_scraping_session, curl_verify_kwargs
 from astock_backtester.data.parsing import is_blank_numeric, parse_float
 from astock_backtester.data.symbols import a_share_market_symbol, market_code, normalize_symbol
 from astock_backtester.data.trading_calendar import a_share_trade_dates
@@ -173,6 +173,9 @@ def _curl_cffi_json_get(url: str, params: dict[str, str], headers: dict[str, str
         headers=headers,
         timeout=timeout,
         impersonate="chrome124",
+        # 非 ASCII 用户目录下 libcurl 装不上 certifi 的 CA（curl error 77），
+        # 显式传入可加载的 ASCII CA 路径，否则整个备用传输在本机会静默失效。
+        **curl_verify_kwargs(),
     )
     response.raise_for_status()
     return _loads_eastmoney_json(response.text)

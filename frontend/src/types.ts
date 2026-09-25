@@ -194,6 +194,28 @@ export type MarketBriefingResponse = {
   diagnostics: string[];
 };
 
+export type MarketCommentaryPoint = {
+  title: string;
+  detail: string;
+  weight: "high" | "medium" | "low";
+};
+
+/** 行情评价（/market/commentary）：四段状态机的产物。mode 表达的是
+ * 证据来源层级——非 intraday/post_close 的 mode 都不是实时盘面结论，
+ * 前端必须显式标注（AGENTS.md §6）。 */
+export type MarketCommentaryResponse = {
+  updated_at: string;
+  trade_date: string;
+  source: string;
+  mode: "intraday" | "lunch_break_review" | "post_close" | "non_trading_review" | "news_fallback" | "local_brief_review";
+  stance: "positive" | "neutral" | "defensive";
+  summary: string;
+  drivers: MarketCommentaryPoint[];
+  risks: string[];
+  next_watch: string[];
+  diagnostics: string[];
+};
+
 export type ClsFinanceTlinePoint = {
   date?: number | null;
   minute: number;
@@ -514,6 +536,11 @@ export type DiagnosticsDataGapsResponse = {
   ok: boolean;
   generated_at?: string;
   profile: DataGapProfile;
+  /** 分区损坏与"数据缺失"是两类问题：损坏必须先修（补齐无法修复损坏）。 */
+  warehouse_health?: {
+    corrupt_partitions: Record<string, string>;
+    healthy: boolean;
+  };
 };
 
 export type OptimizeGrid = Partial<Record<OptimizeGridKey, number[]>>;

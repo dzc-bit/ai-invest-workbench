@@ -111,12 +111,19 @@ class ADataProvider:
             (column for column in ["stock_code", "code", "symbol"] if column in frame.columns),
             frame.columns[0],
         )
+        has_list_date = "list_date" in frame.columns
+        selected = frame[[code_column, "list_date"]] if has_list_date else frame[[code_column]]
         listings: dict[str, str | None] = {}
-        for _, row in frame.iterrows():
-            code = normalize_symbol(str(row[code_column]))
+        # itertuples 替代 iterrows：list_symbol_listings 在每次全市场同步前都会
+        # 扫全市场帧，iterrows 的逐行 Series 构造是大头开销。
+        for record in selected.itertuples(index=False, name=None):
+            code = normalize_symbol(str(record[0]))
             if not code or code in listings:
                 continue
-            raw_date = row.get("list_date")
+            if not has_list_date:
+                listings[code] = None
+                continue
+            raw_date = record[1]
             if raw_date is None or pd.isna(raw_date):
                 listings[code] = None
                 continue
@@ -149,11 +156,17 @@ class ADataProvider:
 class HttpAStockProvider:
     name: str = "http"
 
+    def __post_init__(self) -> None:
+        # 复用同一个 adapter：它内部带"东财增强连续失败就熔断"的计数器，
+        # 每只股票新建一个 adapter 会让计数永远归零，全市场补齐时每只票都要
+        # 重新等满超时（实测 5528 只从分钟级拖到数小时）。
+        self._adapter = AStockDataAdapter.from_http_sources()
+
     def list_symbols(self) -> list[str]:
         return []
 
     def fetch_daily_bars(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        frame = AStockDataAdapter.from_http_sources().fetch_daily_bars([symbol], start_date, end_date)
+        frame = self._adapter.fetch_daily_bars([symbol], start_date, end_date)
         if frame.empty:
             return frame
         frame["source"] = self.name
@@ -200,24 +213,24 @@ class AkshareProvider:
         }
         if not all(columns[key] for key in ("code", "name", "price", "change_pct")):
             return []
+        optional_keys = [key for key in ("turnover", "volume_ratio", "float_market_cap") if columns[key]]
+        optional_labels = {"turnover": "换手率", "volume_ratio": "量比", "float_market_cap": "流通市值"}
+        selected = frame[[columns["code"], columns["name"], columns["price"], columns["change_pct"],
+                          *(columns[key] for key in optional_keys)]]
         rows: list[dict[str, object]] = []
-        for _, item in frame.iterrows():
-            code = normalize_symbol(str(item[columns["code"]]))
-            name = str(item[columns["name"]]).strip()
+        for record in selected.itertuples(index=False, name=None):
+            code = normalize_symbol(str(record[0]))
+            name = str(record[1]).strip()
             if not code or not name:
                 continue
             row: dict[str, object] = {
                 "代码": code,
                 "名称": name,
-                "现价": item[columns["price"]],
-                "涨跌幅": item[columns["change_pct"]],
+                "现价": record[2],
+                "涨跌幅": record[3],
             }
-            if columns["turnover"]:
-                row["换手率"] = item[columns["turnover"]]
-            if columns["volume_ratio"]:
-                row["量比"] = item[columns["volume_ratio"]]
-            if columns["float_market_cap"]:
-                row["流通市值"] = item[columns["float_market_cap"]]
+            for offset, key in enumerate(optional_keys, start=4):
+                row[optional_labels[key]] = record[offset]
             rows.append(row)
         return rows
 

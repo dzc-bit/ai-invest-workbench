@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import {
   loadClsFinance,
   loadMarketBriefing,
+  loadMarketCommentary,
   loadMarketNews,
   loadNewsSummary,
   loadRecommendedStrategies,
@@ -12,6 +13,7 @@ import type {
   DataServiceStatus,
   DatasetCoverage,
   MarketBriefingResponse,
+  MarketCommentaryResponse,
   MarketNewsResponse,
   NewsSummaryResponse,
   RecommendedStrategy,
@@ -20,14 +22,15 @@ import type {
 import { useIndependentModuleRefresh } from "./useIndependentModuleRefresh";
 
 /**
- * Owns the seven independent market-modules (news / finance / summary / fupan /
- * zaopan / risk / recommendations): their payloads, loading flags, refresh
- * cycle and manual refresh helpers.  Each module fails and recovers on its own
- * without affecting the others.  ``coverage`` participates in the
- * recommendations loader identity on purpose: a fresh coverage snapshot must
- * re-read the recommended strategies immediately.
+ * Owns the eight independent market-modules (commentary / news / finance /
+ * summary / fupan / zaopan / risk / recommendations): their payloads, loading
+ * flags, refresh cycle and manual refresh helpers.  Each module fails and
+ * recovers on its own without affecting the others.  ``coverage`` participates
+ * in the recommendations loader identity on purpose: a fresh coverage snapshot
+ * must re-read the recommended strategies immediately.
  */
 export function useMarketModules(dataService: DataServiceStatus | null, coverage: DatasetCoverage[]) {
+  const [marketCommentary, setMarketCommentary] = useState<MarketCommentaryResponse | null>(null);
   const [marketNews, setMarketNews] = useState<MarketNewsResponse | null>(null);
   const [isLoadingNews, setIsLoadingNews] = useState(false);
   const [clsFinance, setClsFinance] = useState<ClsFinanceResponse | null>(null);
@@ -39,6 +42,25 @@ export function useMarketModules(dataService: DataServiceStatus | null, coverage
   const [riskAlerts, setRiskAlerts] = useState<RiskAlertsResponse | null>(null);
   const [isLoadingRiskAlerts, setIsLoadingRiskAlerts] = useState(false);
   const [recommendedStrategies, setRecommendedStrategies] = useState<RecommendedStrategy[]>([]);
+
+  const loadCommentary = useCallback(
+    async (isCancelled: () => boolean): Promise<boolean> => {
+      if (!dataService) {
+        return false;
+      }
+      try {
+        const response = await loadMarketCommentary(dataService.base_url);
+        if (!isCancelled() && response) {
+          setMarketCommentary(response);
+        }
+        return Boolean(response);
+      } catch {
+        // 行情评价失败独立恢复：前端保留最近一次评价（自带 updated_at）。
+        return false;
+      }
+    },
+    [dataService]
+  );
 
   const loadNews = useCallback(
     async (isCancelled: () => boolean): Promise<boolean> => {
@@ -201,6 +223,7 @@ export function useMarketModules(dataService: DataServiceStatus | null, coverage
     void loadRiskAlertData(() => false);
   };
 
+  useIndependentModuleRefresh(Boolean(dataService), loadCommentary);
   useIndependentModuleRefresh(Boolean(dataService), loadNews);
   useIndependentModuleRefresh(Boolean(dataService), loadFupan);
   useIndependentModuleRefresh(Boolean(dataService), loadZaopan);
@@ -210,6 +233,7 @@ export function useMarketModules(dataService: DataServiceStatus | null, coverage
   useIndependentModuleRefresh(Boolean(dataService), loadRecommendations);
 
   return {
+    marketCommentary,
     marketNews,
     isLoadingNews,
     clsFinance,

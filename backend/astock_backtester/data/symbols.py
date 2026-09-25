@@ -26,16 +26,18 @@ def a_share_market_symbol(symbol: str) -> str | None:
     """Convert an A-share code to the ``sh``/``sz``/``bj`` prefix form used by
     Sina and Tencent quote APIs.
 
-    900xxx Shanghai B-shares map to ``sh``; ``None`` is returned for codes that
-    do not match a known A-share digit prefix.  The ``9`` -> ``sh`` mapping is
-    the established project-wide convention (risk and realtime providers always
-    used it); the capital-flow crawler's old ``9`` -> ``bj`` branch was the
-    outlier and is intentionally unified here — Eastmoney stays the primary
-    capital-flow source, Sina is only a fallback.
+    ``900xxx`` Shanghai B-shares map to ``sh``; ``920xxx`` is the *Beijing*
+    exchange segment and must map to ``bj`` — Sina and Tencent both answer
+    ``none_match``/empty for ``sh920xxx``, so the old blanket ``9`` -> ``sh``
+    rule silently dropped every 920 code from quotes and capital-flow
+    backfills.  ``None`` is returned for codes that do not match a known
+    A-share digit prefix.
     """
     code = normalize_symbol(symbol)
     if not code or not code.isdigit():
         return None
+    if code.startswith("92"):
+        return f"bj{code}"
     if code.startswith(("6", "9")):
         return f"sh{code}"
     if code.startswith(("0", "2", "3")):
@@ -52,5 +54,14 @@ def sina_summary_symbol(symbol: str) -> str | None:
 
 
 def market_code(code: str) -> int:
-    """Eastmoney numeric market prefix: 1 for Shanghai (6/9), 0 otherwise."""
-    return 1 if code.startswith(("6", "9")) else 0
+    """Eastmoney numeric market prefix: 1 for Shanghai (6/9), 0 otherwise.
+
+    ``920xxx`` Beijing codes resolve through :func:`a_share_market_symbol`'s
+    ``bj`` branch but Eastmoney's ``push2`` family still addresses them under
+    the ``0`` market bucket (verified against ``push2`` spot: ``secid=0.920171``
+    returns the quote), so only ``6``/``9`` Shanghai-listed codes take prefix 1.
+    """
+    normalized = normalize_symbol(code)
+    if normalized.startswith("92"):
+        return 0
+    return 1 if normalized.startswith(("6", "9")) else 0

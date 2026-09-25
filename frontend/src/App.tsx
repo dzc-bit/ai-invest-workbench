@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { Activity, Database, Flame, Gauge, ShieldAlert, Sparkles } from "lucide-react";
 import { AiAssistantPanel } from "./components/AiAssistantPanel";
 import { aiParseConditions, loadAiNewsDigest, loadAiStatus, revealAiKey } from "./aiApi";
+import { isTauriRuntime as isTauri } from "./tauriRuntime";
 import { useAiEventStream } from "./hooks/useAiEventStream";
 import { useMarketModules } from "./hooks/useMarketModules";
 import type { AiConditionParseResult, AiDigestItem, AiInsight, AiStatus as AiStatusView, AiTask } from "./aiTypes";
@@ -422,6 +423,7 @@ export function App() {
   });
 
   const {
+    marketCommentary,
     marketNews,
     isLoadingNews,
     clsFinance,
@@ -621,8 +623,13 @@ export function App() {
           <span className="status-pill"><Database size={16} aria-hidden="true" /> 本地缓存</span>
         </div>
       </header>
+      {!isTauri ? (
+        <div className="preview-banner" role="status">
+          浏览器预览：页面展示的是演示数据，回测/行情/补数据等操作仅在桌面端（Tauri）生效。
+        </div>
+      ) : null}
       <div className="market-news-layout">
-        <MarketDashboard snapshot={marketSnapshot} isLoading={isLoadingMarket} refreshMeta={marketRefreshMeta} />
+        <MarketDashboard snapshot={marketSnapshot} commentary={marketCommentary} isLoading={isLoadingMarket} refreshMeta={marketRefreshMeta} />
         <NewsPanel news={marketNews} aiDigest={aiDigest} isLoading={isLoadingNews} onRefresh={refreshNews} />
       </div>
       <div className="market-insight-layout">

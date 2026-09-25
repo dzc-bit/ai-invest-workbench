@@ -5,16 +5,19 @@ import remarkGfm from "remark-gfm";
 import { AlertTriangle, Bot, Download, MessageSquarePlus, Send, Settings2, Sparkles, Square, X } from "lucide-react";
 import {
   loadAiConfig,
+  loadAiMemories,
   loadAiReportFile,
   loadAiReports,
   loadAiSession,
   loadAiSessions,
   loadAiStatus,
+  deleteAiMemory,
   revealAiKey,
   runAiChatStream,
-  saveAiConfig
+  saveAiConfig,
+  updateAiMemory
 } from "../aiApi";
-import { translateAiError } from "../aiTypes";
+import { AI_MEMORY_CATEGORY_LABELS, translateAiError } from "../aiTypes";
 import type {
   AiChartArtifact,
   AiChatContext,
@@ -22,6 +25,8 @@ import type {
   AiConfigView,
   AiDisplayTurn,
   AiInsight,
+  AiMemoriesResponse,
+  AiMemoryRecord,
   AiReportMeta,
   AiSessionMeta,
   AiStatus,
@@ -48,13 +53,14 @@ type Props = {
  * 常驻堆叠——它们曾占掉抽屉约 46% 的固定高度（含定时报告默认 open），
  * 且占用量随会话数增长。改成切换后，消息区高度与这些列表完全解耦。
  */
-type AiDrawerView = "chat" | "history" | "insights" | "reports";
+type AiDrawerView = "chat" | "history" | "insights" | "reports" | "memories";
 
 const DRAWER_VIEWS: Array<{ value: AiDrawerView; label: string }> = [
   { value: "chat", label: "对话" },
   { value: "history", label: "历史" },
   { value: "insights", label: "快讯" },
-  { value: "reports", label: "报告" }
+  { value: "reports", label: "报告" },
+  { value: "memories", label: "记忆" }
 ];
 
 const QUICK_PROMPTS: Array<{ label: string; message: string }> = [
@@ -134,6 +140,11 @@ export function AiAssistantPanel({
   const [lastChart, setLastChart] = useState<AiChartArtifact | null>(null);
   const [reports, setReports] = useState<AiReportMeta[]>([]);
   const [reportBusy, setReportBusy] = useState<string | null>(null);
+  const [memories, setMemories] = useState<AiMemoryRecord[]>([]);
+  const [memoriesNote, setMemoriesNote] = useState<string | null>(null);
+  const [memoryBusy, setMemoryBusy] = useState<string | null>(null);
+  const [editingMemory, setEditingMemory] = useState<string | null>(null);
+  const [editingContent, setEditingContent] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const streamingRef = useRef(false);
@@ -259,6 +270,15 @@ export function AiAssistantPanel({
       loadAiReports(baseUrl)
         .then((next) => setReports(next.items ?? []))
         .catch(() => setReports([]));
+    }
+    if (view === "memories" && baseUrl) {
+      loadAiMemories(baseUrl)
+        .then((next: AiMemoriesResponse) => {
+          setMemories(next.items ?? []);
+          const rejected = next.rejected_market_facts_total ?? 0;
+          setMemoriesNote(rejected > 0 ? `写侧已拦截 ${rejected} 条行情数字记录（行情数字不是持久事实）。` : null);
+        })
+        .catch(() => setMemories([]));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, view, baseUrl]);
@@ -442,6 +462,37 @@ export function AiAssistantPanel({
       // 下载失败保持安静：列表仍在，可重试。
     } finally {
       setReportBusy(null);
+    }
+  };
+
+  const saveMemoryEdit = async (record: AiMemoryRecord) => {
+    if (!baseUrl) {
+      return;
+    }
+    setMemoryBusy(record.id);
+    try {
+      await updateAiMemory(baseUrl, { id: record.id, content: editingContent.trim(), category: record.category });
+      setMemories((prev) => prev.map((item) => (item.id === record.id ? { ...item, content: editingContent.trim() } : item)));
+      setEditingMemory(null);
+    } catch (caught) {
+      setError(translateAiError(caught));
+    } finally {
+      setMemoryBusy(null);
+    }
+  };
+
+  const removeMemory = async (record: AiMemoryRecord) => {
+    if (!baseUrl) {
+      return;
+    }
+    setMemoryBusy(record.id);
+    try {
+      await deleteAiMemory(baseUrl, record.id);
+      setMemories((prev) => prev.filter((item) => item.id !== record.id));
+    } catch (caught) {
+      setError(translateAiError(caught));
+    } finally {
+      setMemoryBusy(null);
     }
   };
 
@@ -640,6 +691,76 @@ export function AiAssistantPanel({
             </ul>
           ) : (
             <p className="ai-history-empty">还没有定时报告。开启后由服务端按计划生成。</p>
+          )}
+        </section>
+      ) : null}
+
+      {view === "memories" ? (
+        <section className="ai-panel-view" aria-label="长期记忆面板">
+          <p className="ai-memory-note">记忆是 AI 从对话里沉淀的用户自述，可以修改或删除；行情数字由写侧自动拦截，不会入记忆。</p>
+          {memoriesNote ? <p className="ai-memory-note">{memoriesNote}</p> : null}
+          {memories.length > 0 ? (
+            <ul>
+              {memories.map((record) => (
+                <li key={record.id} className="ai-insight ai-memory-item">
+                  {editingMemory === record.id ? (
+                    <>
+                      <input
+                        className="ai-memory-edit"
+                        value={editingContent}
+                        onChange={(event) => setEditingContent(event.target.value)}
+                        aria-label="修改记忆内容"
+                      />
+                      <div className="ai-memory-actions">
+                        <button
+                          className="ai-reveal-button"
+                          type="button"
+                          disabled={memoryBusy === record.id || !editingContent.trim()}
+                          onClick={() => void saveMemoryEdit(record)}
+                        >
+                          {memoryBusy === record.id ? "保存中" : "保存"}
+                        </button>
+                        <button className="ai-reveal-button" type="button" onClick={() => setEditingMemory(null)}>
+                          取消
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <strong>
+                        <span className="ai-memory-category">{AI_MEMORY_CATEGORY_LABELS[record.category] ?? record.category}</span>
+                        {record.content}
+                      </strong>
+                      <div className="ai-memory-actions">
+                        <small>
+                          权重 {record.weight} · {formatSessionTime(record.updated_at)}
+                        </small>
+                        <button
+                          className="ai-reveal-button"
+                          type="button"
+                          onClick={() => {
+                            setEditingMemory(record.id);
+                            setEditingContent(record.content);
+                          }}
+                        >
+                          编辑
+                        </button>
+                        <button
+                          className="ai-reveal-button"
+                          type="button"
+                          disabled={memoryBusy === record.id}
+                          onClick={() => void removeMemory(record)}
+                        >
+                          {memoryBusy === record.id ? "删除中" : "删除"}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="ai-history-empty">还没有长期记忆。对话中确认的偏好/持仓会自动沉淀到这里。</p>
           )}
         </section>
       ) : null}

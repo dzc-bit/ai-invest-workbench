@@ -13,6 +13,7 @@ import type {
   ConditionValidationResult,
   ClsFinanceResponse,
   MarketBriefingResponse,
+  MarketCommentaryResponse,
   MarketNewsResponse,
   NewsSummaryResponse,
   RealtimeMarketSnapshot,
@@ -23,31 +24,7 @@ import type {
   SyncJobStatus
 } from "./types";
 import { isTauriRuntime } from "./tauriRuntime";
-import {
-  demoBacktestResult,
-  mockCallBackendCoverage,
-  mockCancelSyncJob,
-  mockClsFinance,
-  mockConditionValidation,
-  mockDailyBarsCoverage,
-  mockDataServiceHealth,
-  mockDataServiceLogs,
-  mockDataServiceStatus,
-  mockDiagnosticsDataGaps,
-  mockDiagnosticsSources,
-  mockFetchCapitalFlowResult,
-  mockFetchDailyBarsResult,
-  mockImportDailyBarsResult,
-  mockLoadSyncJob,
-  mockMarketBriefing,
-  mockMarketNews,
-  mockNewsSummary,
-  mockRealtimeMarketSnapshot,
-  mockRecommendedStrategies,
-  mockRiskAlerts,
-  mockStartFullMarketSync,
-  mockStockSymbolValidation
-} from "./apiMocks";
+import { previewApiMocks } from "./previewMocks";
 
 type BackendResponse<T> = ({ ok: true } & T) | { ok: false; error: { code: string; message: string } };
 
@@ -63,10 +40,16 @@ export class BackendError extends Error {
 
 async function callBackend<T>(payload: Record<string, unknown>): Promise<T> {
   if (!isTauriRuntime()) {
-    if (payload.command === "coverage") {
-      return mockCallBackendCoverage() as T;
+    // 浏览器预览（非 Tauri）：演示数据只存在于 DEV 构建。生产包不含 mock，
+    // 这里直接把异常抛给调用方，绝不静默伪造回测结果。
+    const mocks = await previewApiMocks();
+    if (mocks) {
+      if (payload.command === "coverage") {
+        return mocks.mockCallBackendCoverage() as T;
+      }
+      return { result: mocks.demoBacktestResult } as T;
     }
-    return { result: demoBacktestResult } as T;
+    throw new BackendError("no_local_data", "本地数据服务未连接（当前不是桌面端运行环境）。");
   }
   const response = await invoke<BackendResponse<T>>("backend_command", { payload });
   if (!response.ok) {
@@ -229,28 +212,32 @@ async function serviceFetch<T>(
 
 export async function ensureDataService(cacheDir: string): Promise<DataServiceStatus> {
   if (!isTauriRuntime()) {
-    return mockDataServiceStatus(cacheDir);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockDataServiceStatus(cacheDir);
   }
   return invoke<DataServiceStatus>("ensure_data_service", { cacheDir });
 }
 
 export async function loadDataServiceHealth(baseUrl: string): Promise<DataServiceHealth> {
   if (!isTauriRuntime()) {
-    return mockDataServiceHealth();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockDataServiceHealth();
   }
   return serviceFetch<DataServiceHealth>(baseUrl, "/health", undefined, { timeoutMs: HEALTH_SERVICE_TIMEOUT_MS });
 }
 
 export async function loadDataServiceLogs(baseUrl: string): Promise<{ items: Array<{ level: "info" | "warning" | "error"; message: string; timestamp?: string }> }> {
   if (!isTauriRuntime()) {
-    return mockDataServiceLogs();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockDataServiceLogs();
   }
   return serviceFetch(baseUrl, "/logs/recent");
 }
 
 export async function loadRealtimeMarketSnapshot(baseUrl: string): Promise<RealtimeMarketSnapshot> {
   if (!isTauriRuntime()) {
-    return mockRealtimeMarketSnapshot();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockRealtimeMarketSnapshot();
   }
   return serviceFetch<RealtimeMarketSnapshot>(baseUrl, "/realtime/market-snapshot");
 }
@@ -374,7 +361,8 @@ export async function loadRealtimeMarketSnapshotStream(
 
 export async function loadMarketNews(baseUrl: string): Promise<MarketNewsResponse> {
   if (!isTauriRuntime()) {
-    return mockMarketNews();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockMarketNews();
   }
   return serviceFetch<MarketNewsResponse>(baseUrl, "/market/news", undefined, {
     timeoutMs: NEWS_SERVICE_TIMEOUT_MS
@@ -383,14 +371,26 @@ export async function loadMarketNews(baseUrl: string): Promise<MarketNewsRespons
 
 export async function loadMarketBriefing(baseUrl: string, kind: "fupan" | "zaopan"): Promise<MarketBriefingResponse> {
   if (!isTauriRuntime()) {
-    return mockMarketBriefing(kind);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockMarketBriefing(kind);
   }
   return serviceFetch<MarketBriefingResponse>(baseUrl, `/market/${kind}`);
 }
 
+/** 行情评价（怎么读盘面）。后端是四段状态机：非 intraday/post_close 的 mode
+ * 都不是实时盘面结论，调用方必须把状态语义显式展示（AGENTS.md §6）。 */
+export async function loadMarketCommentary(baseUrl: string): Promise<MarketCommentaryResponse> {
+  if (!isTauriRuntime()) {
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockMarketCommentary();
+  }
+  return serviceFetch<MarketCommentaryResponse>(baseUrl, "/market/commentary");
+}
+
 export async function loadClsFinance(baseUrl: string): Promise<ClsFinanceResponse> {
   if (!isTauriRuntime()) {
-    return mockClsFinance();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockClsFinance();
   }
   return serviceFetch<ClsFinanceResponse>(baseUrl, "/market/finance", undefined, {
     timeoutMs: CLS_FINANCE_SERVICE_TIMEOUT_MS
@@ -399,7 +399,8 @@ export async function loadClsFinance(baseUrl: string): Promise<ClsFinanceRespons
 
 export async function loadNewsSummary(baseUrl: string): Promise<NewsSummaryResponse> {
   if (!isTauriRuntime()) {
-    return mockNewsSummary();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockNewsSummary();
   }
   return serviceFetch<NewsSummaryResponse>(baseUrl, "/market/news-summary", undefined, {
     timeoutMs: NEWS_SERVICE_TIMEOUT_MS
@@ -408,21 +409,24 @@ export async function loadNewsSummary(baseUrl: string): Promise<NewsSummaryRespo
 
 export async function loadRiskAlerts(baseUrl: string): Promise<RiskAlertsResponse> {
   if (!isTauriRuntime()) {
-    return mockRiskAlerts();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockRiskAlerts();
   }
   return serviceFetch<RiskAlertsResponse>(baseUrl, "/risk/alerts");
 }
 
 export async function loadDiagnosticsSources(baseUrl: string): Promise<DiagnosticsSourcesResponse> {
   if (!isTauriRuntime()) {
-    return mockDiagnosticsSources();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockDiagnosticsSources();
   }
   return serviceFetch<DiagnosticsSourcesResponse>(baseUrl, "/diagnostics/sources");
 }
 
 export async function loadDiagnosticsDataGaps(baseUrl: string): Promise<DiagnosticsDataGapsResponse> {
   if (!isTauriRuntime()) {
-    return mockDiagnosticsDataGaps();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockDiagnosticsDataGaps();
   }
   return serviceFetch<DiagnosticsDataGapsResponse>(baseUrl, "/diagnostics/data-gaps");
 }
@@ -433,7 +437,8 @@ export async function validateConditionExpression(
   mode: "entry" | "exit" = "entry"
 ): Promise<ConditionValidationResult> {
   if (!isTauriRuntime()) {
-    return mockConditionValidation(text, mode);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockConditionValidation(text, mode);
   }
   return serviceFetch<ConditionValidationResult>(baseUrl, "/strategy/conditions/validate", { text, mode });
 }
@@ -441,14 +446,16 @@ export async function validateConditionExpression(
 export async function validateStockSymbols(baseUrl: string, symbols: string[]): Promise<StockSymbolValidationResult> {
   const normalizedSymbols = symbols.map((symbol) => symbol.trim()).filter(Boolean);
   if (!isTauriRuntime()) {
-    return mockStockSymbolValidation(normalizedSymbols);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockStockSymbolValidation(normalizedSymbols);
   }
   return serviceFetch<StockSymbolValidationResult>(baseUrl, "/symbols/validate", { symbols: normalizedSymbols });
 }
 
 export async function loadRecommendedStrategies(baseUrl: string): Promise<RecommendedStrategiesResponse> {
   if (!isTauriRuntime()) {
-    return mockRecommendedStrategies();
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockRecommendedStrategies();
   }
   return serviceFetch<RecommendedStrategiesResponse>(baseUrl, "/strategy/recommended");
 }
@@ -460,7 +467,8 @@ export async function loadDailyBarsCoverage(
   endDate: string
 ): Promise<DailyBarsCoverageResponse> {
   if (!isTauriRuntime()) {
-    return mockDailyBarsCoverage(symbols, startDate, endDate);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockDailyBarsCoverage(symbols, startDate, endDate);
   }
   return serviceFetch<DailyBarsCoverageResponse>(baseUrl, "/coverage/daily-bars", {
     symbols,
@@ -476,7 +484,8 @@ export async function fetchDailyBars(
   endDate: string
 ): Promise<FetchResult> {
   if (!isTauriRuntime()) {
-    return mockFetchDailyBarsResult(symbols, startDate, endDate);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockFetchDailyBarsResult(symbols, startDate, endDate);
   }
   return serviceFetch<FetchResult>(
     baseUrl,
@@ -497,7 +506,8 @@ export async function fetchCapitalFlow(
   endDate: string
 ): Promise<FetchResult> {
   if (!isTauriRuntime()) {
-    return mockFetchCapitalFlowResult(symbols, startDate, endDate);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockFetchCapitalFlowResult(symbols, startDate, endDate);
   }
   return serviceFetch<FetchResult>(
     baseUrl,
@@ -513,7 +523,8 @@ export async function fetchCapitalFlow(
 
 export async function importDailyBars(baseUrl: string, source: "sample" | "file", path?: string): Promise<ImportResult> {
   if (!isTauriRuntime()) {
-    return mockImportDailyBarsResult(source, path);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockImportDailyBarsResult(source, path);
   }
   return serviceFetch<ImportResult>(baseUrl, "/import/daily-bars", { source, path }, { timeoutMs: LONG_RUNNING_SERVICE_TIMEOUT_MS });
 }
@@ -525,7 +536,8 @@ export async function startFullMarketSync(
   symbols?: string[]
 ): Promise<{ job: SyncJobStatus }> {
   if (!isTauriRuntime()) {
-    return mockStartFullMarketSync(startDate, endDate, symbols);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockStartFullMarketSync(startDate, endDate, symbols);
   }
   return serviceFetch<{ job: SyncJobStatus }>(
     baseUrl,
@@ -539,16 +551,53 @@ export async function startFullMarketSync(
   );
 }
 
+/** 「只补缺口」：以缺口为基准的补齐入口（§9）。后端用 incomplete_symbols
+ * 计算窗口内不完整的股票名单，只对名单发起抓取，不做全量扫描。 */
+export type MissingOnlySyncResponse = {
+  started: boolean;
+  reason?: string;
+  missing_symbols: number;
+  start_date: string;
+  end_date: string;
+  job?: SyncJobStatus;
+};
+
+export async function startMissingOnlySync(
+  baseUrl: string,
+  startDate: string,
+  endDate: string
+): Promise<MissingOnlySyncResponse> {
+  if (!isTauriRuntime()) {
+    const mocks = await previewApiMocks();
+    if (mocks) {
+      const mock = await mocks.mockStartFullMarketSync(startDate, endDate);
+      return { started: true, missing_symbols: mock.job.total_symbols, start_date: startDate, end_date: endDate, job: mock.job };
+    }
+    throw new BackendError("no_local_data", "本地数据服务未连接（当前不是桌面端运行环境）。");
+  }
+  return serviceFetch<MissingOnlySyncResponse>(
+    baseUrl,
+    "/sync/missing-only",
+    {
+      start_date: startDate,
+      end_date: endDate
+    },
+    { timeoutMs: LONG_RUNNING_SERVICE_TIMEOUT_MS }
+  );
+}
+
 export async function loadSyncJob(baseUrl: string, jobId: string): Promise<{ job: SyncJobStatus }> {
   if (!isTauriRuntime()) {
-    return mockLoadSyncJob(jobId);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockLoadSyncJob(jobId);
   }
   return serviceFetch<{ job: SyncJobStatus }>(baseUrl, `/sync/jobs/${jobId}`);
 }
 
 export async function cancelSyncJob(baseUrl: string, jobId: string): Promise<{ job: SyncJobStatus }> {
   if (!isTauriRuntime()) {
-    return mockCancelSyncJob(jobId);
+    const mocks = await previewApiMocks();
+    if (mocks) return mocks.mockCancelSyncJob(jobId);
   }
   return serviceFetch<{ job: SyncJobStatus }>(baseUrl, `/sync/jobs/${jobId}/cancel`, {});
 }
@@ -561,12 +610,16 @@ export async function runBacktestStreamWithDataService(
   options: StreamRequestOptions = {}
 ): Promise<BacktestResult> {
   if (!isTauriRuntime()) {
-    handlers.onPhase?.("校验参数");
-    handlers.onPhase?.("读取本地数据");
-    handlers.onProgress?.({ message: "扫描 2024-01-05：候选 1 只，持仓 0 只" });
-    handlers.onTrade?.(demoBacktestResult.trades[0]);
-    handlers.onResult?.(demoBacktestResult);
-    return demoBacktestResult;
+    const mocks = await previewApiMocks();
+    if (mocks) {
+      handlers.onPhase?.("校验参数");
+      handlers.onPhase?.("读取本地数据");
+      handlers.onProgress?.({ message: "扫描 2024-01-05：候选 1 只，持仓 0 只" });
+      handlers.onTrade?.(mocks.demoBacktestResult.trades[0]);
+      handlers.onResult?.(mocks.demoBacktestResult);
+      return mocks.demoBacktestResult;
+    }
+    throw new BackendError("no_local_data", "本地数据服务未连接（当前不是桌面端运行环境）。");
   }
 
   let finalResult: BacktestResult | null = null;

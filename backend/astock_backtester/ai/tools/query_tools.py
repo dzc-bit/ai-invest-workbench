@@ -50,6 +50,28 @@ def _statement_allowed(sql: str) -> bool:
     return sql.lstrip().lower().startswith(("select", "with"))
 
 
+def _warehouse_as_of(backend: AiBackend) -> str:
+    """Latest date present in the warehouse, as ``YYYY-MM-DD`` ("" when empty).
+
+    Local warehouse numbers are history: without this stamp the model presents
+    a stale close as if it were the current quote (realtime-first discipline).
+    """
+    try:
+        coverage = backend.coverage_snapshot()
+    except Exception:  # noqa: BLE001
+        return ""
+    for item in coverage:
+        if getattr(item, "dataset", "") == "daily_bars" and getattr(item, "end_date", None):
+            return str(item.end_date)
+    return ""
+
+
+def _staleness_suffix(as_of: str) -> str:
+    if not as_of:
+        return ""
+    return f"（本地数据仓截止 {as_of}，非实时）"
+
+
 def build_query_tools(backend: AiBackend) -> list[AiTool]:
     def query_warehouse_sql(args: dict[str, Any]) -> dict[str, Any]:
         sql = str(args.get("sql", "")).strip().rstrip(";")
@@ -85,14 +107,24 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
             for key, value in row.items():
                 if isinstance(value, (pd.Timestamp, date)):
                     row[key] = str(value)[:10]
-        return {"ok": True, "rows": data, "row_count": len(data), "truncated": truncated}
+        as_of = _warehouse_as_of(backend)
+        return {
+            "ok": True,
+            "rows": data,
+            "row_count": len(data),
+            "truncated": truncated,
+            "as_of_date": as_of or None,
+            "is_realtime": False,
+            "note": "本地数据仓为历史数据，不反映当前盘中行情" if as_of else "",
+        }
 
     def summarize_sql(payload: dict[str, Any]) -> str:
         if not payload.get("ok"):
             return f"查询失败：{payload.get('error')}"
         rows = payload.get("rows", [])
+        as_of_note = _staleness_suffix(str(payload.get("as_of_date") or ""))
         if not rows:
-            return "查询成功：0 行"
+            return f"查询成功：0 行{as_of_note}"
         retained = retain_rows(rows, max_rows=25)
         # 回填保留元数据：agent 据此告诉模型"还有 M 行，用 read_tool_result 从 offset=K 续读"。
         payload["shown_rows"] = retained.kept
@@ -103,7 +135,7 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
             if payload.get("truncated")
             else ""
         )
-        return f"查询成功 {payload.get('row_count')} 行：\n{retained.text}{note}"
+        return f"查询成功 {payload.get('row_count')} 行{as_of_note}：\n{retained.text}{note}"
 
     def compute_stock_stats(args: dict[str, Any]) -> dict[str, Any]:
         symbol = normalize_symbol(str(args.get("symbol", "")))
@@ -137,13 +169,15 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
             "avg_turnover_rate": round(float(frame["turnover_rate"].mean()), 4) if "turnover_rate" in frame else None,
             "main_net_inflow_sum": round(float(frame["main_net_inflow"].sum()), 2) if "main_net_inflow" in frame else None,
         }
-        return {"ok": True, "stats": stats}
+        return {"ok": True, "stats": stats, "is_realtime": False, "as_of_date": stats["end"]}
 
     def summarize_stats(payload: dict[str, Any]) -> str:
         stats = payload.get("stats", {})
+        as_of = _staleness_suffix(str(stats.get("end") or ""))
         return (
-            f"{stats.get('symbol')} {stats.get('name')} 近 {stats.get('window_days')} 个交易日："
-            f"区间收益 {stats.get('total_return_pct', 0):+.2%}，年化波动 {stats.get('annualized_volatility_pct') or '--'}，"
+            f"{stats.get('symbol')} {stats.get('name')} 近 {stats.get('window_days')} 个交易日"
+            f"{as_of}：区间收益 {stats.get('total_return_pct', 0):+.2%}，"
+            f"年化波动 {stats.get('annualized_volatility_pct') or '--'}，"
             f"最大回撤 {stats.get('max_drawdown_pct', 0):.2%}，主力净流入合计 {stats.get('main_net_inflow_sum')}"
         )
 

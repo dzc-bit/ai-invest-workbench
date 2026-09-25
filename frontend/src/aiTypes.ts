@@ -98,21 +98,35 @@ export const AI_API_STYLE_LABELS: Record<AiApiStyle, string> = {
   anthropic: "Anthropic Messages"
 };
 
-export const AI_RESEARCH_STYLES: Array<{ value: AiResearchStyle; label: string; description: string }> = [
+export type AiResearchStyleMeta = {
+  value: AiResearchStyle;
+  label: string;
+  description: string;
+  /** 一句示例口吻：用户切换前就能预览"这个人怎么说话"。 */
+  sample: string;
+};
+
+export const AI_RESEARCH_STYLES: AiResearchStyleMeta[] = [
   {
     value: "conservative",
     label: "保守 · 防御型",
-    description: "低波动、高股息、低估值为先，强调回撤控制与流动性，警惕题材连板。"
+    description:
+      "审计出身的老派防御投资人：本金安全优先，先给否决理由再给条件放行；必查回撤、估值分位与流动性，禁用打板/卡位/满仓等进攻词汇。",
+    sample: "结论：回避。下行风险三条：跌破 20 日线放量、解禁盘压力、流动性塌缩；在收盘站稳 5 日线之前，我不动。"
   },
   {
     value: "balanced",
     label: "均衡 · 默认",
-    description: "基本面/资金面/技术面三线均衡，右侧交易为主，守正出奇。"
+    description:
+      "对照式研究员：每条多头证据紧跟一条空头反驳，结论从对照里长出来；常用设问与“对价”句式，最后必落观望/偏多/偏空三选一。",
+    sample: "多头看资金连续 3 日净流入，但空头会指出量价背离；这个位置的赔率够不够？观望，跌破 10 日线倒向偏空。"
   },
   {
     value: "aggressive",
     label: "激进 · 进攻型",
-    description: "情绪周期与龙头战法视角，聚焦主线题材与连板梯队（高风险，附纪律提示）。"
+    description:
+      "龙头选手视角：短句快节奏，只判断情绪周期位置、梯队与辨识度，给出打板/低吸/半路三选一与断板预案；不作持有型建议（高风险）。",
+    sample: "看梯队：最高板 6，晋级率塌到 35%，退潮期——高标不接力，只看卡位低吸；断板即走，仓位减半。"
   }
 ];
 
@@ -177,6 +191,32 @@ export type AiReportMeta = {
 
 export type AiReportsResponse = {
   items: AiReportMeta[];
+};
+
+export type AiMemoryCategory = "risk_preference" | "watchlist" | "holding" | "style" | "strategy" | "fact";
+
+export const AI_MEMORY_CATEGORY_LABELS: Record<string, string> = {
+  risk_preference: "风险偏好",
+  watchlist: "关注标的",
+  holding: "持仓",
+  style: "交易风格",
+  strategy: "策略参数",
+  fact: "其他事实"
+};
+
+export type AiMemoryRecord = {
+  id: string;
+  category: AiMemoryCategory | string;
+  content: string;
+  weight: number;
+  hits: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AiMemoriesResponse = {
+  items: AiMemoryRecord[];
+  rejected_market_facts_total?: number;
 };
 
 export type AiOverfitFinding = {
