@@ -19,6 +19,7 @@ from astock_backtester.ai.tools.registry import AiTool
 from astock_backtester.backtest_runner import run_configured_backtest
 from astock_backtester.condition_parser import validate_condition_text, validate_exit_condition_text
 from astock_backtester.data.symbols import normalize_symbol
+from astock_backtester.data.trading_calendar import a_share_trade_dates
 from astock_backtester.indicators import add_moving_average
 from astock_backtester.models import (
     BacktestSettings,
@@ -32,6 +33,25 @@ BACKTEST_WARMUP_CALENDAR_DAYS = 120
 MAX_BACKTEST_SYMBOLS = 50
 MAX_BACKTEST_RANGE_DAYS = 366
 MAX_CONDITION_EXPRESSIONS = 6
+
+
+def _trading_days_since(last_date: str) -> int:
+    """Trading days between ``last_date`` and today (0 = today's data present)."""
+    try:
+        start = pd.Timestamp(last_date).date()
+    except (TypeError, ValueError):
+        return 0
+    today = date.today()
+    if start >= today:
+        return 0
+    return len(a_share_trade_dates(start + timedelta(days=1), today))
+
+
+def _staleness_note(last_date: str, lag_days: int) -> str:
+    """Human wording that makes "this is history, not live" unmissable."""
+    if lag_days <= 0:
+        return f"截止 {last_date}（当日）"
+    return f"截止 {last_date}，距今天 {lag_days} 个交易日，非实时"
 
 
 class AiBackend(Protocol):
@@ -279,7 +299,19 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
                 }
             )
         name = str(frame.iloc[0].get("stock_name") or symbol)
-        return {"ok": True, "symbol": symbol, "name": name, "rows": rows}
+        last_date = str(rows[-1]["trade_date"])[:10]
+        # 数据时效必须显式带出：本地仓最新日期通常早于今天，模型若不知道
+        # 截止日，会把几天前的收盘价当成"现在"讲（红线：不得伪装实时）。
+        lag_days = _trading_days_since(last_date)
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "name": name,
+            "as_of_date": last_date,
+            "staleness": _staleness_note(last_date, lag_days),
+            "is_realtime": False,
+            "rows": rows,
+        }
 
     def summarize_bars(payload: dict[str, Any]) -> str:
         rows = payload.get("rows", [])
@@ -300,8 +332,10 @@ def build_local_tools(backend: AiBackend) -> list[AiTool]:
         payload["shown_rows"] = retained.kept
         payload["more_rows"] = retained.omitted
         payload["resume_offset"] = retained.resume_offset
+        staleness = payload.get("staleness") or ""
         return (
-            f"{payload.get('symbol')} {payload.get('name')} 最近 {len(rows)} 个交易日："
+            f"{payload.get('symbol')} {payload.get('name')} 本地数据仓最近 {len(rows)} 个交易日"
+            f"（{staleness}）："
             f"最新收盘 {last_close}，MA5 {last.get('ma5')} / MA10 {last.get('ma10')} / MA20 {last.get('ma20')}，"
             f"区间 {range_pct:+.2f}%\n{retained.text}"
         )

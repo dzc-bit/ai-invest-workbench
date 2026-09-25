@@ -1645,6 +1645,12 @@ class TestAShareMarketSymbol:
     def test_beijing(self):
         assert a_share_market_symbol("430047") == "bj430047"
         assert a_share_market_symbol("830799") == "bj830799"
+        # 920xxx 是北交所新代码段：腾讯/新浪对 sh920xxx 一律 none_match，
+        # 旧的全量 9->sh 规则曾让北交所股票的实时行情与资金流整段缺失。
+        assert a_share_market_symbol("920171") == "bj920171"
+        assert a_share_market_symbol("920002") == "bj920002"
+        # 900xxx 仍是沪 B。
+        assert a_share_market_symbol("900901") == "sh900901"
 
     def test_invalid(self):
         assert a_share_market_symbol("") is None

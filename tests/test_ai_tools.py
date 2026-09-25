@@ -303,6 +303,76 @@ def test_stock_valuation_parses_tencent_payload(monkeypatch):
     assert "贵州茅台" in execution.summary
 
 
+def test_realtime_stock_detail_flags_limit_status_and_range(monkeypatch):
+    """实时个股快照必须带涨跌停判定与当日分位，这是"实时优先"的个股读数。"""
+    def make_line(*, price: str, high: str, low: str, limit_up: str, limit_down: str) -> str:
+        fields = ["0"] * 53
+        fields[1] = "测试股"
+        fields[3] = price
+        fields[4] = "10.00"
+        fields[5] = "10.10"
+        fields[30] = "20260925103000"
+        fields[31] = "0.10"
+        fields[32] = "1.00"
+        fields[33] = high
+        fields[34] = low
+        fields[37] = "8000"
+        fields[38] = "1.5"
+        fields[43] = "5.0"
+        fields[44] = "100.0"
+        fields[45] = "120.0"
+        fields[47] = limit_up
+        fields[48] = limit_down
+        fields[49] = "2.5"
+        return 'v_sh600519="' + "~".join(fields) + '"'
+
+    lines = [
+        make_line(price="11.00", high="11.00", low="10.10", limit_up="11.00", limit_down="9.00"),
+        make_line(price="10.50", high="11.00", low="10.10", limit_up="11.00", limit_down="9.00"),
+        make_line(price="9.00", high="10.90", low="9.00", limit_up="11.00", limit_down="9.00"),
+    ]
+    payload_text = ";\n".join(
+        f"v_sh60051{i}={line}" for i, line in enumerate([line.split('"')[1] for line in lines])
+    )
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        content = payload_text.encode("gbk")
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(astock_data_tools, "create_scraping_session", lambda: FakeSession())
+    registry = ToolRegistry()
+    registry.register_all(build_astock_data_tools())
+    execution = registry.execute(
+        "realtime_stock_detail", '{"symbols": ["600519"]}'
+    )
+    assert execution.ok is False  # 请求 3 只代码但 fake 只覆盖 1 个 key，返回空 → 失败路径也受控
+
+    # 用同 key 的三段拼接不可行（腾讯协议一行一只），改为逐次单只验证。
+    statuses = []
+    summaries = []
+    for line in lines:
+        FakeResponse.content = line.encode("gbk")
+        execution = registry.execute("realtime_stock_detail", '{"symbols": ["600519"]}')
+        assert execution.ok is True
+        quote = execution.payload["quotes"][0]
+        statuses.append(quote["limit_status"])
+        summaries.append(execution.summary)
+        if quote["limit_status"] == "":
+            assert quote["intraday_position"] is not None
+    assert statuses[0] == "涨停"
+    assert "炸板" in statuses[1]
+    assert statuses[2] == "跌停"
+    assert "涨停" in summaries[0]
+    assert "跌停" in summaries[2]
+    assert "区间" in summaries[1]
+
+
 def test_research_reports_and_pools_handle_failure(monkeypatch):
     def failing_em_get(url, **kwargs):
         raise RuntimeError("blocked")

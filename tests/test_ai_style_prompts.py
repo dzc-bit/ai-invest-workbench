@@ -245,6 +245,28 @@ def test_core_rules_keep_discipline_stricter_than_any_style():
     assert "确定性承诺词" in CORE_RULES
 
 
+def test_core_rules_require_realtime_first_for_current_market():
+    """本地数据仓是历史数据：当前行情必须走实时通道，且历史数字必须带截止日。
+
+    背景：数据仓同步有延迟（停牌/退市股更旧），模型曾把几天前的收盘价当成
+    "现在"讲。这条守卫锁住三件事：实时工具优先、本地数据必须标截止日、
+    实时不可用不得用历史数据伪装。
+    """
+    for marker in ("实时", "realtime_market_snapshot", "realtime_stock_detail", "limit_up_pool"):
+        assert marker in CORE_RULES, f"CORE_RULES 缺少实时通道要求：{marker}"
+    # 本地数据仓的角色边界与时效标注
+    assert "历史数据" in CORE_RULES
+    assert "截止日期" in CORE_RULES
+    # 失败语义：不得伪装实时
+    assert "实时数据不可用" in CORE_RULES
+    assert "包装成实时" in CORE_RULES
+    # 三个风格的取证清单也必须指向实时通道（工具名是出口无关的中性词）。
+    for style in STYLES:
+        block = STYLE_PROMPTS[style]
+        assert "realtime_market_snapshot" in block, f"{style} 取证清单缺少实时盘面工具"
+        assert "realtime_stock_detail" in block, f"{style} 取证清单缺少实时个股工具"
+
+
 def test_insight_template_has_no_unescaped_json_placeholder_trap():
     """提示词含字面 JSON 时必须 {{ }} 转义（str.format 会把 {\"content\": ...}
     当占位符，项目踩过）。这里直接 format 一遍验证不抛 KeyError/IndexError。"""

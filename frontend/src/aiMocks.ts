@@ -23,6 +23,7 @@ export function mockAiStatus(): AiStatus {
     insights_enabled: true,
     tool_names: [
       "realtime_market_snapshot",
+      "realtime_stock_detail",
       "market_news",
       "market_briefing",
       "risk_alerts",

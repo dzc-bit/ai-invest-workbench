@@ -53,8 +53,11 @@ def today_context(now: datetime | None = None) -> str:
     local = now or datetime.now(BEIJING_TZ)
     return (
         f"## 当前时间\n今天是 {local:%Y-%m-%d}（{_WEEKDAY_NAMES[local.weekday()]}，北京时间）。"
-        "“今天/昨天/近期”一律以此为基准；本地数据仓的最新交易日必须用工具确认"
-        "（realtime_market_snapshot 或 query_warehouse_sql），不要凭日期推断行情。"
+        "“今天/昨天/近期”一律以此为基准。\n"
+        "**行情必须走实时通道**：本地数据仓是历史数据（最新日期通常早于今天），"
+        "回答任何“现在/今天/盘中”的行情问题前先调用 realtime_market_snapshot（指数/红绿家数/强势板块）"
+        "与 realtime_stock_detail（个股实时价、量比、涨跌停状态）；limit_up_pool 提供涨停/炸板/跌停池。"
+        "本地数据仓只用于历史区间、横截面筛选与回测，引用其数字时必须写出数据截止日期并说明非实时。"
     )
 
 

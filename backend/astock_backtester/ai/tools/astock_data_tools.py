@@ -116,6 +116,32 @@ def _fmt_zt_time(value: Any) -> str:
     return f"{digits[0:2]}:{digits[2:4]}:{digits[4:6]}"
 
 
+def _limit_status(price: float, limit_up: float | None, limit_down: float | None, high: float | None) -> str:
+    """Classify a quote against its limit prices.
+
+    ``limit_up``/``limit_down`` come from the exchange-published bounds in the
+    Tencent payload, so this is a direct comparison — no heuristic board-size
+    math that would break on ST (5%) or Beijing (30%) names.
+    """
+    if price <= 0:
+        return "停牌/无成交"
+    if limit_up and price >= limit_up:
+        return "涨停"
+    if limit_down and price <= limit_down:
+        return "跌停"
+    if limit_up and high and high >= limit_up:
+        # 盘中触及涨停但未封住，即"炸板"。
+        return "炸板（盘中触及涨停后回落）"
+    return ""
+
+
+def _intraday_position(price: float, high: float | None, low: float | None) -> float | None:
+    """Where the price sits inside today's range: 1.0 = at high, 0.0 = at low."""
+    if not price or high is None or low is None or high <= low:
+        return None
+    return round((price - low) / (high - low), 3)
+
+
 def fetch_tencent_quotes(raw_symbols: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
     """Batch Tencent realtime valuation quotes. Returns (quotes, diagnostics)."""
     prefixed: list[str] = []
@@ -158,22 +184,36 @@ def fetch_tencent_quotes(raw_symbols: list[str]) -> tuple[list[dict[str, Any]], 
         price = _num(values, 3) or 0.0
         last_close = _num(values, 4) or 0.0
         amount_wan = _num(values, 37) or 0.0
+        high = _num(values, 33)
+        low = _num(values, 34)
+        limit_up = _num(values, 47)
+        limit_down = _num(values, 48)
         stale = amount_wan == 0 and price == last_close and price > 0
         quotes.append(
             {
                 "symbol": code,
                 "name": values[1],
                 "price": price,
+                "prev_close": last_close or None,
+                "open": _num(values, 5),
+                "high": high,
+                "low": low,
+                "change": _num(values, 31),
                 "change_pct": _num(values, 32),
+                "amplitude_pct": _num(values, 43),
                 "turnover_pct": _num(values, 38),
+                "amount_wan": amount_wan or None,
                 "pe_ttm": _num(values, 39),
                 "float_mcap_yi": _num(values, 44),
                 "total_mcap_yi": _num(values, 45),
                 "pb": _num(values, 46),
-                "limit_up": _num(values, 47),
-                "limit_down": _num(values, 48),
+                "limit_up": limit_up,
+                "limit_down": limit_down,
                 "vol_ratio": _num(values, 49),
                 "pe_static": _num(values, 52),
+                "quote_time": values[30] if len(values) > 30 else None,
+                "limit_status": _limit_status(price, limit_up, limit_down, high),
+                "intraday_position": _intraday_position(price, high, low),
                 "is_stale": stale,
                 "stale_reason": "成交量为 0（停牌/未开盘/废码），非当日真实成交" if stale else "",
             }
@@ -379,6 +419,43 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
             )
         return "\n".join(lines)
 
+    def realtime_stock_detail(args: dict[str, Any]) -> dict[str, Any]:
+        """One call that answers "this stock right now" without touching the warehouse."""
+        raw_symbols = [str(s) for s in args.get("symbols", [])][:8]
+        if not raw_symbols:
+            return {"ok": False, "error": "symbols 不能为空"}
+        try:
+            quotes, diagnostics = fetch_tencent_quotes(raw_symbols)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc), "diagnostics": []}
+        if not quotes:
+            return {
+                "ok": False,
+                "error": "实时行情未返回有效数据（代码不可识别或全部停牌）。",
+                "diagnostics": diagnostics,
+            }
+        return {"ok": True, "quotes": quotes, "diagnostics": diagnostics}
+
+    def summarize_realtime_detail(payload: dict[str, Any]) -> str:
+        lines: list[str] = []
+        for quote in payload.get("quotes", []):
+            limit = f"，{quote['limit_status']}" if quote.get("limit_status") else ""
+            stale = "（无成交：停牌或未开盘）" if quote.get("is_stale") else ""
+            position = quote.get("intraday_position")
+            position_text = (
+                f"，位于当日区间 {position * 100:.0f}% 分位" if isinstance(position, (int, float)) else ""
+            )
+            lines.append(
+                f"- {quote.get('symbol')} {quote.get('name')}{stale}：{quote.get('price')} "
+                f"({quote.get('change_pct'):+.2f}%){limit}，"
+                f"开 {quote.get('open')} / 高 {quote.get('high')} / 低 {quote.get('low')}"
+                f"{position_text}，成交额 {quote.get('amount_wan')} 万，"
+                f"量比 {quote.get('vol_ratio')}，换手 {quote.get('turnover_pct')}%，"
+                f"总市值 {quote.get('total_mcap_yi')} 亿"
+            )
+        head = f"实时个股快照（腾讯公开行情，{len(payload.get('quotes', []))} 只）："
+        return head + "\n" + "\n".join(lines)
+
     def compare_stocks(args: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = [str(s) for s in args.get("symbols", [])][:6]
         if len(raw_symbols) < 2:
@@ -425,6 +502,29 @@ def build_astock_data_tools(backend: AiBackend | None = None) -> list[AiTool]:
         return "\n".join(lines)
 
     return [
+        AiTool(
+            name="realtime_stock_detail",
+            description=(
+                "查询个股**当前**实时盘面（腾讯公开行情，不读本地数据仓）：现价、涨跌幅、开高低、"
+                "当日区间分位、成交额、量比、换手率、市值，以及涨停/跌停/炸板状态与停牌识别。"
+                "行情类问题（现在怎么样/今天强不强/是不是涨停/放量没有）先调用本工具；"
+                "本地数据仓只用于历史区间与回测。最多 8 只。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "symbols": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "最多 8 个 6 位代码，如 600519",
+                    },
+                },
+                "required": ["symbols"],
+            },
+            executor=realtime_stock_detail,
+            summarizer=summarize_realtime_detail,
+            digest_chars=2_600,
+        ),
         AiTool(
             name="stock_valuation",
             description="批量查询 A 股实时估值：现价、涨跌幅、PE(TTM)/静态、PB、总市值/流通市值、换手率、涨跌停价（腾讯财经公开接口）。",

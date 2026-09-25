@@ -156,11 +156,17 @@ class ADataProvider:
 class HttpAStockProvider:
     name: str = "http"
 
+    def __post_init__(self) -> None:
+        # 复用同一个 adapter：它内部带"东财增强连续失败就熔断"的计数器，
+        # 每只股票新建一个 adapter 会让计数永远归零，全市场补齐时每只票都要
+        # 重新等满超时（实测 5528 只从分钟级拖到数小时）。
+        self._adapter = AStockDataAdapter.from_http_sources()
+
     def list_symbols(self) -> list[str]:
         return []
 
     def fetch_daily_bars(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        frame = AStockDataAdapter.from_http_sources().fetch_daily_bars([symbol], start_date, end_date)
+        frame = self._adapter.fetch_daily_bars([symbol], start_date, end_date)
         if frame.empty:
             return frame
         frame["source"] = self.name
