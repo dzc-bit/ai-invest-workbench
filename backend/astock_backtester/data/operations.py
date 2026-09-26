@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any
@@ -8,13 +9,16 @@ from typing import Any
 import pandas as pd
 
 from astock_backtester.data.cache import LocalCache
+from astock_backtester.data.filelock import FileLockTimeout
 from astock_backtester.data.importer import normalize_daily_bars
 from astock_backtester.data.trading_calendar import a_share_trade_dates
 from astock_backtester.data.warehouse import (
-    KNOWN_CAPITAL_FLOW_LISTING_LAG_DAYS,
     KNOWN_CAPITAL_FLOW_SOURCE_GAP_DATES,
+    MarketDayClassification,
     Warehouse,
+    classify_market_days_by_cross_section,
     lifecycle_bound,
+    uses_listing_day_capital_flow_source_start,
     uses_symbol_capital_flow_source_start,
 )
 from astock_backtester.models import (
@@ -30,6 +34,42 @@ DailyBarsFetcher = Callable[[Sequence[str], str, str], pd.DataFrame]
 CapitalFlowFetcher = Callable[[Sequence[str], str, str], dict[str, Any]]
 logger = logging.getLogger(__name__)
 
+# 日线尾部断供阈值（A 股交易日数）。provider 只回窗口前半段时，该股最后一行距
+# effective_end_date 的交易日缺口会超过这个值；5 = 一个正常交易周，能容忍上游 1~3 天
+# 的常规滞后与小长假休市，又能把"半截窗口"判成 partial（与资金流侧的
+# date_coverage_shortfall 诊断同一 code，前端与 AI 复用同一套语义）。
+DAILY_BARS_TAIL_SHORTFALL_TRADE_DAYS = 5
+
+# 逐股缺口做停牌类剔除前，窗口至少要有这么多 A 股交易日：横截面中位数在
+# 三五天的窗口上抖动太大，分类结果不可信，此时退回平日历口径（旧行为）。
+MIN_TRADE_DAYS_FOR_SUSPENSION_CLASSIFICATION = 5
+
+# 跨进程写锁（LocalCache / Warehouse 的 CrossProcessFileLock，120s 超时）超时后的
+# 有界重试：抓取结果此刻还在内存里，锁持有者崩溃时 OS 会自动释放锁，短退避后再试
+# 一次就能避免整批数据被丢掉并变成 HTTP 400。3 次 = 首次 + 2 次重试，
+# 退避 0.5s/1.0s 线性递增（总等待 ≤ 1.5s，远小于锁本身的 120s 预算）。
+WRITE_LOCK_RETRY_ATTEMPTS = 3
+WRITE_LOCK_RETRY_BACKOFF_SECONDS = 0.5
+
+
+def _write_with_lock_retry(write: Callable[[], None]) -> None:
+    """执行一次写入，``FileLockTimeout`` 时有界短退避重试；其它异常原样上抛。"""
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            write()
+            return
+        except FileLockTimeout:
+            if attempt >= WRITE_LOCK_RETRY_ATTEMPTS:
+                raise
+            time.sleep(WRITE_LOCK_RETRY_BACKOFF_SECONDS * attempt)
+            logger.warning(
+                "daily-bars write lock is busy; retrying (%d/%d)",
+                attempt + 1,
+                WRITE_LOCK_RETRY_ATTEMPTS,
+            )
+
 
 def _date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) -> set[pd.Timestamp]:
     return a_share_trade_dates(start_date, end_date)
@@ -40,6 +80,100 @@ def effective_a_share_date_range(start_date: str, end_date: str) -> tuple[str, s
     if not trade_dates:
         return None
     return trade_dates[0].date().isoformat(), trade_dates[-1].date().isoformat()
+
+
+def _tail_coverage_shortfall(
+    frame: pd.DataFrame,
+    fetched_symbols: Sequence[str],
+    effective_end_date: str,
+    warehouse: Warehouse | None,
+) -> dict[str, pd.Timestamp]:
+    """返回尾部断供的股票：``{symbol: 该股最后一行日期}``。
+
+    provider 只返回窗口前半段时，该股最后一行距 ``effective_end_date`` 超过
+    ``DAILY_BARS_TAIL_SHORTFALL_TRADE_DAYS`` 个 A 股交易日 → 判定为部分成功。
+    lifecycle ``delisted_date``（口径=最后交易日）能解释的短尾不判缺口：已退市股
+    本来就停在那里。lifecycle 读不到时退回保守判定（照样算断供），与覆盖表的
+    无生命周期记录口径一致。
+    """
+    if frame.empty or not fetched_symbols:
+        return {}
+    normalized = frame[["symbol", "trade_date"]].copy()
+    normalized["symbol"] = normalized["symbol"].astype(str)
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"], errors="coerce")
+    normalized = normalized.dropna(subset=["symbol", "trade_date"])
+    if normalized.empty:
+        return {}
+    last_row_by_symbol = normalized.groupby("symbol")["trade_date"].max().to_dict()
+    candidates = [str(symbol) for symbol in fetched_symbols if str(symbol) in last_row_by_symbol]
+    if not candidates:
+        return {}
+    lifecycle_records: dict[str, dict[str, str | None]] = {}
+    if warehouse is not None:
+        try:
+            lifecycle_records = warehouse.read_symbol_lifecycle(candidates)
+        except Exception as exc:
+            logger.warning("symbol lifecycle read failed; tail shortfall keeps the conservative window: %s", exc)
+    window_end = pd.Timestamp(effective_end_date)
+    shortfall: dict[str, pd.Timestamp] = {}
+    for symbol in candidates:
+        last_row = pd.Timestamp(last_row_by_symbol[symbol])
+        delisted_date = lifecycle_bound(lifecycle_records.get(symbol), "delisted_date")
+        tail_end = window_end if delisted_date is None else min(window_end, delisted_date)
+        if tail_end <= last_row:
+            continue
+        trailing_trade_dates = a_share_trade_dates(last_row + pd.Timedelta(days=1), tail_end)
+        if len(trailing_trade_dates) > DAILY_BARS_TAIL_SHORTFALL_TRADE_DAYS:
+            shortfall[symbol] = last_row
+    return shortfall
+
+
+def _market_day_classification(
+    warehouse: Warehouse | None,
+    bars: pd.DataFrame,
+    requested_start_date: pd.Timestamp | None,
+    requested_end_date: pd.Timestamp | None,
+    derived_window_end: pd.Timestamp | None,
+) -> MarketDayClassification | None:
+    """窗口横截面分类（市场正常日 / thin day）；任何拿不到的情况都返回 ``None``，
+    调用方退回平日历口径（旧行为）。分类窗口取逐股覆盖窗口的并集，
+    保证每个 item 的 ``expected_dates`` 都落在分类覆盖的日期里。
+    """
+    if warehouse is None:
+        return None
+    window_start = requested_start_date if requested_start_date is not None else bars["trade_date"].min()
+    window_end = bars["trade_date"].max()
+    if derived_window_end is not None and derived_window_end > window_end:
+        window_end = derived_window_end
+    if requested_end_date is not None and requested_end_date > window_end:
+        window_end = requested_end_date
+    if pd.isna(window_start) or pd.isna(window_end) or window_end < window_start:
+        return None
+    if len(_date_range(window_start, window_end)) < MIN_TRADE_DAYS_FOR_SUSPENSION_CLASSIFICATION:
+        return None
+    try:
+        counts = warehouse.market_trade_date_counts(window_start.date().isoformat(), window_end.date().isoformat())
+        if not counts:
+            return None
+        # 0 行日不进横截面：market_trade_date_counts 按交易日历补 0，而 coverage()
+        # 与 sync 的计数都来自“有行日期”的 groupby——把 0 混进中位数会压低阈值，
+        # 让三个出口对同一天给出不同分类。0 行日不在任一集合里，逐股缺口按平日历
+        # 口径保留（0 行 < 任何阈值 → 可行动，与另两个出口行为一致）；全是 0 时
+        # 整体退回平日历口径。
+        positive_counts = {day: count for day, count in counts.items() if count > 0}
+        if not positive_counts:
+            return None
+        classification = classify_market_days_by_cross_section(positive_counts)
+    except Exception as exc:
+        logger.warning(
+            "market trade-date classification failed; per-symbol coverage falls back to the flat calendar: %s",
+            exc,
+            exc_info=True,
+        )
+        return None
+    if not classification.market_normal_days and not classification.thin_days:
+        return None
+    return classification
 
 
 def build_daily_bars_coverage(
@@ -105,6 +239,9 @@ def build_daily_bars_coverage(
             logger.warning(
                 "warehouse coverage scan failed; per-symbol coverage falls back to its own last row: %s", exc
             )
+    classification = _market_day_classification(
+        warehouse, bars, requested_start_date, requested_end_date, derived_window_end
+    )
     for symbol, frame in bars.groupby("symbol", sort=True):
         frame = frame.sort_values("trade_date")
         data_start_date = frame["trade_date"].min()
@@ -129,6 +266,16 @@ def build_daily_bars_coverage(
         else:
             expected_dates = set()
         missing_trade_dates = sorted(expected_dates - present_dates)
+        if classification is not None and missing_trade_dates:
+            # 与 Warehouse.coverage() 的 suspension_rows / missing_rows 分列口径对齐：
+            # 市场正常日的缺行是停牌类（公开渠道天然没有停牌 K 线，不可补），从逐股
+            # 缺口中剔除；thin day 缺日与停更尾部（缺日在该股最后一行之后，"多久没
+            # 同步"的可行动信号）必须保留。models.DailyBarsCoverageItem 不加字段，只过滤值。
+            missing_trade_dates = [
+                day
+                for day in missing_trade_dates
+                if day > data_end_date or day not in classification.market_normal_days
+            ]
         lifecycle_status = "unknown"
         if record is not None:
             lifecycle_status = "delisted" if delisted_date is not None else str(record.get("status") or "listed")
@@ -163,9 +310,9 @@ def import_daily_bars_into_cache(
     source: str,
     warehouse: Warehouse | None = None,
 ) -> DataOperationResult:
-    cache.write_daily_bars(frame)
+    _write_with_lock_retry(lambda: cache.write_daily_bars(frame))
     if warehouse is not None:
-        warehouse.write_daily_bars(frame)
+        _write_with_lock_retry(lambda: warehouse.write_daily_bars(frame))
     coverage = _safe_coverage(cache, warehouse)
     return DataOperationResult(
         status="ok",
@@ -259,9 +406,9 @@ def fetch_daily_bars_into_cache(
     if frame.empty:
         fetched_symbols: list[str] = []
     else:
-        cache.write_daily_bars(frame)
+        _write_with_lock_retry(lambda: cache.write_daily_bars(frame))
         if warehouse is not None:
-            warehouse.write_daily_bars(frame)
+            _write_with_lock_retry(lambda: warehouse.write_daily_bars(frame))
             derived_listings = derive_listing_dates_from_frame(frame)
             if derived_listings:
                 try:
@@ -274,10 +421,28 @@ def fetch_daily_bars_into_cache(
                 except Exception as exc:
                     logger.warning("symbol lifecycle upsert failed after daily-bars fetch: %s", exc)
         fetched_symbols = sorted(frame["symbol"].astype(str).unique().tolist())
+    tail_shortfalls = _tail_coverage_shortfall(frame, fetched_symbols, effective_end_date, warehouse)
+    for symbol, last_row in sorted(tail_shortfalls.items()):
+        diagnostics.append(
+            {
+                "code": "date_coverage_shortfall",
+                "symbol": symbol,
+                "source": "daily_bars_fetcher",
+                "start_date": effective_start_date,
+                "end_date": effective_end_date,
+                "last_trade_date": last_row.date().isoformat(),
+                "message": (
+                    f"Daily-bar fetch returned rows ending {last_row.date().isoformat()} for requested "
+                    f"{effective_start_date} to {effective_end_date}; tail is more than "
+                    f"{DAILY_BARS_TAIL_SHORTFALL_TRADE_DAYS} A-share trade days behind"
+                ),
+            }
+        )
     missing_symbols = sorted(
         {
             *(symbol for symbol in requested_symbols if symbol not in fetched_symbols),
             *capital_flow_missing_symbols,
+            *tail_shortfalls,
         }
     )
     if capital_flow_fetcher is not None and frame.empty:
@@ -539,9 +704,9 @@ def fetch_capital_flow_into_cache(
     if imported_rows > 0:
         frames_to_write = [item for item in [merged_frame, standalone_frame] if not item.empty]
         write_frame = normalize_daily_bars(pd.concat(frames_to_write, ignore_index=True))
-        cache.write_daily_bars(write_frame)
+        _write_with_lock_retry(lambda: cache.write_daily_bars(write_frame))
         if warehouse is not None:
-            warehouse.write_daily_bars(write_frame)
+            _write_with_lock_retry(lambda: warehouse.write_daily_bars(write_frame))
 
     missing_symbols = sorted(
         {
@@ -736,6 +901,11 @@ def _symbols_with_complete_capital_flow(
 
 
 def _uses_listing_day_capital_flow_source_start(data: pd.DataFrame, flow_start: pd.Timestamp) -> bool:
+    """从该股帧里取首行 ``listing_days``，判定规则委托给 warehouse 的公共函数。
+
+    规则本体（≤10 天 + 0~90 天源起点滞后）只有 warehouse 那一个家，这里只做
+    DataFrame → 标量的取数，供 ``_symbols_with_complete_capital_flow`` 使用。
+    """
     if "listing_days" not in data or data.empty:
         return False
     first_daily_date = data["trade_date"].dropna().min()
@@ -743,10 +913,9 @@ def _uses_listing_day_capital_flow_source_start(data: pd.DataFrame, flow_start: 
         return False
     first_rows = data.loc[data["trade_date"] == first_daily_date]
     listing_days = pd.to_numeric(first_rows["listing_days"], errors="coerce").dropna()
-    if listing_days.empty or listing_days.min() > 10:
+    if listing_days.empty:
         return False
-    lag_days = (pd.Timestamp(flow_start) - pd.Timestamp(first_daily_date)).days
-    return 0 <= lag_days <= KNOWN_CAPITAL_FLOW_LISTING_LAG_DAYS
+    return uses_listing_day_capital_flow_source_start(float(listing_days.min()), first_daily_date, flow_start)
 
 
 def _merge_capital_flow_from_fetcher(
@@ -1015,21 +1184,6 @@ def _merge_capital_flow_rows(
     out.loc[target_index, "main_net_inflow"] = flow.loc[target_index, "main_net_inflow"]
     fetched_symbols = sorted({str(symbol) for symbol, _date in target_index})
     return out.reset_index().sort_values(["symbol", "trade_date"]).reset_index(drop=True), int(len(target_index)), fetched_symbols
-
-
-def _count_merged_main_net_inflow(before: pd.DataFrame, after: pd.DataFrame, *, only_missing: bool) -> int:
-    if before.empty or after.empty:
-        return 0
-    left = normalize_daily_bars(before).set_index(["symbol", "trade_date"])
-    right = normalize_daily_bars(after).set_index(["symbol", "trade_date"])
-    common = left.index.intersection(right.index)
-    if common.empty:
-        return 0
-    before_values = left.loc[common, "main_net_inflow"]
-    after_values = right.loc[common, "main_net_inflow"]
-    if only_missing:
-        return int((before_values.isna() & after_values.notna()).sum())
-    return int(after_values.notna().sum())
 
 
 def _safe_coverage(cache: LocalCache, warehouse: Warehouse | None) -> list[DatasetCoverage]:

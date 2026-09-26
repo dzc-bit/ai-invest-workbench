@@ -1067,4 +1067,244 @@ describe("DataCenter", () => {
       expect.any(String)
     ));
   });
+
+  // —— 「补全缺失数据」资金流优先编排（DataCenter.runCapitalFlowFirstFullMarket）——
+
+  it("starts the full-market daily sync immediately when capital flow reports no gaps", async () => {
+    const user = setupUser();
+    // 无缺口 200 立即返回：没有 job → 编排应直接衔接 startFullMarketSync（POST /sync/full-market）。
+    apiMocks.fetchCapitalFlow.mockResolvedValue({
+      status: "ok",
+      imported_rows: 0,
+      returned_rows: 0,
+      requested_symbols: [],
+      fetched_symbols: [],
+      missing_symbols: [],
+      skipped_symbols: [],
+      coverage,
+      logs: [{ level: "info", message: "Capital-flow gaps already filled, nothing to backfill" }],
+      diagnostics: [{ code: "capital_flow_no_gaps", source: "capital_flow_crawler" }],
+      failures: []
+    });
+    // 让日线启动停留在 pending，便于断言「资金流无缺口」这条衔接 message 与调用顺序。
+    apiMocks.startFullMarketSync.mockReturnValue(new Promise(() => {}));
+
+    render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
+
+    await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
+    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+
+    await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalledWith(
+      "http://127.0.0.1:9011",
+      [],
+      "2026-06-01",
+      "2026-06-05"
+    ));
+    await waitFor(() => expect(apiMocks.startFullMarketSync).toHaveBeenCalledWith(
+      "http://127.0.0.1:9011",
+      "2026-06-01",
+      "2026-06-05"
+    ));
+    // 资金流必须先于全市场日线启动
+    expect(apiMocks.fetchCapitalFlow.mock.invocationCallOrder[0]).toBeLessThan(
+      apiMocks.startFullMarketSync.mock.invocationCallOrder[0]
+    );
+    expect(screen.getByRole("status", { name: "数据中心状态" })).toHaveTextContent("资金流无缺口");
+    expect(apiMocks.fetchDailyBars).not.toHaveBeenCalled();
+  });
+
+  it("waits for the capital-flow job to finish before starting the full-market sync", async () => {
+    const user = setupUser();
+    const flowJob = {
+      job_id: "flow-chain",
+      mode: "capital_flow_backfill",
+      status: "running",
+      total_symbols: 3,
+      completed_symbols: 1,
+      failed_symbols: 0,
+      processed_symbols: 1,
+      skipped_symbols: 0,
+      imported_rows: 4,
+      returned_rows: 6,
+      current_symbol: "000002",
+      start_date: "2026-06-01",
+      end_date: "2026-06-05",
+      errors: []
+    };
+    apiMocks.fetchCapitalFlow.mockResolvedValue({
+      status: "ok",
+      imported_rows: 0,
+      returned_rows: 0,
+      requested_symbols: [],
+      fetched_symbols: [],
+      missing_symbols: [],
+      skipped_symbols: [],
+      coverage,
+      logs: [{ level: "info", message: "Capital-flow backfill started for all symbols" }],
+      diagnostics: [{ code: "capital_flow_backfill_job_started", source: "capital_flow_crawler" }],
+      failures: [],
+      job: flowJob
+    });
+    // 在我们显式切换成 completed 之前，轮询始终返回 running，避免测试时序依赖真实 1 秒节拍。
+    apiMocks.loadSyncJob.mockResolvedValue({ job: { ...flowJob } });
+    apiMocks.startFullMarketSync.mockResolvedValue({
+      job: {
+        job_id: "full-market-chain",
+        mode: "full_market_bootstrap",
+        status: "completed",
+        total_symbols: 3,
+        completed_symbols: 3,
+        failed_symbols: 0,
+        processed_symbols: 3,
+        skipped_symbols: 0,
+        imported_rows: 30,
+        current_symbol: null,
+        start_date: "2026-06-01",
+        end_date: "2026-06-05",
+        errors: []
+      }
+    });
+
+    render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
+
+    await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
+    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "数据中心状态" })).toHaveTextContent("正在补齐全市场资金流")
+    );
+    // 资金流 job 在跑：全市场日线不得立即启动
+    expect(apiMocks.startFullMarketSync).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1100);
+    });
+    await waitFor(() => expect(apiMocks.loadSyncJob).toHaveBeenCalledWith("http://127.0.0.1:9011", "flow-chain"));
+    // job 仍是 running：依然不能启动
+    expect(apiMocks.startFullMarketSync).not.toHaveBeenCalled();
+
+    // 资金流 job 结束 → 轮询到 completed → 自动衔接全市场日线
+    apiMocks.loadSyncJob.mockResolvedValue({
+      job: { ...flowJob, status: "completed", completed_symbols: 3, processed_symbols: 3, current_symbol: null, imported_rows: 12 }
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1100);
+    });
+
+    await waitFor(() => expect(apiMocks.startFullMarketSync).toHaveBeenCalledWith(
+      "http://127.0.0.1:9011",
+      "2026-06-01",
+      "2026-06-05"
+    ));
+  });
+
+  it("keeps starting the full-market sync when the capital-flow fetch fails", async () => {
+    const user = setupUser();
+    apiMocks.fetchCapitalFlow.mockRejectedValue(new Error("capital-flow upstream disconnected"));
+    // 停留在 pending：日线启动的 startMessage（资金流失败文案）不会被新 job 进度覆盖。
+    apiMocks.startFullMarketSync.mockReturnValue(new Promise(() => {}));
+
+    render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
+
+    await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
+    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+
+    await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalledWith(
+      "http://127.0.0.1:9011",
+      [],
+      "2026-06-01",
+      "2026-06-05"
+    ));
+    // 资金流失败不得阻断日线补齐
+    await waitFor(() => expect(apiMocks.startFullMarketSync).toHaveBeenCalledWith(
+      "http://127.0.0.1:9011",
+      "2026-06-01",
+      "2026-06-05"
+    ));
+    const status = screen.getByRole("status", { name: "数据中心状态" });
+    expect(status).toHaveTextContent("资金流补齐失败，继续日线补齐");
+    expect(status).toHaveTextContent("capital-flow upstream disconnected");
+  });
+
+  it("does not start the full-market sync after the user cancels the capital-flow job", async () => {
+    const user = setupUser();
+    const flowJob = {
+      job_id: "flow-cancel",
+      mode: "capital_flow_backfill",
+      status: "running",
+      total_symbols: 3,
+      completed_symbols: 1,
+      failed_symbols: 0,
+      processed_symbols: 1,
+      skipped_symbols: 0,
+      imported_rows: 4,
+      returned_rows: 6,
+      current_symbol: "000002",
+      start_date: "2026-06-01",
+      end_date: "2026-06-05",
+      errors: []
+    };
+    apiMocks.fetchCapitalFlow.mockResolvedValue({
+      status: "ok",
+      imported_rows: 0,
+      returned_rows: 0,
+      requested_symbols: [],
+      fetched_symbols: [],
+      missing_symbols: [],
+      skipped_symbols: [],
+      coverage,
+      logs: [{ level: "info", message: "Capital-flow backfill started for all symbols" }],
+      diagnostics: [{ code: "capital_flow_backfill_job_started", source: "capital_flow_crawler" }],
+      failures: [],
+      job: flowJob
+    });
+    apiMocks.cancelSyncJob.mockResolvedValue({ job: { ...flowJob, status: "cancelling" } });
+    // 轮询时序确定化：取消动作发生前始终 running，发生后返回 cancelled。
+    apiMocks.loadSyncJob.mockImplementation(async () => ({
+      job:
+        apiMocks.cancelSyncJob.mock.calls.length > 0
+          ? { ...flowJob, status: "cancelled", current_symbol: null }
+          : { ...flowJob }
+    }));
+    apiMocks.startFullMarketSync.mockResolvedValue({
+      job: {
+        job_id: "full-market-should-not-start",
+        mode: "full_market_bootstrap",
+        status: "completed",
+        total_symbols: 3,
+        completed_symbols: 3,
+        failed_symbols: 0,
+        processed_symbols: 3,
+        skipped_symbols: 0,
+        imported_rows: 30,
+        current_symbol: null,
+        start_date: "2026-06-01",
+        end_date: "2026-06-05",
+        errors: []
+      }
+    });
+
+    render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
+
+    await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
+    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+
+    const stopButton = await screen.findByRole("button", { name: "停止任务" });
+    await user.click(stopButton);
+    await waitFor(() => expect(apiMocks.cancelSyncJob).toHaveBeenCalledWith("http://127.0.0.1:9011", "flow-cancel"));
+
+    // 轮询到 cancelled → job 结束分支：衔接标记已被「停止任务」清除，不得启动全市场日线
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1100);
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "数据中心状态" })).toHaveTextContent("资金流补齐已停止")
+    );
+
+    // 再等一轮，确认衔接不会迟到触发
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1100);
+    });
+    expect(apiMocks.startFullMarketSync).not.toHaveBeenCalled();
+  });
 });

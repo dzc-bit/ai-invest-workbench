@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelSyncJob,
   ensureDataService,
@@ -206,6 +206,9 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
   const [items, setItems] = useState<DailyBarsCoverageItem[]>([]);
   const [logs, setLogs] = useState<ServiceLogEntry[]>([]);
   const [syncJob, setSyncJob] = useState<SyncJobStatus | null>(null);
+  // 「补全缺失数据」的资金流优先编排：资金流 job 启动后置位，轮询到 job 结束时
+  // 消费它去自动衔接全市场日线同步；用户点「停止任务」时必须清掉，避免停止后又自动开跑。
+  const pendingFullMarketRef = useRef(false);
   const [message, setMessage] = useState("正在连接本地数据服务");
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [coverageRefreshToken, setCoverageRefreshToken] = useState(0);
@@ -449,7 +452,17 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
               : syncFinishedMessage(result.job)
           );
           if (!isSyncRunning(result.job)) {
-            await refreshAfterOperation(service);
+            // 先同步领取衔接标记再 await：防止区间回调重入时重复启动全市场任务。
+            const shouldChainFullMarket = pendingFullMarketRef.current && result.job.status !== "cancelled";
+            pendingFullMarketRef.current = false;
+            try {
+              await refreshAfterOperation(service);
+            } finally {
+              if (shouldChainFullMarket) {
+                // 衔接 message 只在 startFullMarketSync 返回前可见，随后被新 job 进度覆盖。
+                await runFullMarketSync("fetch", "资金流补齐结束，继续补全全市场缺失数据");
+              }
+            }
           }
         })
         .catch((error: Error) => {
@@ -481,12 +494,46 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     }
   };
 
+  // 「补全缺失数据」全市场路径：资金流补齐速度快，先跑资金流，结束后自动衔接全市场日线。
+  // 三种出口：①资金流返回 running job → 置位 pendingFullMarketRef，交给 syncJob 轮询结束时衔接；
+  // ②资金流无缺口立即返回（无 job）→ 直接启动日线；③资金流失败 → 不阻断，照样启动日线。
+  // 取消语义：handleCancelSyncJob 清掉 pendingFullMarketRef，衔接不会在停止后触发。
+  const runCapitalFlowFirstFullMarket = async () => {
+    if (!service) {
+      return;
+    }
+    pendingFullMarketRef.current = false;
+    setBusyAction("fetch");
+    setMessage("正在优先补齐资金流");
+    let startMessage = "正在补全全市场缺失数据";
+    try {
+      const result = await fetchCapitalFlow(service.base_url, symbols, startDate, endDate);
+      onCoverageChange(result.coverage);
+      if (result.job && isSyncRunning(result.job)) {
+        // 资金流 job 在跑：交给现有轮询，job 结束时自动衔接日线（见 syncJob effect）。
+        // 释放 busyAction（syncRunning 仍让 busy=true 保持按钮禁用）——否则用户取消
+        // 后 busyAction 卡在 "fetch"，按钮永远无法恢复。
+        pendingFullMarketRef.current = true;
+        setSyncJob(result.job);
+        setMessage(syncRunningMessage(result.job));
+        setBusyAction(null);
+        return;
+      }
+      startMessage = result.job
+        ? `${syncFinishedMessage(result.job)}，继续补全全市场缺失数据`
+        : "资金流无缺口，继续补全全市场缺失数据";
+    } catch (error) {
+      startMessage = `资金流补齐失败，继续日线补齐（${connectionErrorMessage(error)}）`;
+    }
+    await runFullMarketSync("fetch", startMessage);
+  };
+
   const handleFetch = async () => {
     if (!service) {
       return;
     }
     if (symbols.length === 0) {
-      await runFullMarketSync("fetch");
+      await runCapitalFlowFirstFullMarket();
       return;
     }
     setBusyAction("fetch");
@@ -638,12 +685,12 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     }
   };
 
-  const runFullMarketSync = async (action: "fetch" | "sync") => {
+  const runFullMarketSync = async (action: "fetch" | "sync", startMessage?: string) => {
     if (!service) {
       return;
     }
     setBusyAction(action);
-    setMessage(action === "fetch" ? "正在补全全市场缺失数据" : "正在下载全市场历史数据");
+    setMessage(startMessage ?? (action === "fetch" ? "正在补全全市场缺失数据" : "正在下载全市场历史数据"));
     try {
       const result = await startFullMarketSync(service.base_url, startDate, endDate);
       setSyncJob(result.job);
@@ -665,6 +712,8 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     if (!service || !syncJob || !isSyncRunning(syncJob)) {
       return;
     }
+    // 用户主动停止：撤销「资金流结束后自动衔接日线」的意图，衔接不得再触发。
+    pendingFullMarketRef.current = false;
     setMessage("正在停止任务，已导入的数据会保留");
     try {
       const result = await cancelSyncJob(service.base_url, syncJob.job_id);

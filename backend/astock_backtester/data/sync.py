@@ -1,27 +1,42 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from threading import Lock, Thread
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 
 from astock_backtester.data.cache import LocalCache
+from astock_backtester.data.capital_flow_crawler import diagnostics_should_skip_eastmoney
+from astock_backtester.data.filelock import FileLockTimeout
 from astock_backtester.data.importer import normalize_daily_bars
 from astock_backtester.data.operations import (
     effective_a_share_date_range,
     fetch_capital_flow_into_cache,
 )
 from astock_backtester.data.trading_calendar import a_share_trade_dates
-from astock_backtester.data.warehouse import Warehouse, lifecycle_bound
+from astock_backtester.data.warehouse import Warehouse, classify_market_days_by_cross_section, lifecycle_bound
 from astock_backtester.models import SyncJobStatus
 
 OHLC_COLUMNS = ["open", "high", "low", "close"]
+
+# 停牌分类的横截面样本下限：窗口交易日太少时“当日行数 ≥ 中位数×0.5”不稳，
+# 退回旧行为（整窗必需、照抓不误），宁可多抓也不误判成停牌。
+MIN_SUSPENSION_CLASSIFICATION_DAYS = 5
+
+# 写批落盘的 FileLockTimeout 有界重试：1 次首发 + 2 次短退避，仍失败才上抛。
+FULL_MARKET_WRITE_LOCK_ATTEMPTS = 3
+FULL_MARKET_WRITE_LOCK_BACKOFF_SECONDS = 0.5
+
+# 抓取窗口收窄时给缺失段两端各留的自然日缓冲：让首尾缺失日也能拿到前收盘，
+# 并容忍缺口边缘的停牌/节假日抖动。窗口本身仍被夹在任务 [start, end] 内。
+MISSING_FETCH_BUFFER_DAYS = 15
 
 
 def _lifecycle_clipped_required_dates(
@@ -52,6 +67,75 @@ def _lifecycle_clipped_required_dates(
     return {date for date in required_dates if clipped_start <= date <= clipped_end}
 
 
+def _market_normal_days(window_frame: pd.DataFrame, required_dates: set[pd.Timestamp]) -> set[pd.Timestamp]:
+    """窗口横截面分类出的“市场正常日”；样本不足或无分类时返回空集合（退回旧口径）。
+
+    与 ``Warehouse.coverage()`` 共用 :func:`classify_market_days_by_cross_section`
+    的阈值口径：当日全市场 OHLC 完整行数 ≥ 中位数 × 0.5 → 市场正常日，它的
+    缺行是停牌类（不可补）；行数异常低 → thin day（疑似写入失败，可补）。
+    """
+    if len(required_dates) < MIN_SUSPENSION_CLASSIFICATION_DAYS:
+        return set()
+    rows_by_date = window_frame.groupby("_td_norm").size().to_dict()
+    if not rows_by_date:
+        return set()
+    return classify_market_days_by_cross_section(rows_by_date).market_normal_days
+
+
+def _suspension_exempt_required_dates(
+    required_dates: set[pd.Timestamp],
+    symbol: str,
+    row_dates_by_symbol: dict[str, set[pd.Timestamp]],
+    market_normal_days: set[pd.Timestamp],
+) -> set[pd.Timestamp]:
+    """把“窗口内已有行、却缺在市场正常日”的交易日按停牌类缺行剔除。
+
+    三条例外与 ``Warehouse.coverage()`` 的 ``missing_rows``/``suspension_rows``
+    口径一致（AGENTS §9）：
+    - 落在 thin day 的缺行仍必需（可行动缺口，照抓）；
+    - 落在市场正常日、但该股当天本就有行（缺的是市值字段而非行）仍必需；
+    - 该股窗口内零行 → 返回原集合（整窗必需，保持旧口径照抓）。
+    """
+    if not market_normal_days:
+        return required_dates
+    row_dates = row_dates_by_symbol.get(symbol)
+    if not row_dates:
+        return required_dates
+    return {day for day in required_dates if day not in market_normal_days or day in row_dates}
+
+
+def _narrow_fetch_window(
+    start_date: str,
+    end_date: str,
+    missing_dates: list[str] | None,
+) -> tuple[str, str]:
+    """把单票抓取窗口收窄到「实际缺失日 ± 缓冲」，两端夹回任务窗口。
+
+    一轮补齐确认过哪些日子缺失后，下一轮只抓那段，而不是把整个
+    ``[start_date, end_date]`` 再重抓一遍（旧行为在 ``float_market_cap``
+    长期补不上的股票上是每轮 ~1 小时的全量重抓）。缺失集合为空（该股已被
+    判完整、或快照里没有它的可行动缺口）时保持原窗口，语义与旧实现一致。
+    """
+    if not missing_dates:
+        return start_date, end_date
+    try:
+        first = min(missing_dates)
+        last = max(missing_dates)
+        window_start = (
+            datetime.strptime(first, "%Y-%m-%d") - timedelta(days=MISSING_FETCH_BUFFER_DAYS)
+        ).strftime("%Y-%m-%d")
+        window_end = (datetime.strptime(last, "%Y-%m-%d") + timedelta(days=MISSING_FETCH_BUFFER_DAYS)).strftime(
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return start_date, end_date
+    window_start = max(window_start, start_date)
+    window_end = min(window_end, end_date)
+    if window_start > window_end:
+        return start_date, end_date
+    return window_start, window_end
+
+
 @dataclass
 class DailyCompletenessSnapshot:
     complete_symbols: set[str]
@@ -62,6 +146,11 @@ class DailyCompletenessSnapshot:
     existing_pairs: pd.MultiIndex
     existing_ohlc_complete: np.ndarray  # bool，按 existing_pairs 顺序对齐
     existing_cap_null: np.ndarray  # bool，按 existing_pairs 顺序对齐
+    # 每股在窗口内**实际缺失**的可行动交易日（ISO 字符串，升序），用于把下一轮
+    # 抓取窗口收窄到缺口附近（见 _narrow_fetch_window）。只收“部分缺失”的股票：
+    # 窗口内零行、或整个必需集合全缺的股票不入表——调用方对缺席者回退整窗抓取，
+    # 与旧行为完全一致，同时避免为它们复制几万条日期字符串。
+    missing_dates_by_symbol: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -72,6 +161,82 @@ class FilledMissingRows:
     @property
     def total(self) -> int:
         return self.daily_rows + self.market_cap_rows
+
+
+FetchOutcomeKind = Literal["skipped", "empty", "rows", "error"]
+
+
+@dataclass
+class FetchOutcome:
+    """单票抓取结果：``error`` 是抛异常，``empty`` 是 provider 正常返回空。"""
+
+    symbol: str
+    kind: FetchOutcomeKind
+    frame: pd.DataFrame | None = None
+    error: str | None = None
+
+
+class FullMarketProgressSink:
+    """全市场循环的进度写入目标（同步=本地 status，异步=job store）。
+
+    两版循环共用一份核心实现，差异全部收敛在这里：同步版不写 store、不做
+    取消检查；异步版每次进度都经锁落 store，供 HTTP 轮询读取。
+    """
+
+    concurrent: bool = False
+
+    def snapshot(self) -> SyncJobStatus | None:
+        raise NotImplementedError
+
+    def mutate(self, **updates: object) -> None:
+        raise NotImplementedError
+
+    def append_failure(self, symbol: str, message: str) -> None:
+        raise NotImplementedError
+
+    def finish_cancelled(self) -> bool:
+        return False
+
+
+class LocalStatusSink(FullMarketProgressSink):
+    def __init__(self, status: SyncJobStatus) -> None:
+        self._status = status
+
+    def snapshot(self) -> SyncJobStatus | None:
+        return self._status
+
+    def mutate(self, **updates: object) -> None:
+        for key, value in updates.items():
+            setattr(self._status, key, value)
+
+    def append_failure(self, symbol: str, message: str) -> None:
+        error = f"{symbol}: {message}"
+        self._status.errors.append(error)
+        self._status.last_error = error
+        self._status.recent_failures = [
+            *self._status.recent_failures,
+            {"symbol": symbol, "reason": message},
+        ][-20:]
+
+
+class JobStatusSink(FullMarketProgressSink):
+    concurrent = True
+
+    def __init__(self, manager: SyncJobManager, job_id: str) -> None:
+        self._manager = manager
+        self._job_id = job_id
+
+    def snapshot(self) -> SyncJobStatus | None:
+        return self._manager.get_job(self._job_id)
+
+    def mutate(self, **updates: object) -> None:
+        self._manager._mutate(self._job_id, **updates)
+
+    def append_failure(self, symbol: str, message: str) -> None:
+        self._manager._append_failure(self._job_id, symbol, message)
+
+    def finish_cancelled(self) -> bool:
+        return self._manager._finish_cancelled(self._job_id)
 
 
 @dataclass
@@ -107,48 +272,13 @@ class SyncJobManager:
             status.status = "completed"
             return status
         snapshot = self._daily_completeness_snapshot(effective_start_date, effective_end_date)
-        pending_frames: list[pd.DataFrame] = []
-        pending_rows = 0
-        for symbol in symbols:
-            status.current_symbol = symbol
-            status.processed_symbols += 1
-            if symbol in snapshot.complete_symbols:
-                status.skipped_symbols += 1
-                continue
-            try:
-                frame = self.provider.fetch_daily_bars(symbol, effective_start_date, effective_end_date)
-                if not frame.empty:
-                    status.returned_rows += int(len(frame))
-                    filled = self._count_full_market_filled_missing_rows(
-                        frame,
-                        effective_start_date,
-                        effective_end_date,
-                        snapshot,
-                    )
-                    status.filled_missing_rows += filled.total
-                    status.filled_daily_rows += filled.daily_rows
-                    status.filled_market_cap_rows += filled.market_cap_rows
-                    # 攒批落盘：write_daily_bars 每批都要「读整个分区 → 合并 →
-                    # 整文件重写」，逐只写是 O(n²)。攒到阈值再写，把每只股票
-                    # 触发的分区重写次数从 1 降到 1/批。
-                    pending_frames.append(frame)
-                    pending_rows += int(len(frame))
-                    if pending_rows >= self.full_market_write_batch_rows:
-                        self.warehouse.write_daily_bars(
-                            pd.concat(pending_frames, ignore_index=True)
-                        )
-                        pending_frames = []
-                        pending_rows = 0
-                    status.imported_rows += int(len(frame))
-                    status.completed_symbols += 1
-                else:
-                    status.failed_symbols += 1
-                    status.errors.append(f"{symbol}: provider returned no daily rows")
-            except Exception as exc:
-                status.failed_symbols += 1
-                status.errors.append(f"{symbol}: {exc}")
-        if pending_frames:
-            self.warehouse.write_daily_bars(pd.concat(pending_frames, ignore_index=True))
+        self._run_full_market_loop(
+            list(symbols),
+            effective_start_date,
+            effective_end_date,
+            snapshot,
+            LocalStatusSink(status),
+        )
         status.current_symbol = None
         status.status = "completed_with_errors" if status.failed_symbols else "completed"
         return status
@@ -257,67 +387,7 @@ class SyncJobManager:
     def _run_full_market_job(self, job_id: str, symbols: list[str], start_date: str, end_date: str) -> None:
         try:
             snapshot = self._daily_completeness_snapshot(start_date, end_date)
-            pending_frames: list[pd.DataFrame] = []
-            pending_rows = 0
-            for batch in _chunks(symbols, self.full_market_batch_size):
-                if self._finish_cancelled(job_id):
-                    return
-                frames: list[pd.DataFrame] = []
-                batch_failed = False
-                with ThreadPoolExecutor(max_workers=max(1, self.full_market_workers)) as executor:
-                    futures = {
-                        executor.submit(self._fetch_daily_bars_if_needed, symbol, start_date, end_date, snapshot.complete_symbols): symbol
-                        for symbol in batch
-                    }
-                    for future in as_completed(futures):
-                        symbol = futures[future]
-                        self._mutate(job_id, current_symbol=symbol)
-                        current = self.get_job(job_id)
-                        if current:
-                            self._mutate(job_id, processed_symbols=current.processed_symbols + 1)
-                        try:
-                            outcome, frame = future.result()
-                        except Exception as exc:
-                            batch_failed = True
-                            current = self.get_job(job_id)
-                            if current:
-                                self._mutate(job_id, failed_symbols=current.failed_symbols + 1)
-                            self._append_failure(job_id, symbol, str(exc))
-                            continue
-                        if outcome == "skipped":
-                            current = self.get_job(job_id)
-                            if current:
-                                self._mutate(job_id, skipped_symbols=current.skipped_symbols + 1)
-                            continue
-                        if frame is None:
-                            batch_failed = True
-                            current = self.get_job(job_id)
-                            if current:
-                                self._mutate(job_id, failed_symbols=current.failed_symbols + 1)
-                            self._append_failure(job_id, symbol, "provider returned no daily rows")
-                            continue
-                        if frame.empty:
-                            batch_failed = True
-                            current = self.get_job(job_id)
-                            if current:
-                                self._mutate(job_id, failed_symbols=current.failed_symbols + 1)
-                            self._append_failure(job_id, symbol, "provider returned no daily rows")
-                            continue
-                        frames.append(frame)
-                        current = self.get_job(job_id)
-                        if current:
-                            self._mutate(job_id, completed_symbols=current.completed_symbols + 1)
-                if frames:
-                    pending_frames.extend(frames)
-                    pending_rows += sum(int(len(frame)) for frame in frames)
-                    if batch_failed or pending_rows >= self.full_market_write_batch_rows or len(batch) >= self.full_market_batch_size:
-                        pending_rows = self._flush_full_market_frames(job_id, pending_frames, snapshot)
-                if self._finish_cancelled(job_id):
-                    if pending_frames:
-                        self._flush_full_market_frames(job_id, pending_frames, snapshot)
-                    return
-            if pending_frames:
-                self._flush_full_market_frames(job_id, pending_frames, snapshot)
+            self._run_full_market_loop(symbols, start_date, end_date, snapshot, JobStatusSink(self, job_id))
             final = self.get_job(job_id)
             if final:
                 final.current_symbol = None
@@ -331,19 +401,126 @@ class SyncJobManager:
                 current.errors.append(str(exc))
                 self._store(current)
 
-    def _fetch_daily_bars_if_needed(
+    def _run_full_market_loop(
+        self,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        snapshot: DailyCompletenessSnapshot,
+        sink: FullMarketProgressSink,
+    ) -> None:
+        """全市场同步的唯一核心循环：同步 ``run_full_market`` 与异步作业共用。
+
+        ``sink`` 决定进度写到哪、是否并发抓取（同步版顺序抓取、不写 store、不做
+        取消检查；异步版分批 + 线程池 + 取消检查）。抓取结果处理、攒批落盘与
+        ``filled_missing_rows`` 统计两版完全同源：
+
+        - provider **正常返回空**（未抛异常）→ ``skipped_symbols``，不计失败、
+          不写 ``errors``、不影响最终 status；
+        - **抛异常** → ``failed_symbols`` + ``errors``，该批已成功行先落盘；
+        - 攒批只在「行数达 ``full_market_write_batch_rows``」或「批内有失败」时
+          落盘，写成功之后才清空待写帧（写失败不清，配合有界锁重试不丢批）；
+        - 抓取窗口按快照里的每股缺口收窄（``_narrow_fetch_window``）：一轮补齐
+          确认过缺失日后，下一轮只抓缺口 ± 缓冲，不再整窗重抓；完成判定与
+          ``filled_missing_rows`` 统计仍以任务开始时的整窗快照为准，口径不变。
+        """
+        pending_frames: list[pd.DataFrame] = []
+        pending_rows = 0
+        workers = max(1, self.full_market_workers) if sink.concurrent else 1
+        for batch in _chunks(symbols, self.full_market_batch_size):
+            if sink.finish_cancelled():
+                self._flush_full_market_frames(pending_frames)
+                return
+            batch_failed = False
+            for outcome in self._iter_full_market_batch(batch, start_date, end_date, snapshot, workers):
+                current = sink.snapshot()
+                if current is not None:
+                    sink.mutate(current_symbol=outcome.symbol, processed_symbols=current.processed_symbols + 1)
+                if outcome.kind == "error":
+                    batch_failed = True
+                    if current is not None:
+                        sink.mutate(failed_symbols=current.failed_symbols + 1)
+                        sink.append_failure(outcome.symbol, outcome.error or "provider request failed")
+                    continue
+                frame = outcome.frame
+                if outcome.kind == "skipped" or frame is None or frame.empty:
+                    if current is not None:
+                        sink.mutate(skipped_symbols=current.skipped_symbols + 1)
+                    continue
+                rows = int(len(frame))
+                filled = self._count_full_market_filled_missing_rows(frame, start_date, end_date, snapshot)
+                if current is not None:
+                    sink.mutate(
+                        completed_symbols=current.completed_symbols + 1,
+                        returned_rows=current.returned_rows + rows,
+                        imported_rows=current.imported_rows + rows,
+                        filled_missing_rows=current.filled_missing_rows + filled.total,
+                        filled_daily_rows=current.filled_daily_rows + filled.daily_rows,
+                        filled_market_cap_rows=current.filled_market_cap_rows + filled.market_cap_rows,
+                    )
+                # 攒批落盘：write_daily_bars 每批都要「读整个分区 → 合并 → 整文件
+                # 重写」，逐只写是 O(n²)。攒到阈值再写，把分区重写次数降到 1/批。
+                pending_frames.append(frame)
+                pending_rows += rows
+                if pending_rows >= self.full_market_write_batch_rows:
+                    self._flush_full_market_frames(pending_frames)
+                    pending_rows = 0
+            if batch_failed and pending_frames:
+                self._flush_full_market_frames(pending_frames)
+                pending_rows = 0
+            if sink.finish_cancelled():
+                self._flush_full_market_frames(pending_frames)
+                return
+        self._flush_full_market_frames(pending_frames)
+
+    def _iter_full_market_batch(
+        self,
+        batch: list[str],
+        start_date: str,
+        end_date: str,
+        snapshot: DailyCompletenessSnapshot,
+        workers: int,
+    ) -> Iterator[FetchOutcome]:
+        """按批次抓取并按完成顺序产出结果；``workers <= 1`` 时顺序执行保持调用次序。"""
+        if workers <= 1:
+            for symbol in batch:
+                yield self._fetch_daily_bars_outcome(symbol, start_date, end_date, snapshot)
+            return
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(self._fetch_daily_bars_outcome, symbol, start_date, end_date, snapshot): symbol
+                for symbol in batch
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    yield future.result()
+                except Exception as exc:  # noqa: BLE001 - 单票异常不得中断整批
+                    yield FetchOutcome(symbol=symbol, kind="error", error=str(exc))
+
+    def _fetch_daily_bars_outcome(
         self,
         symbol: str,
         start_date: str,
         end_date: str,
-        complete_symbols: set[str],
-    ) -> tuple[str, pd.DataFrame | None]:
-        if symbol in complete_symbols:
-            return "skipped", None
-        return "fetched", self.provider.fetch_daily_bars(symbol, start_date, end_date)
-
-    def _complete_daily_symbols(self, start_date: str, end_date: str) -> set[str]:
-        return self._daily_completeness_snapshot(start_date, end_date).complete_symbols
+        snapshot: DailyCompletenessSnapshot,
+    ) -> FetchOutcome:
+        if symbol in snapshot.complete_symbols:
+            return FetchOutcome(symbol=symbol, kind="skipped")
+        # 窗口收窄：只抓该股在快照里实际缺失的那段（±缓冲），而不是整窗重抓。
+        # 缺失集合缺席（零行/全缺/未入表）时回退整窗，与旧实现同一抓取范围。
+        fetch_start, fetch_end = _narrow_fetch_window(
+            start_date,
+            end_date,
+            snapshot.missing_dates_by_symbol.get(str(symbol)),
+        )
+        try:
+            frame = self.provider.fetch_daily_bars(symbol, fetch_start, fetch_end)
+        except Exception as exc:  # noqa: BLE001 - 异常是唯一算失败的路径
+            return FetchOutcome(symbol=symbol, kind="error", error=str(exc))
+        if frame is None or frame.empty:
+            return FetchOutcome(symbol=symbol, kind="empty")
+        return FetchOutcome(symbol=symbol, kind="rows", frame=frame)
 
     def incomplete_symbols(self, start_date: str, end_date: str) -> list[str]:
         """缺口基准补齐入口：窗口内“不完整”的股票名单。
@@ -416,53 +593,73 @@ class SyncJobManager:
         except Exception:
             lifecycle = {}
 
+        # 停牌分类（AGENTS §9）：直接用内存里的窗口帧算每交易日行数，横截面
+        # 分出“市场正常日 / thin day”，口径与 Warehouse.coverage() 的
+        # missing_rows/suspension_rows 一致；样本不足或无分类时返回空集合，
+        # 退回旧口径（整窗必需、照抓不误）。
+        market_normal_days = _market_normal_days(deduped, required_dates)
+        row_dates_by_symbol: dict[str, set[pd.Timestamp]] = {}
+        if market_normal_days:
+            row_dates_by_symbol = deduped.groupby("symbol")["_td_norm"].apply(set).to_dict()
+
         complete: set[str] = set()
+        missing_dates_by_symbol: dict[str, list[str]] = {}
         if "float_market_cap" in normalized.columns:
             cap_complete = normalized.dropna(subset=["float_market_cap"])
             actual_by_sym = cap_complete.groupby("symbol")["_td_norm"].apply(set)
-            for symbol, actual_dates in actual_by_sym.items():
+            # 扫描集合 = 有市值行的股票 ∪ 窗口内有 OHLC 行的股票：后者覆盖“整只股票
+            # 市值全空”的情况，它们同样要算出缺哪些日子用于收窄窗口。完成判定仍只
+            # 对“有市值行”的股票做 issubset（与旧实现同一口径，不新增 complete 成员）。
+            row_symbols = set(deduped["symbol"].unique())
+            for symbol in set(actual_by_sym.index) | row_symbols:
+                symbol_text = str(symbol)
+                actual_dates = actual_by_sym.get(symbol, set())
                 symbol_required = _lifecycle_clipped_required_dates(
-                    required_dates, lifecycle.get(str(symbol)), expected_dates[0], expected_dates[1]
+                    required_dates, lifecycle.get(symbol_text), expected_dates[0], expected_dates[1]
                 )
-                if symbol_required is not None and symbol_required.issubset(actual_dates):
-                    complete.add(str(symbol))
+                if symbol_required is None:
+                    continue
+                symbol_required = _suspension_exempt_required_dates(
+                    symbol_required, symbol_text, row_dates_by_symbol, market_normal_days
+                )
+                if symbol in actual_by_sym.index and symbol_required.issubset(actual_dates):
+                    complete.add(symbol_text)
+                missing = symbol_required - actual_dates
+                # 只收“部分缺失”：全缺（含窗口内零行）回退整窗抓取，语义等价于旧实现。
+                if missing and len(missing) < len(symbol_required):
+                    missing_dates_by_symbol[symbol_text] = sorted(day.strftime("%Y-%m-%d") for day in missing)
         return DailyCompletenessSnapshot(
             complete_symbols=complete,
             existing_pairs=existing_pairs,
             existing_ohlc_complete=existing_ohlc_complete,
             existing_cap_null=existing_cap_null,
+            missing_dates_by_symbol=missing_dates_by_symbol,
         )
 
-    def _flush_full_market_frames(
-        self,
-        job_id: str,
-        frames: list[pd.DataFrame],
-        snapshot: DailyCompletenessSnapshot | None = None,
-    ) -> int:
+    def _flush_full_market_frames(self, frames: list[pd.DataFrame]) -> int:
+        """把攒批帧落盘并清空待写列表，返回写入行数。
+
+        写成功**之后**才 ``frames.clear()``：旧实现先清后写，``FileLockTimeout``
+        会把整批待写数据丢掉并让整单任务 failed。锁超时做有界短退避重试
+        （见 :meth:`_write_daily_bars_with_lock_retry`），仍失败才上抛，此时
+        frames 原样保留、数据不丢。
+        """
         if not frames:
             return 0
         merged = pd.concat(frames, ignore_index=True)
+        self._write_daily_bars_with_lock_retry(merged)
         frames.clear()
-        returned_rows = int(len(merged))
-        current = self.get_job(job_id)
-        filled = self._count_full_market_filled_missing_rows(
-            merged,
-            current.start_date.isoformat() if current else None,
-            current.end_date.isoformat() if current else None,
-            snapshot,
-        )
-        self.warehouse.write_daily_bars(merged)
-        current = self.get_job(job_id)
-        if current:
-            self._mutate(
-                job_id,
-                imported_rows=current.imported_rows + returned_rows,
-                returned_rows=current.returned_rows + returned_rows,
-                filled_missing_rows=current.filled_missing_rows + filled.total,
-                filled_daily_rows=current.filled_daily_rows + filled.daily_rows,
-                filled_market_cap_rows=current.filled_market_cap_rows + filled.market_cap_rows,
-            )
-        return 0
+        return int(len(merged))
+
+    def _write_daily_bars_with_lock_retry(self, frame: pd.DataFrame) -> None:
+        for attempt in range(FULL_MARKET_WRITE_LOCK_ATTEMPTS):
+            try:
+                self.warehouse.write_daily_bars(frame)
+                return
+            except FileLockTimeout:
+                if attempt >= FULL_MARKET_WRITE_LOCK_ATTEMPTS - 1:
+                    raise
+                time.sleep(FULL_MARKET_WRITE_LOCK_BACKOFF_SECONDS * (attempt + 1))
 
     def _count_full_market_filled_missing_rows(
         self,
@@ -550,7 +747,7 @@ class SyncJobManager:
                         end_date=end_date,
                         refresh_coverage=False,
                     )
-                    if _diagnostics_should_skip_eastmoney(result.diagnostics):
+                    if diagnostics_should_skip_eastmoney(result.diagnostics):
                         skip_eastmoney = True
                     current = self.get_job(job_id)
                     if not current:
@@ -621,15 +818,6 @@ def _call_capital_flow_fetcher(
         return fetcher(symbols, start_date, end_date)
 
 
-def _diagnostics_should_skip_eastmoney(diagnostics: list[dict[str, Any]]) -> bool:
-    return any(
-        item.get("code") == "provider_attempt_failed"
-        and item.get("provider") == "eastmoney"
-        and item.get("error_code") == "network_error"
-        for item in diagnostics
-    )
-
-
 def _capital_flow_failure_reasons(
     batch: list[str],
     result: Any,
@@ -684,11 +872,3 @@ def _failure_message(item: dict[str, Any]) -> str:
 def _chunks(items: list[str], size: int) -> list[list[str]]:
     chunk_size = max(1, size)
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
-
-
-def _failure_symbols(failures: list[dict[str, Any]]) -> set[str]:
-    return {
-        str(item.get("symbol"))
-        for item in failures
-        if isinstance(item, dict) and item.get("symbol")
-    }

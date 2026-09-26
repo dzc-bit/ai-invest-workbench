@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,13 +14,15 @@ import requests
 
 from astock_backtester.data.http_transport import USER_AGENT as UA
 from astock_backtester.data.http_transport import create_scraping_session, curl_verify_kwargs
-from astock_backtester.data.parsing import is_blank_numeric, parse_float
+from astock_backtester.data.parsing import is_blank_numeric, parse_float, parse_money_amount
 from astock_backtester.data.symbols import a_share_market_symbol, market_code, normalize_symbol
 from astock_backtester.data.trading_calendar import a_share_trade_dates
 
 EASTMONEY_FUND_FLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 EASTMONEY_FUND_FLOW_KLINE_URL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-SINA_FUND_FLOW_URL = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_lscjfb"
+# https 与 http 返回同一载荷（实测），且同文件其余端点均为 https：统一走 https，
+# 避免明文请求被中间设备改写或投毒。
+SINA_FUND_FLOW_URL = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_lscjfb"
 BAIDU_FUND_FLOW_URL = "https://finance.pae.baidu.com/vapi/v1/fundsortlist"
 EASTMONEY_UT = "b2884a393a59ad64002292a3e90d46a5"
 SINA_PAGE_SIZE = 5000
@@ -33,6 +34,18 @@ BAIDU_PAGE_BACKOFF_SECONDS = 0.5
 BAIDU_PAGE_SLEEP_SECONDS = 0.05
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_CAPITAL_FLOW_BATCH_SIZE = 50
+# 单票百度补日的上限（按"最近 N 个缺失日"取）：内层每轮最多 500 页，不封顶时
+# 长窗口 + 新浪大面积缺日会退化成 N×500 次请求。
+BAIDU_SUPPLEMENT_MAX_MISSING_DATES = 20
+# 最近成功行缓存的符号数上限：全市场补齐会留下约 5500 个符号的完整行，
+# 无界字典在长驻服务里只增不减（行本身还要按日期窗口裁剪使用）。
+RECENT_SUCCESS_CACHE_MAX_SYMBOLS = 512
+# 东财变体矩阵的**组合**上限（一个组合 = 一个端点 × 参数变体 × header，其下可跑
+# 多个传输）。组合矩阵最坏 2×2×2 = 8 个组合 × 传输数，每次 timeout 秒；不封顶时
+# 403/429 这类"连得上但拿不到数据"的失败会让单票卡满全部组合。
+# 上限按组合而不是按传输计数：按传输计数时，双传输生产形态会把预算全花在第一个
+# 端点，`push2 kline` 备用端点永远轮不到（注入单传输的用例发现不了这个退化）。
+EASTMONEY_VARIANT_MAX_COMBINATIONS = 6
 FAILED_SYMBOL_RETRY_ROUNDS = 2
 FAILED_SYMBOL_RETRY_BACKOFF_SECONDS = 2.0
 
@@ -224,7 +237,7 @@ class CapitalFlowCrawler:
         self._recent_success_rows: dict[str, list[dict[str, Any]]] = {}
         self._recent_success_lock = Lock()
         self._sina_request_lock = Lock()
-        self._last_sina_request_at = -SINA_REQUEST_INTERVAL_SECONDS
+        self._sina_next_allowed_at = 0.0
 
     def fetch_fund_flow(
         self,
@@ -320,27 +333,68 @@ class CapitalFlowCrawler:
         return rows, diagnostics
 
     def _fetch_payload_with_variants(self, code: str, params: dict[str, str], timeout: int) -> dict[str, Any]:
+        """Try the endpoint × param × header matrix under a **total** budget.
+
+        矩阵最坏有 ``2 端点 × 2 参数变体 × 2 header × 2 传输 = 16`` 次请求，每次
+        ``timeout`` 秒。原有的两条早退守卫只对**网络层**错误生效（远端断连、
+        全传输超时），遇到 403/429/空 klines 这类"连得上但拿不到数据"的失败会
+        老老实实走满全部组合——全市场补齐时单票最坏 8 组合 × 传输数 × timeout。这里给
+        矩阵加一个**组合**上限 :data:`EASTMONEY_VARIANT_MAX_COMBINATIONS`：达到上限立刻
+        收手转兜底源，并留下 ``provider_variant_budget_exhausted`` 诊断。
+
+        上限按组合（端点 × 参数 × header）计数而不是按传输计数，这样"备用端点还被
+        轮到过"是有保证的：按传输计数时双传输形态会把预算全花在第一个端点，
+        `push2 kline` 备用端点永远没机会试（注入单传输的用例发现不了这个退化）。
+        用次数而不是墙钟 deadline 是有意的：上限确定、可断言（不依赖时钟行为），
+        效果同样是"最坏墙钟有界"。
+        """
         errors: list[str] = []
+        combinations = 0
         for endpoint in _ENDPOINT_VARIANTS:
             endpoint_params = dict(endpoint["params"])
             for extra_params in _PARAM_VARIANTS:
                 request_params = {**params, **endpoint_params, **extra_params}
                 variant_label = "base" if not extra_params else ",".join(sorted(extra_params))
-                for headers in _HEADER_VARIANTS:
+                for header_index, headers in enumerate(_HEADER_VARIANTS):
+                    if combinations >= EASTMONEY_VARIANT_MAX_COMBINATIONS:
+                        errors.append(
+                            f"{endpoint['label']} [{variant_label}]: variant combination cap "
+                            f"({EASTMONEY_VARIANT_MAX_COMBINATIONS}) reached, skipping remaining combinations"
+                        )
+                        raise CapitalFlowFetchError(
+                            f"Failed to fetch Eastmoney capital flow for {code}: {'; '.join(errors)}",
+                            code="network_error",
+                        )
+                    combinations += 1
                     variant_remote_disconnect = False
+                    transport_attempts = 0
+                    network_layer_failures = 0
                     for transport_label, json_get in self._eastmoney_json_getters:
                         try:
                             return json_get(str(endpoint["url"]), request_params, headers, timeout)
                         except Exception as exc:
+                            transport_attempts += 1
                             label = "" if transport_label == "injected" else f"{transport_label} "
                             errors.append(
                                 f"{endpoint['label']} {label}{headers['Referer']} [{variant_label}]: {exc}"
                             )
                             if _is_remote_disconnect(exc):
                                 variant_remote_disconnect = True
+                            if _is_network_layer_failure(exc):
+                                network_layer_failures += 1
                     if variant_remote_disconnect:
                         raise CapitalFlowFetchError(
                             f"Failed to fetch Eastmoney capital flow for {code}: {'; '.join(errors)}"
+                        )
+                    if (
+                        not extra_params
+                        and header_index == 0
+                        and transport_attempts > 0
+                        and network_layer_failures == transport_attempts
+                    ):
+                        raise CapitalFlowFetchError(
+                            f"Failed to fetch Eastmoney capital flow for {code}: endpoint {endpoint['label']} "
+                            f"base variant failed with network-layer errors on every transport: {'; '.join(errors)}"
                         )
         raise CapitalFlowFetchError(f"Failed to fetch Eastmoney capital flow for {code}: {'; '.join(errors)}")
 
@@ -437,13 +491,20 @@ class CapitalFlowCrawler:
         ) from last_error
 
     def _wait_for_sina_request_slot(self) -> None:
+        """Reserve this host's next slot, then sleep **outside** the lock.
+
+        持锁睡眠会把并发 worker 全部串行化在 ``SINA_REQUEST_INTERVAL_SECONDS`` 的
+        间隔上（8 worker × 5500 只 ≈ 23 分钟纯睡眠）；锁内只做"读—算—写"，
+        把下一个可用时刻预留出去，``sleep`` 移到锁外——与
+        :class:`~astock_backtester.data.http_transport.HostThrottle` 同一纪律。
+        """
         with self._sina_request_lock:
             now = time.monotonic()
-            wait_seconds = self._last_sina_request_at + SINA_REQUEST_INTERVAL_SECONDS - now
-            if wait_seconds > 0:
-                time.sleep(wait_seconds)
-                now = time.monotonic()
-            self._last_sina_request_at = now
+            slot = max(now, self._sina_next_allowed_at)
+            self._sina_next_allowed_at = slot + SINA_REQUEST_INTERVAL_SECONDS
+            delay = slot - now
+        if delay > 0:
+            time.sleep(delay)
 
     def _supplement_missing_rows_with_baidu(
         self,
@@ -467,9 +528,31 @@ class CapitalFlowCrawler:
         missing_dates = expected_dates - existing_dates
         if not missing_dates:
             return rows, []
+        # 每个缺失日原本各发一轮百度分页（内层最多 500 页）：长窗口 + 新浪大面积
+        # 缺日时退化成 N×500 次请求，单票就能把整批拖死。这里按"最近 N 个缺失日"
+        # 封顶，超出的写 ``date_coverage_shortfall``——宁可明确报告欠覆盖，也不
+        # 静默把批次跑到天亮。
+        ordered_missing = sorted(missing_dates)
+        capped_missing = ordered_missing[-BAIDU_SUPPLEMENT_MAX_MISSING_DATES:]
+        skipped_missing = len(ordered_missing) - len(capped_missing)
         baidu_rows: list[dict[str, Any]] = []
         baidu_diagnostics: list[dict[str, Any]] = []
-        for missing_date in sorted(missing_dates):
+        if skipped_missing:
+            baidu_diagnostics.append(
+                {
+                    "symbol": code,
+                    "code": "date_coverage_shortfall",
+                    "provider": "baidu",
+                    "source": "capital_flow_crawler",
+                    "missing_dates": skipped_missing,
+                    "message": (
+                        "Capital-flow crawler capped the Baidu supplement to the most recent "
+                        f"{BAIDU_SUPPLEMENT_MAX_MISSING_DATES} missing dates; "
+                        f"{skipped_missing} older missing dates stay unfilled."
+                    ),
+                }
+            )
+        for missing_date in capped_missing:
             try:
                 window_start, window_end = _date_window(missing_date, before_days=2, after_days=2)
                 next_rows, next_diagnostics = self._fetch_baidu_history_rows(
@@ -632,7 +715,7 @@ class CapitalFlowCrawler:
                     "rows": next_rows,
                     "failures": [],
                     "diagnostics": next_diagnostics,
-                    "skip_eastmoney": _diagnostics_should_skip_eastmoney(next_diagnostics),
+                    "skip_eastmoney": diagnostics_should_skip_eastmoney(next_diagnostics),
                 }
             except CapitalFlowFetchError as exc:
                 failure = {"symbol": code, "code": exc.code, "error": str(exc)}
@@ -748,9 +831,21 @@ class CapitalFlowCrawler:
         return {"rows": rows, "failures": failures, "diagnostics": diagnostics}
 
     def _remember_success_rows(self, code: str, rows: list[dict[str, Any]]) -> None:
-        if rows:
-            with self._recent_success_lock:
-                self._recent_success_rows[code] = [dict(row) for row in rows]
+        """Remember this symbol's rows for the same-batch fallback.
+
+        缓存只服务"本次请求失败时用最近成功行兜底"，因此按符号数封顶：全市场
+        补齐会留下约 5500 个符号的全部行，无界字典在长驻 sidecar 里只增不减。
+        超出上限时淘汰最久未更新的符号（``dict`` 保序，等价 FIFO）。
+        """
+        if not rows:
+            return
+        with self._recent_success_lock:
+            # pop + 重新插入 = 把这个符号挪到"最新使用"，超限时从最旧的一端淘汰
+            # （dict 保序，等价 FIFO/LRU）。
+            self._recent_success_rows.pop(code, None)
+            self._recent_success_rows[code] = [dict(row) for row in rows]
+            while len(self._recent_success_rows) > RECENT_SUCCESS_CACHE_MAX_SYMBOLS:
+                self._recent_success_rows.pop(next(iter(self._recent_success_rows)))
 
     def _recent_success_rows_for_range(self, code: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
         with self._recent_success_lock:
@@ -806,6 +901,32 @@ def _is_remote_disconnect(exc: Exception) -> bool:
     )
 
 
+def _is_network_layer_failure(exc: Exception | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError, requests.Timeout, requests.ConnectionError)):
+        return True
+    text = repr(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "timeout",
+            "timed out",
+            "connectionerror",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "connection closed abruptly",
+            "max retries exceeded",
+            "getaddrinfo",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "network is unreachable",
+            "no route to host",
+        )
+    )
+
+
 def _is_retryable_provider_error(exc: Exception | None) -> bool:
     text = repr(exc).lower()
     return any(
@@ -825,9 +946,17 @@ def _is_retryable_provider_error(exc: Exception | None) -> bool:
     )
 
 
-def _diagnostics_should_skip_eastmoney(diagnostics: list[dict[str, Any]]) -> bool:
+def diagnostics_should_skip_eastmoney(diagnostics: list[dict[str, Any]]) -> bool:
+    """本批资金流请求是否应跳过东财、直接走兜底源。
+
+    判定依据是 crawler 自己产出的诊断形状（``provider_attempt_failed`` +
+    ``provider=eastmoney`` + ``error_code=network_error``）。这是**唯一**实现：
+    ``sync`` 与 ``scripts/run-capital-flow-backfill.py`` 都从这里导入，避免同一
+    谓词在三处漂移（判据一改，三处必须同时改的那种 bug）。
+    """
     return any(
-        item.get("code") == "provider_attempt_failed"
+        isinstance(item, dict)
+        and item.get("code") == "provider_attempt_failed"
         and item.get("provider") == "eastmoney"
         and item.get("error_code") == "network_error"
         for item in diagnostics
@@ -878,11 +1007,12 @@ def _parse_baidu_content(
         row = {
             "symbol": code,
             "trade_date": trade_date,
-            "main_net_inflow": _parse_money_amount(item.get("extMainIn")),
-            "small_net_inflow": _parse_money_amount(item.get("littleNetIn")),
-            "medium_net_inflow": _parse_money_amount(item.get("mediumNetIn")),
-            "large_net_inflow": _parse_money_amount(item.get("largeNetIn")),
-            "super_large_net_inflow": _parse_money_amount(item.get("superNetIn")),
+            # 单位统一为元：百度带 "万/亿" 后缀，与东财 f52、新浪 netamount 同值。
+            "main_net_inflow": parse_money_amount(item.get("extMainIn")),
+            "small_net_inflow": parse_money_amount(item.get("littleNetIn")),
+            "medium_net_inflow": parse_money_amount(item.get("mediumNetIn")),
+            "large_net_inflow": parse_money_amount(item.get("largeNetIn")),
+            "super_large_net_inflow": parse_money_amount(item.get("superNetIn")),
             "main_net_inflow_pct": parse_float(item.get("ratio")),
             "close": parse_float(item.get("closepx")),
         }
@@ -946,24 +1076,6 @@ def _ratio_to_pct(value: Any) -> float | None:
     if parsed is None:
         return None
     return parsed * 100.0
-
-
-def _parse_money_amount(value: Any) -> float | None:
-    if value in (None, "", "-", "--"):
-        return None
-    text = str(value).strip().replace(",", "").replace("+", "")
-    if text in ("", "-", "--"):
-        return None
-    multiplier = 1.0
-    if "\u4ebf" in text:
-        multiplier = 100_000_000.0
-    elif "\u4e07" in text:
-        multiplier = 10_000.0
-    text = text.replace("\u5143", "").replace("\u4e07", "").replace("\u4ebf", "").strip()
-    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
-    if match is None:
-        return None
-    return float(match.group(0)) * multiplier
 
 
 def _last_baidu_trade_date(content: list[Any]) -> date | None:

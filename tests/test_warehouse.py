@@ -756,28 +756,39 @@ def test_read_capital_flow_missing_symbols_spans_window_partitions(tmp_path):
     """``read_capital_flow_missing_symbols`` 必须扫窗口覆盖的所有年分区。
 
     旧实现只读最新分区：横跨旧分区的补数窗口里，"资金流只存在于旧分区"
-    的股票会被误判为缺流。000002 在旧分区有流、最新分区的行缺流——
-    合并两个分区后它不该进缺口名单。
+    的股票会被误判为缺流。窗口 2025-12-30 ~ 2026-01-05 的应有交易日是
+    12-30、12-31、01-05（01-01~01-03 元旦休市）：
+    - 000001 三天都有流（12-30/12-31 在 year=2025、01-05 在 year=2026），
+      合并两个分区才判得出完整——只扫最新分区会把它误判成缺流；
+    - 000002 旧分区有流、01-05 缺流 → "有洞"，必须选中（全空口径选不中）；
+    - 000003 窗口内始终无资金流 → 选中。
     """
     warehouse = Warehouse(tmp_path)
     frame = pd.DataFrame(
         {
-            "symbol": ["000001", "000002", "000002", "000003"],
-            "trade_date": ["2025-12-30", "2025-12-30", "2026-01-05", "2026-01-05"],
-            "open": [10.0, 10.0, 10.0, 10.0],
-            "high": [10.5, 10.5, 10.5, 10.5],
-            "low": [9.8, 9.8, 9.8, 9.8],
-            "close": [10.2, 10.2, 10.2, 10.2],
-            "volume": [1000, 1000, 1000, 1000],
-            "main_net_inflow": [50.0, 60.0, float("nan"), float("nan")],
+            "symbol": ["000001", "000001", "000001", "000002", "000002", "000003"],
+            "trade_date": [
+                "2025-12-30",
+                "2025-12-31",
+                "2026-01-05",
+                "2025-12-30",
+                "2026-01-05",
+                "2026-01-05",
+            ],
+            "open": [10.0] * 6,
+            "high": [10.5] * 6,
+            "low": [9.8] * 6,
+            "close": [10.2] * 6,
+            "volume": [1000] * 6,
+            "main_net_inflow": [50.0, 51.0, 52.0, 60.0, float("nan"), float("nan")],
         }
     )
     warehouse.write_daily_bars(frame)
 
-    missing = warehouse.read_capital_flow_missing_symbols("2025-12-01", "2026-01-31")
+    missing = warehouse.read_capital_flow_missing_symbols("2025-12-30", "2026-01-05")
 
-    assert "000001" not in missing  # 旧分区已有资金流
-    assert "000002" not in missing  # 旧分区有流；只扫最新分区时会误判
+    assert "000001" not in missing  # 两个分区合并后窗口内完整
+    assert "000002" in missing  # 12-31 与 01-05 缺流：全空口径选不中
     assert "000003" in missing  # 窗口内始终无资金流
 
 
@@ -823,3 +834,469 @@ def test_data_gap_profile_excludes_delisted_from_stale_distribution(tmp_path):
     assert daily["symbols_stale"] == 1
     # 分布里只剩未退市的 000003
     assert {"last_date": "2026-06-03", "symbols": 1} in daily["stale_distribution"]
+
+
+def test_read_capital_flow_missing_symbols_selects_partial_flow_holes(tmp_path):
+    """口径从"全空"扩到"有洞"：窗口内缺任一应有交易日的资金流就选中。
+
+    旧实现只返回窗口内一行 non-null ``main_net_inflow`` 都没有的股票，
+    000002 这种"大部分日期有流、个别日期缺流"的股票永远进不了补齐名单。
+    """
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000001", "000001", "000002", "000002", "000003", "000003"],
+                "trade_date": ["2026-06-01", "2026-06-02"] * 3,
+                "open": [10.0] * 6,
+                "high": [10.5] * 6,
+                "low": [9.8] * 6,
+                "close": [10.2] * 6,
+                "volume": [1000] * 6,
+                "main_net_inflow": [100.0, 200.0, 100.0, float("nan"), float("nan"), float("nan")],
+            }
+        )
+    )
+
+    missing = warehouse.read_capital_flow_missing_symbols("2026-06-01", "2026-06-02")
+
+    # 000001 两天都有流；000002 只缺 06-02（有洞）；000003 全空。
+    assert missing == {"000002", "000003"}
+
+
+def test_read_capital_flow_missing_symbols_ignores_known_source_gap_dates(tmp_path):
+    """``KNOWN_CAPITAL_FLOW_SOURCE_GAP_DATES`` 里的整日缺口不算缺失。
+
+    2024-07-16 是已知公开资金流源缺口日：窗口 07-15~07-16 的应有交易日只剩
+    07-15。000002 只有 07-16 的流，救不了它缺的 07-15；000001 有 07-15 的流
+    → 完整（07-16 的空值不是洞）。
+    """
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000001", "000001", "000002", "000002"],
+                "trade_date": ["2024-07-15", "2024-07-16", "2024-07-15", "2024-07-16"],
+                "open": [10.0] * 4,
+                "high": [10.5] * 4,
+                "low": [9.8] * 4,
+                "close": [10.2] * 4,
+                "volume": [1000] * 4,
+                "main_net_inflow": [100.0, float("nan"), float("nan"), 80.0],
+            }
+        )
+    )
+
+    missing = warehouse.read_capital_flow_missing_symbols("2024-07-15", "2024-07-16")
+
+    assert missing == {"000002"}
+
+
+def test_read_capital_flow_missing_symbols_skips_lifecycle_clipped_empty_window(tmp_path):
+    """生命周期截断后没有任何应有交易日 → 不算缺失。
+
+    600001 上市日（2026-06-05）晚于窗口末尾：窗口内的应有交易日对它全部
+    落在上市前，截断后为空，两行空资金流不能把它算成缺口。
+    """
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["600001", "600001"],
+                "trade_date": ["2026-06-01", "2026-06-02"],
+                "open": [10.0, 10.0],
+                "high": [10.5, 10.5],
+                "low": [9.8, 9.8],
+                "close": [10.2, 10.2],
+                "volume": [1000, 1000],
+                "main_net_inflow": [float("nan"), float("nan")],
+            }
+        )
+    )
+    warehouse.upsert_symbol_lifecycle([{"symbol": "600001", "listing_date": "2026-06-05", "status": "listed"}])
+
+    missing = warehouse.read_capital_flow_missing_symbols("2026-06-01", "2026-06-02")
+
+    assert missing == set()
+
+
+def test_read_capital_flow_missing_symbols_exempts_capital_flow_source_start(tmp_path):
+    """资金流源起点滞后豁免：新股在数据源起点之前的日期不算缺口（与 coverage 同规则）。
+
+    窗口 2026-06-01 ~ 2026-06-12（10 个交易日，分类样本充足）：
+    - 000007 于 06-04 上市（lifecycle listing_date），首根日线 06-04、资金流从
+      06-08 才开始（lag 4 ≤ 90）→ 起点前的 06-04/06-05 豁免，不进名单；
+    - 600008 首根日线就是窗口起点（``first_daily <= warehouse_start`` 让
+      variant 1 不成立），但首行 ``listing_days=0`` → 走 listing-day 变体，
+      06-01~06-05 豁免，不进名单；
+    - 000009 是老股（``listing_days=9999``）且资金流 06-09 才有 → 两个变体
+      都不适用，06-01~06-08 照算缺口。
+    """
+    warehouse = Warehouse(tmp_path)
+    all_days = [
+        "2026-06-01",
+        "2026-06-02",
+        "2026-06-03",
+        "2026-06-04",
+        "2026-06-05",
+        "2026-06-08",
+        "2026-06-09",
+        "2026-06-10",
+        "2026-06-11",
+        "2026-06-12",
+    ]
+    listings = {"000007": "2026-06-04", "600008": "2026-06-01", "000009": None}
+    symbol_days = {"000007": all_days[3:], "600008": all_days, "000009": all_days}
+    flow_start = {"000007": "2026-06-08", "600008": "2026-06-08", "000009": "2026-06-09"}
+    rows = []
+    for symbol in ("000007", "600008", "000009"):
+        for day in symbol_days[symbol]:
+            listing = listings[symbol]
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": day,
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "volume": 1000,
+                    "main_net_inflow": 100.0 if day >= flow_start[symbol] else float("nan"),
+                    "listing_days": 9999 if listing is None else (pd.Timestamp(day) - pd.Timestamp(listing)).days,
+                }
+            )
+    warehouse.write_daily_bars(pd.DataFrame(rows))
+    warehouse.upsert_symbol_lifecycle([{"symbol": "000007", "listing_date": "2026-06-04", "status": "listed"}])
+
+    missing = warehouse.read_capital_flow_missing_symbols("2026-06-01", "2026-06-12")
+
+    # 只有老股 000009 的源起点滞后不适用：它缺的是"已有日线行但资金流为空"的内部洞。
+    assert missing == {"000009"}
+
+
+def test_read_capital_flow_missing_symbols_exempts_market_normal_suspension_days(tmp_path):
+    """市场正常日的整行缺失（停牌）不算资金流缺口；thin day 的整行缺失照算。
+
+    窗口 2026-06-01 ~ 2026-06-12（10 个交易日）：
+    - 000010 只缺 06-03 一行，当日其余 4 只都有行（计数 4 ≥ 中位数 5 × 0.5）
+      → 市场正常日 → 停牌类豁免，不进名单；
+    - 000011/000013/000014 只缺 06-05 一行，而 06-05 全市场只剩 2 行
+      （2 < 2.5 → thin day，疑似写入失败）→ 可行动，照算；
+    - 000012 全窗口有行有流 → 不进名单。
+    """
+    warehouse = Warehouse(tmp_path)
+    all_days = [
+        "2026-06-01",
+        "2026-06-02",
+        "2026-06-03",
+        "2026-06-04",
+        "2026-06-05",
+        "2026-06-08",
+        "2026-06-09",
+        "2026-06-10",
+        "2026-06-11",
+        "2026-06-12",
+    ]
+    thin_day = "2026-06-05"
+    rows = []
+    for symbol in ("000010", "000011", "000012", "000013", "000014"):
+        for day in all_days:
+            if symbol == "000010" and day == "2026-06-03":
+                continue  # 000010 在市场正常日停牌
+            if symbol in ("000011", "000013", "000014") and day == thin_day:
+                continue  # 写入失败日：这三只的行整行丢失
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": day,
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "volume": 1000,
+                    "main_net_inflow": 100.0,
+                    "listing_days": 9999,
+                }
+            )
+    warehouse.write_daily_bars(pd.DataFrame(rows))
+
+    missing = warehouse.read_capital_flow_missing_symbols("2026-06-01", "2026-06-12")
+
+    # 000010 的停牌豁免生效；thin day 丢行的三只照算；完整股 000012 不进名单。
+    assert missing == {"000011", "000013", "000014"}
+
+
+def test_read_capital_flow_missing_symbols_keeps_stale_tail_visible(tmp_path):
+    """停更尾部不被停牌豁免吞掉：max(OHLC 末行, 资金流末行) 之后必须照算。
+
+    000015 的数据停在 06-05，窗口尾部 06-08~06-12 全市场行数极低但仍被判为
+    市场正常日（阈值下限 1.0）——这些日期既没有行也在尾部边界之后，属于
+    "这只股票多久没同步"的可行动信号，绝不能按停牌豁免掉。
+    """
+    warehouse = Warehouse(tmp_path)
+    stale_days = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05"]
+    all_days = [
+        *stale_days,
+        "2026-06-08",
+        "2026-06-09",
+        "2026-06-10",
+        "2026-06-11",
+        "2026-06-12",
+    ]
+    rows = [
+        {
+            "symbol": symbol,
+            "trade_date": day,
+            "open": 10.0,
+            "high": 10.5,
+            "low": 9.8,
+            "close": 10.2,
+            "volume": 1000,
+            "main_net_inflow": 100.0,
+            "listing_days": 9999,
+        }
+        for symbol, days in (("000015", stale_days), ("000016", all_days))
+        for day in days
+    ]
+    warehouse.write_daily_bars(pd.DataFrame(rows))
+
+    missing = warehouse.read_capital_flow_missing_symbols("2026-06-01", "2026-06-12")
+
+    assert missing == {"000015"}
+
+
+def test_read_capital_flow_missing_symbols_keeps_gaps_when_counts_unavailable(tmp_path, monkeypatch):
+    """横截面计数拿不到 → 分类退空集 → 平日历口径：停牌豁免一个都不生效，缺口照算。
+
+    000021 只缺 06-03 一行、该日在正常计数下会被判成市场正常日（本会被停牌豁免
+    掉）；``market_trade_date_counts`` 抛异常时必须退回旧行为——把 06-03 当成普通
+    缺口进名单，而不是因为分类失败把缺口静默吞掉（平日历 = 不豁免）。
+    """
+    warehouse = Warehouse(tmp_path)
+    days = [
+        "2026-06-01",
+        "2026-06-02",
+        "2026-06-03",
+        "2026-06-04",
+        "2026-06-05",
+        "2026-06-08",
+        "2026-06-09",
+        "2026-06-10",
+        "2026-06-11",
+        "2026-06-12",
+    ]
+    rows = [
+        {
+            "symbol": symbol,
+            "trade_date": day,
+            "open": 10.0,
+            "high": 10.5,
+            "low": 9.8,
+            "close": 10.2,
+            "volume": 1000,
+            "main_net_inflow": 100.0,
+            "listing_days": 9999,
+        }
+        for symbol in ("000020", "000021")
+        for day in days
+        if not (symbol == "000021" and day == "2026-06-03")
+    ]
+    warehouse.write_daily_bars(pd.DataFrame(rows))
+
+    # 计数可用：06-03 当天仍有 000020 的完整行 → 市场正常日 → 停牌豁免，名单为空。
+    assert warehouse.read_capital_flow_missing_symbols("2026-06-01", "2026-06-12") == set()
+
+    def _boom(self, start_date, end_date):
+        raise RuntimeError("parquet scan failed")
+
+    monkeypatch.setattr(Warehouse, "market_trade_date_counts", _boom)
+    assert warehouse.read_capital_flow_missing_symbols("2026-06-01", "2026-06-12") == {"000021"}
+
+
+def test_market_trade_date_counts_reports_ohlc_complete_rows_per_trade_date(tmp_path):
+    """每个交易日的 OHLC 完整行数：四列全非空才计数，无完整行的交易日记 0。
+
+    - 06-01：000001/000003 完整；000002 close 为空、000004 是资金流独立行
+      （OHLC 全空）→ 2；
+    - 06-02：只有 000001 → 1；
+    - 06-03 是交易日但没有任何行 → 0（键来自交易日历，不是"有行的日期"）。
+    """
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000001", "000002", "000003", "000004", "000001"],
+                "trade_date": ["2026-06-01", "2026-06-01", "2026-06-01", "2026-06-01", "2026-06-02"],
+                "open": [10.0, 10.0, 10.0, float("nan"), 10.1],
+                "high": [10.5, 10.5, 10.5, float("nan"), 10.6],
+                "low": [9.8, 9.8, 9.8, float("nan"), 9.9],
+                "close": [10.2, float("nan"), 10.2, float("nan"), 10.3],
+                "volume": [1000, 1000, 1000, 0, 1100],
+                "main_net_inflow": [10.0, float("nan"), float("nan"), 5.0, 12.0],
+            }
+        )
+    )
+
+    counts = warehouse.market_trade_date_counts("2026-06-01", "2026-06-03")
+
+    assert counts == {"2026-06-01": 2, "2026-06-02": 1, "2026-06-03": 0}
+
+
+def test_market_trade_date_counts_caches_by_window_until_written(tmp_path):
+    """10 分钟 TTL 单条缓存，key 带日期区间，写入路径让它失效。"""
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000001"],
+                "trade_date": ["2026-06-01"],
+                "open": [10.0],
+                "high": [10.5],
+                "low": [9.8],
+                "close": [10.2],
+                "volume": [1000],
+            }
+        )
+    )
+
+    first = warehouse.market_trade_date_counts("2026-06-01", "2026-06-03")
+    assert warehouse.market_trade_date_counts("2026-06-01", "2026-06-03") is first
+
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000002"],
+                "trade_date": ["2026-06-02"],
+                "open": [20.0],
+                "high": [20.5],
+                "low": [19.8],
+                "close": [20.2],
+                "volume": [2000],
+            }
+        )
+    )
+
+    second = warehouse.market_trade_date_counts("2026-06-01", "2026-06-03")
+    assert second is not first  # 写入后失效并重算
+    assert first["2026-06-02"] == 0
+    assert second["2026-06-02"] == 1
+
+    other_window = warehouse.market_trade_date_counts("2026-06-02", "2026-06-03")
+    assert other_window is not second  # 缓存 key 带日期区间，换窗口不复用
+    assert other_window == {"2026-06-02": 1, "2026-06-03": 0}
+
+
+def test_market_trade_date_counts_skips_corrupt_partition(tmp_path):
+    """坏分区跳过并登记 ``corrupt_partitions``，不让单个坏分区炸掉整个调用。"""
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000001", "000001"],
+                "trade_date": ["2025-12-30", "2025-12-31"],
+                "open": [10.0, 10.1],
+                "high": [10.5, 10.6],
+                "low": [9.8, 9.9],
+                "close": [10.2, 10.3],
+                "volume": [1000, 1000],
+            }
+        )
+    )
+    corrupt = tmp_path / "warehouse" / "daily_bars" / "year=2026" / "daily_bars.parquet"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_bytes(b"not a parquet file")
+
+    counts = warehouse.market_trade_date_counts("2025-12-30", "2026-01-05")
+
+    # 应有交易日 = 12-30、12-31、01-05（01-01~01-03 元旦休市）；
+    # year=2026 分区损坏 → 01-05 计 0，且调用不抛异常。
+    assert counts == {"2025-12-30": 1, "2025-12-31": 1, "2026-01-05": 0}
+    assert str(corrupt) in warehouse.corrupt_partitions
+
+
+def test_classify_market_days_by_cross_section_splits_normal_and_thin_days():
+    """模块级纯函数：行数 ≥ 中位数 × 比例 → 市场正常日，否则 thin day。"""
+    from astock_backtester.data.warehouse import MarketDayClassification, classify_market_days_by_cross_section
+
+    classification = classify_market_days_by_cross_section(
+        {
+            pd.Timestamp("2026-06-01"): 6,
+            "2026-06-02": 1,
+            pd.Timestamp("2026-06-03"): 4,
+            pd.Timestamp("2026-06-04"): 6,
+        }
+    )
+
+    assert isinstance(classification, MarketDayClassification)
+    # 行数 6/1/4/6 → 中位数 5 → 阈值 2.5：06-02 thin，其余市场正常日；
+    # 字符串键归一化成 pd.Timestamp。
+    assert classification.thin_days == {pd.Timestamp("2026-06-02")}
+    assert classification.market_normal_days == {
+        pd.Timestamp("2026-06-01"),
+        pd.Timestamp("2026-06-03"),
+        pd.Timestamp("2026-06-04"),
+    }
+
+    strict = classify_market_days_by_cross_section(
+        {
+            pd.Timestamp("2026-06-01"): 6,
+            pd.Timestamp("2026-06-02"): 1,
+            pd.Timestamp("2026-06-03"): 4,
+            pd.Timestamp("2026-06-04"): 6,
+        },
+        thin_day_ratio=1.0,
+    )
+    # 阈值 = 中位数 5：06-03（4 行）也落入 thin。
+    assert pd.Timestamp("2026-06-03") in strict.thin_days
+    assert pd.Timestamp("2026-06-01") in strict.market_normal_days
+
+    empty = classify_market_days_by_cross_section({})
+    assert empty.market_normal_days == set()
+    assert empty.thin_days == set()
+
+
+def test_coverage_delegates_cross_section_classification_to_module_function(tmp_path, monkeypatch):
+    """coverage() 的横截面分类必须走模块级纯函数（sync/operations 复用同一口径）。"""
+    import astock_backtester.data.warehouse as warehouse_module
+
+    warehouse = warehouse_module.Warehouse(tmp_path)
+    layout = {
+        "000001": ("2026-06-01", "2026-06-02", "2026-06-03"),
+        "000002": ("2026-06-01", "2026-06-03"),
+        "000003": ("2026-06-01", "2026-06-03"),
+    }
+    warehouse.write_daily_bars(
+        pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "trade_date": day,
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "volume": 1000,
+                }
+                for symbol, days in layout.items()
+                for day in days
+            ]
+        )
+    )
+
+    seen: list[dict] = []
+    original = warehouse_module.classify_market_days_by_cross_section
+
+    def spy(rows_by_date, *, thin_day_ratio=0.5):
+        seen.append(dict(rows_by_date))
+        return original(rows_by_date, thin_day_ratio=thin_day_ratio)
+
+    monkeypatch.setattr(warehouse_module, "classify_market_days_by_cross_section", spy)
+
+    coverage = {item.dataset: item for item in warehouse.coverage()}
+
+    assert seen
+    assert {pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-03")} <= set(seen[0])
+    # 行数 3/1/3 → 中位数 3 → 阈值 1.5 → 06-02 是 thin day：spanning 3 − 实有 1
+    # = 2 计入 missing；06-01/06-03 无内部洞；三只都同步到 06-03 → 尾部 0。
+    assert coverage["daily_bars"].missing_rows == 2
+    assert coverage["daily_bars"].suspension_rows == 0

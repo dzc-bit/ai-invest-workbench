@@ -154,11 +154,24 @@ def holiday_table_first_year() -> int:
 
 _holiday_gap_warned = False
 
+# ``has_acceptable_coverage`` 会**逐票**调用本函数（5500 票 × 最多 3 个 provider
+# ≈ 1.6 万次），每次都要重建 ``date_range(freq="B")`` 并逐日展开节假日表。
+# 节假日表是纯静态数据（写入方只有源码本身），因此 (start, end) → 交易日集合的
+# 结果可以安全缓存；返回时复制一份，调用方拿到的仍是可自由改动的 set。
+_trade_dates_cache: dict[tuple[pd.Timestamp, pd.Timestamp], frozenset[pd.Timestamp]] = {}
+
+# 缓存条目上限：命中率来自"同一窗口被逐票反复查询"，几千条足够；超出后整体清空
+# （而不是 LRU 淘汰），保证长期驻留的 sidecar 不会把它养成第二份数据仓。
+_TRADE_DATES_CACHE_MAX_ENTRIES = 4096
+
 
 def a_share_trade_dates(start_date: pd.Timestamp | date | str, end_date: pd.Timestamp | date | str) -> set[pd.Timestamp]:
     global _holiday_gap_warned
     start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize()
+    cached = _trade_dates_cache.get((start, end))
+    if cached is not None:
+        return set(cached)
     if end < start:
         return set()
     if not _holiday_gap_warned and (end.year > holiday_table_last_year() or start.year < holiday_table_first_year()):
@@ -170,4 +183,8 @@ def a_share_trade_dates(start_date: pd.Timestamp | date | str, end_date: pd.Time
             holiday_table_last_year(),
         )
     weekdays = {pd.Timestamp(day).normalize() for day in pd.date_range(start=start, end=end, freq="B")}
-    return weekdays - _holiday_dates(start, end)
+    result = weekdays - _holiday_dates(start, end)
+    if len(_trade_dates_cache) >= _TRADE_DATES_CACHE_MAX_ENTRIES:
+        _trade_dates_cache.clear()
+    _trade_dates_cache[(start, end)] = frozenset(result)
+    return result

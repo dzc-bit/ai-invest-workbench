@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import bisect
+import logging
 import os
 import sqlite3
 import threading
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from statistics import median
+from typing import NamedTuple
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -19,6 +21,8 @@ from astock_backtester.data.importer import normalize_daily_bars
 from astock_backtester.data.trading_calendar import a_share_trade_dates
 from astock_backtester.models import DatasetCoverage
 
+logger = logging.getLogger(__name__)
+
 OHLC_COLUMNS = ["open", "high", "low", "close"]
 GAP_PROFILE_TTL_SECONDS = 600.0
 GAP_PROFILE_DEFAULT_PARTITION_YEARS = 2
@@ -27,6 +31,8 @@ GAP_PROFILE_TOP_STALE = 12
 # coverage() 全仓扫描实测 ~10s，而红绿家数 provider 循环的总预算只有 8s——
 # 计数绝不能在行情链路上现算。
 SYMBOL_COUNT_TTL_SECONDS = 600.0
+# 每交易日 OHLC 完整行数缓存：与缺口画像共用 10 分钟 TTL 与写入失效节奏。
+TRADE_DATE_COUNTS_TTL_SECONDS = GAP_PROFILE_TTL_SECONDS
 KNOWN_CAPITAL_FLOW_SOURCE_GAP_DATES = {
     pd.Timestamp("2018-08-07"),
     pd.Timestamp("2019-04-04"),
@@ -38,6 +44,12 @@ KNOWN_CAPITAL_FLOW_SOURCE_START_SYMBOL_PREFIXES = ("920",)
 KNOWN_CAPITAL_FLOW_SOURCE_START_SYMBOLS = {"001872", "001914", "601360"}
 KNOWN_CAPITAL_FLOW_SOURCE_START_DATES = {pd.Timestamp("2021-12-29")}
 KNOWN_CAPITAL_FLOW_LISTING_LAG_DAYS = 90
+# 资金流缺口名单做停牌类豁免前，窗口至少要有这么多 A 股交易日：横截面中位数
+# 在短窗口上抖动太大，样本不足时退回平日历口径（旧行为）。与
+# data/operations.py::MIN_TRADE_DAYS_FOR_SUSPENSION_CLASSIFICATION、
+# data/sync.py::MIN_SUSPENSION_CLASSIFICATION_DAYS 同为 5（各自模块持有，
+# warehouse 不反向依赖它们）。
+MIN_TRADE_DAYS_FOR_CAPITAL_FLOW_SUSPENSION_EXEMPTION = 5
 
 
 class Warehouse:
@@ -52,6 +64,10 @@ class Warehouse:
         self._gap_profile_cache: tuple[float, dict[str, object]] | None = None
         self._symbol_count_lock = threading.Lock()
         self._symbol_count_cache: tuple[float, int] | None = None
+        self._trade_date_counts_lock = threading.Lock()
+        # 单条缓存：(写入时刻, (start_date, end_date), {YYYY-MM-DD: 行数})。
+        # key 必须落在缓存里，换窗口即重算，避免无界增长。
+        self._trade_date_counts_cache: tuple[float, tuple[str, str], dict[str, int]] | None = None
         self._corrupt_partitions_lock = threading.Lock()
         self._corrupt_partitions: dict[str, str] = {}
 
@@ -119,6 +135,32 @@ class Warehouse:
             return None
         return str(self.daily_bars_root / "year=*" / "daily_bars.parquet")
 
+    def _partition_paths_for_window(self, start_date: str, end_date: str) -> list[Path]:
+        """按窗口覆盖的年份选择日线分区；一个都选不中时退回最新分区。
+
+        横跨旧分区的窗口只读最新分区会漏掉旧分区里的行（例如 12 月~1 月的
+        窗口漏掉 ``year=2025`` 分区），因此 ``read_capital_flow_missing_symbols``
+        与 ``market_trade_date_counts`` 共用这个选择口径。没有任何分区时返回
+        空列表（此时不解析日期，"空仓 + 任意入参"保持只读不到数据的旧行为），
+        调用方按"还没有数据"处理。
+        """
+        paths = sorted(self.daily_bars_root.glob("year=*/daily_bars.parquet"))
+        if not paths:
+            return []
+        window_start = pd.Timestamp(start_date)
+        window_end = pd.Timestamp(end_date)
+        selected: list[Path] = []
+        for path in paths:
+            try:
+                year = int(path.parent.name.split("=", maxsplit=1)[1])
+            except (IndexError, ValueError):
+                continue
+            if window_start.year <= year <= window_end.year:
+                selected.append(path)
+        if not selected:
+            selected = [paths[-1]]
+        return selected
+
     def daily_bars_parquet_paths(self) -> list[str]:
         """Explicit partition file paths (no glob) for sandboxed DuckDB views."""
         return [str(path) for path in self._partition_paths_for_range(None, None)]
@@ -167,11 +209,13 @@ class Warehouse:
             raise
 
     def invalidate_gap_profile(self) -> None:
-        """写入后丢弃缺口画像与股票池计数缓存，让下一次读取反映最新数据。"""
+        """写入后丢弃缺口画像、股票池计数与每交易日行数缓存，让下一次读取反映最新数据。"""
         with self._gap_profile_lock:
             self._gap_profile_cache = None
         with self._symbol_count_lock:
             self._symbol_count_cache = None
+        with self._trade_date_counts_lock:
+            self._trade_date_counts_cache = None
 
     def cached_symbol_count(self) -> int | None:
         """本地 OHLC 股票池规模（只读缓存；``None`` = 缓存未热）。
@@ -619,9 +663,12 @@ class Warehouse:
         spanning(d) = 满足 [起, 止]（生命周期截断后）覆盖 d 的股票数。某股票
         在 d 有行则必然 spanning d，因此实有 ≤ spanning 恒成立。
 
-        分类：实有行数低于 ``median × thin_day_ratio`` 的交易日是 thin day
-        （疑似写入失败），其缺行计入 missing_rows（可行动）；其余交易日的
+        分类委托给模块级纯函数 :func:`classify_market_days_by_cross_section`
+        （threshold = 当日行数 ≥ 中位数 × thin_day_ratio 的市场正常日）：thin
+        day（疑似写入失败）的缺行计入 missing_rows（可行动）；市场正常日的
         缺行是停牌类（公开渠道天然没有，不可补），计入 suspension_rows。
+        输入 ``rows_per_date`` 没有覆盖的交易日（0 行）不属于任何市场正常日
+        → 按 thin day 计入 missing_rows。
 
         返回 (missing_rows, suspension_rows)。无生命周期记录的股票按在市
         处理（保守口径不变）。
@@ -655,7 +702,7 @@ class Warehouse:
             return 0, 0
         starts.sort()
         ends.sort()
-        threshold = max(1.0, float(median(rows_per_date.values())) * thin_day_ratio)
+        classification = classify_market_days_by_cross_section(rows_per_date, thin_day_ratio=thin_day_ratio)
         missing_total = 0
         suspension_total = 0
         for day in calendar:
@@ -664,10 +711,10 @@ class Warehouse:
             internal = spanning - rows_per_date.get(day, 0)
             if internal <= 0:
                 continue
-            if rows_per_date.get(day, 0) < threshold:
-                missing_total += internal
-            else:
+            if day in classification.market_normal_days:
                 suspension_total += internal
+            else:
+                missing_total += internal
         return missing_total, suspension_total
 
     def _tail_missing_rows(
@@ -947,38 +994,42 @@ class Warehouse:
         return {str(row[0]) for row in rows}
 
     def read_capital_flow_missing_symbols(self, start_date: str, end_date: str) -> set[str]:
-        """Return symbols with no ``main_net_inflow`` value within
-        ``[start_date, end_date]`` across the daily-bars partitions the window
-        touches.
+        """Return symbols missing ``main_net_inflow`` on at least one expected
+        trade date within ``[start_date, end_date]``.
 
-        只读最新分区会让横跨旧分区的补数窗口漏掉旧分区里的缺流股票
-        （例如 12 月~1 月的窗口漏掉 ``year=2025`` 分区），因此按窗口覆盖
-        的年份选择分区；一个分区都选不中时退回最新分区保持旧行为。
+        口径从"整段窗口一行 non-null ``main_net_inflow`` 都没有"扩到"窗口内
+        有洞"：对每只股票先算窗口内的应有交易日（``a_share_trade_dates`` 减去
+        ``KNOWN_CAPITAL_FLOW_SOURCE_GAP_DATES`` 这类公开源整日缺口），再按
+        ``symbol_lifecycle`` 的 ``[listing_date, delisted_date]`` 截断；只要截断
+        后的应有交易日里有一天没有 non-null ``main_net_inflow``，该股票就进入
+        返回集合（"全空"只是"有洞"的特例，旧口径能选中的股票新口径照样选中）。
 
-        Rows outside a symbol's ``symbol_lifecycle`` window (before listing /
-        after delisting) are ignored, so a delisted stock no longer reports its
-        post-delisting dates as missing. Symbols without a lifecycle record
-        keep the conservative legacy behaviour.
+        - 候选股票 = 窗口内至少有一行的股票；窗口内完全无行属于日线停更，
+          由 ``coverage()`` 与缺口画像负责，不在本名单内；
+        - 截断后没有任何应有交易日的股票（上市前 / 退市后）不算缺失；无生命周期
+          记录的股票按整个窗口的应有交易日计算（保守口径不变）；
+        - 资金流源起点滞后豁免：``uses_symbol_capital_flow_source_start`` /
+          ``uses_listing_day_capital_flow_source_start`` 判定"该股资金流数据源
+          本身还没到起始日"（新股、920 段等）时，源起点之前的日期不算缺口——
+          与 ``coverage()``、``data/operations.py`` 出口同一规则（AGENTS §9）；
+        - 停牌豁免与停更尾部：横截面分类（:func:`classify_market_days_by_cross_section`，
+          见 :meth:`_capital_flow_market_normal_days`）判为市场正常日、且该股当日
+          整行缺失的日期按停牌类豁免；已有完整日线行但资金流为空的内部洞、
+          thin day（疑似写入失败日）的整行缺失、以及 ``max(OHLC 末行, 资金流末行)``
+          之后的停更尾部照算——尾部是"多久没同步"的可行动信号，绝不参与停牌
+          豁免（与 ``coverage()`` 的资金流尾部边界同口径，AGENTS §9）；
+        - 只读窗口覆盖年份的分区（一个都选不中时退回最新分区）+ 列裁剪 +
+          ``_safe_read_parquet``，所以横跨旧分区的补数窗口不会漏掉旧分区里的股票。
 
         Encapsulates the parquet layout so HTTP/service layers do not need to
         know how daily bars are stored.
         """
-        paths = sorted(self.daily_bars_root.glob("year=*/daily_bars.parquet"))
-        if not paths:
+        selected = self._partition_paths_for_window(start_date, end_date)
+        if not selected:
             return set()
         window_start = pd.Timestamp(start_date)
         window_end = pd.Timestamp(end_date)
-        selected: list[Path] = []
-        for path in paths:
-            try:
-                year = int(path.parent.name.split("=", maxsplit=1)[1])
-            except (IndexError, ValueError):
-                continue
-            if window_start.year <= year <= window_end.year:
-                selected.append(path)
-        if not selected:
-            selected = [paths[-1]]
-        columns_to_read = ["symbol", "trade_date", "main_net_inflow"]
+        columns_to_read = ["symbol", "trade_date", "main_net_inflow", *OHLC_COLUMNS, "listing_days"]
         frames: list[pd.DataFrame] = []
         for path in selected:
             try:
@@ -986,7 +1037,7 @@ class Warehouse:
             except FileNotFoundError:
                 continue
             columns = [column for column in columns_to_read if column in available]
-            if "symbol" not in columns or "main_net_inflow" not in columns:
+            if "symbol" not in columns or "trade_date" not in columns or "main_net_inflow" not in columns:
                 continue
             frame = self._safe_read_parquet(path, columns=columns)
             if not frame.empty:
@@ -994,31 +1045,196 @@ class Warehouse:
         if not frames:
             return set()
         frame = pd.concat(frames, ignore_index=True)
-        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
-        frame = frame.dropna(subset=["trade_date"])
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
+        frame = frame.dropna(subset=["trade_date", "symbol"])
         frame = frame[frame["trade_date"] >= window_start]
         frame = frame[frame["trade_date"] <= window_end]
         if frame.empty:
             return set()
-        lifecycle = self.read_symbol_lifecycle(
-            [str(symbol) for symbol in frame["symbol"].dropna().astype(str).unique()]
-        )
-        if lifecycle:
-            listing_by_symbol = frame["symbol"].astype(str).map(
-                lambda symbol: _lifecycle_bound(lifecycle.get(symbol), "listing_date")
-            )
-            delisted_by_symbol = frame["symbol"].astype(str).map(
-                lambda symbol: _lifecycle_bound(lifecycle.get(symbol), "delisted_date")
-            )
-            in_window = (
-                (listing_by_symbol.isna() | (frame["trade_date"] >= listing_by_symbol))
-                & (delisted_by_symbol.isna() | (frame["trade_date"] <= delisted_by_symbol))
-            )
-            frame = frame.loc[in_window]
-        if frame.empty:
+        frame["symbol"] = frame["symbol"].astype(str)
+        # 应有交易日全仓一份：交易日历 − 已知公开源整日缺口。
+        trade_dates = a_share_trade_dates(window_start, window_end)
+        expected: set[pd.Timestamp] = set(trade_dates) - KNOWN_CAPITAL_FLOW_SOURCE_GAP_DATES
+        if not expected:
             return set()
-        has_any_flow = frame.groupby(frame["symbol"].astype(str))["main_net_inflow"].any()
-        return set(has_any_flow[~has_any_flow].index)
+        # 按 symbol 做集合交集：每只股票 = 应有日期集合 − 实际有 non-null 资金流
+        # 的日期集合，非空即缺。绝不构造 symbols × dates 的全量布尔矩阵。
+        flow_dates: dict[str, set[pd.Timestamp]] = {}
+        flow_frame = frame.loc[frame["main_net_inflow"].notna()]
+        if not flow_frame.empty:
+            flow_dates = flow_frame.groupby("symbol")["trade_date"].apply(set).to_dict()
+        universe = sorted(set(frame["symbol"]))
+        lifecycle = self.read_symbol_lifecycle(universe)
+        candidates: dict[str, set[pd.Timestamp]] = {}
+        for symbol in universe:
+            record = lifecycle.get(symbol)
+            listing = lifecycle_bound(record, "listing_date")
+            delisted = lifecycle_bound(record, "delisted_date")
+            if listing is None and delisted is None:
+                symbol_expected = expected
+            else:
+                symbol_expected = {
+                    day
+                    for day in expected
+                    if (listing is None or day >= listing) and (delisted is None or day <= delisted)
+                }
+            if not symbol_expected:
+                # 生命周期截断后窗口内没有任何应有交易日 → 不算缺失。
+                continue
+            rest = symbol_expected - flow_dates.get(symbol, frozenset())
+            if rest:
+                candidates[symbol] = rest
+        if not candidates:
+            return set()
+
+        # 豁免 1：资金流源起点滞后。窗口内首行日期与首行 listing_days 只算一次，
+        # 逐候选股判定（完整股票不付这笔开销）。
+        first_daily_by_symbol = frame.groupby("symbol")["trade_date"].min().to_dict()
+        warehouse_start = frame["trade_date"].min()
+        first_listing_days: dict[str, float] = {}
+        if "listing_days" in frame.columns:
+            first_row_mask = frame["trade_date"] == frame.groupby("symbol")["trade_date"].transform("min")
+            first_rows = frame.loc[first_row_mask]
+            if not first_rows.empty:
+                first_listing_days = (
+                    pd.to_numeric(first_rows["listing_days"], errors="coerce").groupby(first_rows["symbol"]).min().to_dict()
+                )
+        for symbol in list(candidates):
+            symbol_flow_dates = flow_dates.get(symbol)
+            if not symbol_flow_dates:
+                # 窗口内一行资金流都没有 → 无从判定源起点（coverage()/operations 同口径）。
+                continue
+            flow_start = min(symbol_flow_dates)
+            first_daily = first_daily_by_symbol.get(symbol)
+            if uses_symbol_capital_flow_source_start(symbol, flow_start, first_daily, warehouse_start) or (
+                uses_listing_day_capital_flow_source_start(first_listing_days.get(symbol, float("nan")), first_daily, flow_start)
+            ):
+                candidates[symbol] = {day for day in candidates[symbol] if day >= flow_start}
+
+        # 豁免 2：停牌日（市场正常日的整行缺失）；内部洞与停更尾部照算。
+        market_normal_days = self._capital_flow_market_normal_days(start_date, end_date, len(trade_dates))
+        if market_normal_days and candidates:
+            ohlc_dates: dict[str, set[pd.Timestamp]] = {}
+            ohlc_last: dict[str, pd.Timestamp] = {}
+            if all(column in frame.columns for column in OHLC_COLUMNS):
+                ohlc_frame = frame.loc[frame[OHLC_COLUMNS].notna().all(axis=1)]
+                if not ohlc_frame.empty:
+                    ohlc_dates = ohlc_frame.groupby("symbol")["trade_date"].apply(set).to_dict()
+                    ohlc_last = ohlc_frame.groupby("symbol")["trade_date"].max().to_dict()
+            flow_last = {symbol: max(days) for symbol, days in flow_dates.items()}
+            for symbol, rest in list(candidates.items()):
+                if not rest:
+                    continue
+                boundaries = [value for value in (ohlc_last.get(symbol), flow_last.get(symbol)) if value is not None]
+                boundary = max(boundaries) if boundaries else None
+                symbol_ohlc_dates = ohlc_dates.get(symbol, frozenset())
+                kept: set[pd.Timestamp] = set()
+                for day in rest:
+                    if day in symbol_ohlc_dates:
+                        # 已有完整日线行但资金流为空 → 内部洞，可行动，照算。
+                        kept.add(day)
+                    elif boundary is not None and day > boundary:
+                        # 停更尾部（max(OHLC 末行, 资金流末行) 之后）→ 必须可见。
+                        kept.add(day)
+                    elif day not in market_normal_days:
+                        # thin day / 0 行日的整行缺失 → 疑似写入失败，可行动，照算。
+                        kept.add(day)
+                    # 其余（市场正常日的整行缺失）= 停牌类，豁免不进名单。
+                candidates[symbol] = kept
+        return {symbol for symbol, days in candidates.items() if days}
+
+    def _capital_flow_market_normal_days(self, start_date: str, end_date: str, trade_day_count: int) -> set[pd.Timestamp]:
+        """资金流缺口名单用的“市场正常日”集合；样本不足或计数拿不到时返回空集合（退回平日历口径）。
+
+        与 ``data/sync.py`` 的窗口快照、``data/operations.py`` 的逐股覆盖共用
+        :func:`classify_market_days_by_cross_section` 的阈值口径，且只喂**有行**
+        的交易日：``market_trade_date_counts`` 按交易日历补的 0 行日不是横截面
+        证据（通常是节假日表覆盖问题或全市场未写入），混进中位数会压低阈值，
+        让各出口对同一天给出不同分类——``coverage()`` / sync 的计数都来自有行
+        日期的 groupby，这里必须对齐。
+        """
+        if trade_day_count < MIN_TRADE_DAYS_FOR_CAPITAL_FLOW_SUSPENSION_EXEMPTION:
+            return set()
+        try:
+            counts = self.market_trade_date_counts(start_date, end_date)
+        except Exception as exc:  # noqa: BLE001 - 分类拿不到就退回平日历口径（旧行为）
+            logger.warning("capital-flow suspension exemption skipped; market trade-date counts failed: %s", exc)
+            return set()
+        positive_counts = {day: count for day, count in counts.items() if count > 0}
+        if not positive_counts:
+            return set()
+        return classify_market_days_by_cross_section(positive_counts).market_normal_days
+
+    def market_trade_date_counts(self, start_date: str, end_date: str) -> dict[str, int]:
+        """窗口内每个交易日的全市场 OHLC 完整行数（``{"YYYY-MM-DD": 行数}``）。
+
+        只读 ``symbol/trade_date/open/high/low/close`` 六列，OHLC 四列全非空的
+        行才计数。键覆盖 ``[start_date, end_date]`` 内的每个 A 股交易日：没有
+        完整行的交易日记 0，仓库里落在非交易日的行也会以真实行数出现在结果里。
+        供复用 :func:`classify_market_days_by_cross_section` 横截面阈值时充当输入
+        （``data/sync.py`` / ``data/operations.py`` 与本模块的资金流缺口名单）；
+        0 值键按交易日历补出、不是横截面证据，喂给分类器前应由调用方过滤。
+
+        按窗口年份选分区；单个损坏分区跳过并登记 ``corrupt_partitions``，不让
+        一个坏分区炸掉整个调用。10 分钟 TTL 单条缓存，缓存 key 即
+        ``(start_date, end_date)``，``write_daily_bars`` →
+        ``invalidate_gap_profile`` 会让它失效。
+        """
+        key = (str(start_date), str(end_date))
+        with self._trade_date_counts_lock:
+            cached = self._trade_date_counts_cache
+            if (
+                cached is not None
+                and cached[1] == key
+                and time.monotonic() - cached[0] < TRADE_DATE_COUNTS_TTL_SECONDS
+            ):
+                return cached[2]
+        counts = self._compute_trade_date_counts(key[0], key[1])
+        with self._trade_date_counts_lock:
+            self._trade_date_counts_cache = (time.monotonic(), key, counts)
+        return counts
+
+    def _compute_trade_date_counts(self, start_date: str, end_date: str) -> dict[str, int]:
+        window_start = pd.Timestamp(start_date)
+        window_end = pd.Timestamp(end_date)
+        if window_end < window_start:
+            return {}
+        # 先按交易日历铺 0，保证"没有任何数据的交易日"也在结果里（thin-day
+        # 判定需要它们），随后把落在非交易日的行按真实行数补进来。
+        counts: dict[str, int] = {
+            pd.Timestamp(day).date().isoformat(): 0 for day in sorted(a_share_trade_dates(window_start, window_end))
+        }
+        wanted_columns = ["symbol", "trade_date", *OHLC_COLUMNS]
+        for path in self._partition_paths_for_window(start_date, end_date):
+            try:
+                available = set(pq.ParquetFile(path).schema_arrow.names)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:  # noqa: BLE001 - 坏分区跳过并登记，不炸掉整个调用
+                self._note_corrupt_partition(path, exc)
+                continue
+            columns = [column for column in wanted_columns if column in available]
+            if "trade_date" not in columns or not all(column in columns for column in OHLC_COLUMNS):
+                continue
+            try:
+                frame = self._safe_read_parquet(path, columns=columns)
+            except Exception:  # noqa: BLE001 - _safe_read_parquet 已登记 corrupt_partitions
+                continue
+            if frame.empty:
+                continue
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+            frame = frame.dropna(subset=["trade_date"])
+            frame = frame[frame["trade_date"] >= window_start]
+            frame = frame[frame["trade_date"] <= window_end]
+            if frame.empty:
+                continue
+            complete = frame.loc[frame[OHLC_COLUMNS].notna().all(axis=1)]
+            if complete.empty:
+                continue
+            for trade_date, count in complete.groupby(complete["trade_date"].dt.normalize()).size().items():
+                day_key = pd.Timestamp(trade_date).date().isoformat()
+                counts[day_key] = counts.get(day_key, 0) + int(count)
+        return counts
 
     def _safe_read_parquet(self, path: Path, **kwargs) -> pd.DataFrame:
         """Read a partition, distinguishing "absent" from "unreadable".
@@ -1057,6 +1273,55 @@ class Warehouse:
     def clear_corrupt_partitions(self) -> None:
         with self._corrupt_partitions_lock:
             self._corrupt_partitions.clear()
+
+
+class MarketDayClassification(NamedTuple):
+    """横截面分类结果（见 :func:`classify_market_days_by_cross_section`）。
+
+    ``market_normal_days``：市场正常日，其缺行是停牌类（不可补，记
+    ``suspension_rows``）；``thin_days``：疑似写入失败日，其缺行可补（记
+    ``missing_rows``）。
+    """
+
+    market_normal_days: set[pd.Timestamp]
+    thin_days: set[pd.Timestamp]
+
+
+def classify_market_days_by_cross_section(
+    rows_by_date: Mapping[pd.Timestamp | date | str, int],
+    *,
+    thin_day_ratio: float = 0.5,
+) -> MarketDayClassification:
+    """按横截面证据把交易日分成"市场正常日"与 thin day。
+
+    对每个交易日 d：当日全市场 OHLC 完整行数 ``rows_by_date[d]`` ≥
+    ``median(各日行数) × thin_day_ratio``（下限 1.0）→ 市场正常日，它的缺行
+    是停牌类（公开渠道天然没有停牌日 K 线，不可补）；否则 → thin day（当日
+    全市场行数异常低，疑似写入失败，缺行可补）。2025 年实测 15,095 个缺口
+    **100%** 落在市场正常日——旧"累计真实缺口"口径就是因此被实证推翻。
+
+    纯函数、不读仓：``Warehouse.coverage()``（内部洞分类）与后续
+    ``data/sync.py`` / ``data/operations.py`` 共用同一阈值口径。键会被归一化为
+    ``pd.Timestamp``（同日多键行数累加）；返回的两个集合只覆盖输入里出现的
+    日期——输入里没有行的交易日不在任一集合中，调用方按"0 行 < 任何阈值"
+    自行归入 thin。0 值键传进来也会被分进 thin，但各调用方约定先把 0 行日
+    过滤掉再分类：0 行日不是横截面证据，混入中位数会压低阈值，让三个出口对
+    同一天给出不同分类（``market_trade_date_counts`` 按交易日历补 0，其调用方
+    见 operations 的 ``_market_day_classification`` 与 warehouse 的
+    ``_capital_flow_market_normal_days``）。空输入返回两个空集合。
+    """
+    counts: dict[pd.Timestamp, int] = {}
+    for day, value in rows_by_date.items():
+        key = pd.Timestamp(day).normalize()
+        counts[key] = counts.get(key, 0) + int(value)
+    if not counts:
+        return MarketDayClassification(market_normal_days=set(), thin_days=set())
+    threshold = max(1.0, float(median(counts.values())) * thin_day_ratio)
+    normal: set[pd.Timestamp] = set()
+    thin: set[pd.Timestamp] = set()
+    for day, value in counts.items():
+        (normal if value >= threshold else thin).add(day)
+    return MarketDayClassification(market_normal_days=normal, thin_days=thin)
 
 
 def _require_ohlc_rows(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1112,4 +1377,30 @@ def uses_symbol_capital_flow_source_start(
     if first_daily <= start:
         return False
     lag_days = (pd.Timestamp(flow_start) - first_daily).days
+    return 0 <= lag_days <= KNOWN_CAPITAL_FLOW_LISTING_LAG_DAYS
+
+
+def uses_listing_day_capital_flow_source_start(
+    first_listing_days: float,
+    first_daily_date: pd.Timestamp | None,
+    flow_start: pd.Timestamp | None,
+) -> bool:
+    """首行 ``listing_days`` ≤ 10 的股票是否适用“资金流源起点滞后”豁免。
+
+    窗口里看到的首根日线落在上市 10 天内（``first_listing_days``，9999 表示未知）
+    说明那就是该股上市初期；资金流起点落在首根日线之后 0~
+    ``KNOWN_CAPITAL_FLOW_LISTING_LAG_DAYS`` 天内 → 视为“该股资金流数据源本身
+    还没到起始日”，源起点之前的日期不算缺口。``data/operations.py`` 的
+    ``_symbols_with_complete_capital_flow`` 与
+    :meth:`Warehouse.read_capital_flow_missing_symbols` 共用这一判定——判定规则
+    只有这一个家，调用方各自负责从自己的帧里取出首行 ``listing_days``。
+    """
+    if flow_start is None or first_daily_date is None or pd.isna(first_daily_date):
+        return False
+    try:
+        if pd.isna(first_listing_days) or float(first_listing_days) > 10:
+            return False
+    except (TypeError, ValueError):
+        return False
+    lag_days = (pd.Timestamp(flow_start) - pd.Timestamp(first_daily_date)).days
     return 0 <= lag_days <= KNOWN_CAPITAL_FLOW_LISTING_LAG_DAYS

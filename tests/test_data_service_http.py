@@ -220,6 +220,34 @@ def test_capital_flow_backfill_records_symbol_source_failure_before_provider_fal
     assert any("capital-flow symbol read failed" in item["message"] for item in state.logs)
 
 
+def test_capital_flow_backfill_returns_empty_when_window_has_no_gaps(tmp_path, monkeypatch):
+    state = DataServiceState(tmp_path, port=0)
+
+    monkeypatch.setattr(state.warehouse, "read_daily_symbols", lambda **_kwargs: ["000001"])
+    monkeypatch.setattr(state.warehouse, "read_capital_flow_missing_symbols", lambda start_date, end_date: set())
+    handler = object.__new__(DataServiceHandler)
+    handler.server = SimpleNamespace(state=state)
+
+    assert handler._capital_flow_backfill_symbols("2026-05-26", "2026-05-29") == []
+    assert any("无资金流缺口" in item["message"] for item in state.logs)
+
+
+def test_capital_flow_backfill_keeps_full_local_list_when_gap_check_fails(tmp_path, monkeypatch):
+    state = DataServiceState(tmp_path, port=0)
+
+    monkeypatch.setattr(state.warehouse, "read_daily_symbols", lambda **_kwargs: ["000001", "000002"])
+
+    def broken_gap_check(start_date, end_date):
+        raise OSError("corrupt warehouse partition")
+
+    monkeypatch.setattr(state.warehouse, "read_capital_flow_missing_symbols", broken_gap_check)
+    handler = object.__new__(DataServiceHandler)
+    handler.server = SimpleNamespace(state=state)
+
+    assert handler._capital_flow_backfill_symbols("2026-05-26", "2026-05-29") == ["000001", "000002"]
+    assert any("capital-flow coverage inspection failed" in item["message"] for item in state.logs)
+
+
 def test_sync_symbols_records_internal_attribute_error_before_provider_fallback(
     tmp_path,
     monkeypatch,
@@ -346,6 +374,45 @@ def test_service_health_does_not_restart_coverage_refresh_when_snapshot_is_fresh
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_coverage_refresh_reruns_with_post_write_data_when_forced_during_running_refresh(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    state = DataServiceState(tmp_path, port=0)
+    entered = Event()
+    release = Event()
+    reads: list[int] = []
+
+    def fake_read_coverage():
+        reads.append(len(reads))
+        if len(reads) == 1:
+            entered.set()
+            assert release.wait(timeout=5), "首轮 coverage 读取未被释放（测试收尾失败）"
+            return [DatasetCoverage(dataset="daily_bars", symbols=1, start_date=None, end_date=None)]
+        return [DatasetCoverage(dataset="daily_bars", symbols=5, start_date=None, end_date=None)]
+
+    monkeypatch.setattr(state, "_read_coverage_snapshot", fake_read_coverage)
+
+    finished = state.start_coverage_refresh(force=True)
+    assert finished is not None
+    assert entered.wait(timeout=5)
+
+    # 模拟"写入发生在刷新进行中"：路此刻请求 force refresh，写前数据即将落盘。
+    written_at = datetime.now(UTC)
+    assert state.start_coverage_refresh(force=True) is None
+    release.set()
+    assert finished.wait(timeout=5)
+
+    assert len(reads) == 2, "写入之后必须补跑一轮以写入后数据为输入的刷新"
+    assert [item.symbols for item in state.coverage_snapshot()] == [5]
+    assert state._coverage_refreshed_at is not None
+    # 不能用 `refreshed_at > written_at` 断言：两者都是 datetime.now(UTC)，
+    # 在快机器上可以落在同一微秒（CI 实测相等，本机也可复现）。
+    # 真正的不变量是"最终快照来自强制刷新之后的那一轮读取"——用序号断言：
+    # 两次读取都发生过，且最终快照是第二次（symbols=5）的内容。
+    assert len(reads) == 2 and state.coverage_snapshot()[0].symbols == 5
+    assert state._coverage_refreshed_at >= written_at
 
 
 def test_service_coverage_endpoint_returns_symbol_items(tmp_path):
@@ -867,6 +934,120 @@ def test_service_fetch_daily_bars_merges_capital_flow_from_configured_crawler(tm
         thread.join(timeout=5)
 
 
+def test_service_fetch_daily_bars_adopts_operation_coverage_into_state_snapshot(tmp_path, monkeypatch):
+    import astock_backtester.service as service_module
+
+    operation_coverage = [
+        DatasetCoverage(
+            dataset="daily_bars",
+            symbols=7,
+            start_date="2026-05-26",
+            end_date="2026-05-29",
+            missing_rows=0,
+        )
+    ]
+
+    class FakeResult:
+        logs: list = []
+
+        def model_dump(self, mode="json"):
+            return {
+                "status": "ok",
+                "imported_rows": 1,
+                "requested_symbols": ["000001"],
+                "fetched_symbols": ["000001"],
+                "missing_symbols": [],
+                "coverage": [],
+                "logs": [],
+                "diagnostics": [],
+                "failures": [],
+            }
+
+    FakeResult.coverage = operation_coverage
+
+    refresh_calls: list[bool] = []
+    server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
+    monkeypatch.setattr(
+        server.state,
+        "start_coverage_refresh",
+        lambda *, force=False: refresh_calls.append(force),
+    )
+    monkeypatch.setattr(service_module, "fetch_daily_bars_into_cache", lambda **_kwargs: FakeResult())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        response = _request_json(
+            "POST",
+            f"http://127.0.0.1:{port}/fetch/daily-bars",
+            {"symbols": ["000001"], "start_date": "2026-05-26", "end_date": "2026-05-29"},
+        )
+
+        assert response["status"] == "ok"
+        assert refresh_calls == [True]
+        assert [item.symbols for item in server.state.coverage_snapshot()] == [7]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_service_fetch_capital_flow_adopts_operation_coverage_into_state_snapshot(tmp_path, monkeypatch):
+    import astock_backtester.service as service_module
+
+    operation_coverage = [
+        DatasetCoverage(
+            dataset="capital_flow",
+            symbols=3,
+            start_date="2026-05-26",
+            end_date="2026-05-29",
+            missing_rows=0,
+        )
+    ]
+
+    class FakeResult:
+        logs: list = []
+
+        def model_dump(self, mode="json"):
+            return {
+                "status": "ok",
+                "imported_rows": 4,
+                "requested_symbols": ["000001"],
+                "fetched_symbols": ["000001"],
+                "missing_symbols": [],
+                "coverage": [],
+                "logs": [],
+                "diagnostics": [],
+                "failures": [],
+            }
+
+    FakeResult.coverage = operation_coverage
+
+    refresh_calls: list[bool] = []
+    server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
+    monkeypatch.setattr(
+        server.state,
+        "start_coverage_refresh",
+        lambda *, force=False: refresh_calls.append(force),
+    )
+    monkeypatch.setattr(service_module, "fetch_capital_flow_into_cache", lambda **_kwargs: FakeResult())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        response = _request_json(
+            "POST",
+            f"http://127.0.0.1:{port}/fetch/capital-flow",
+            {"symbols": ["000001"], "start_date": "2026-05-26", "end_date": "2026-05-29"},
+        )
+
+        assert response["status"] == "ok"
+        assert refresh_calls == [True]
+        assert [item.symbols for item in server.state.coverage_snapshot()] == [3]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_service_fetch_capital_flow_backfills_existing_rows_and_reports_failures(tmp_path):
     class FakeCapitalFlowCrawler:
         def fetch_many_fund_flows(self, symbols, start_date, end_date, timeout=15, skip_eastmoney=False):
@@ -980,6 +1161,8 @@ def test_service_fetch_capital_flow_empty_symbols_starts_backfill_job_for_local_
         assert manager.calls == [(["000001", "000002"], "2026-05-26", "2026-05-29")]
         assert response["job"]["mode"] == "capital_flow_backfill"
         assert response["job"]["status"] == "running"
+        # 任务刚启动：filled_missing_rows 必须显式为 0，与其它路径字段同构。
+        assert response["filled_missing_rows"] == 0
         assert response["diagnostics"][0]["code"] == "capital_flow_backfill_job_started"
     finally:
         server.shutdown()
@@ -1027,6 +1210,74 @@ def test_service_empty_capital_flow_backfill_falls_back_to_provider_symbols_with
 
         assert manager.calls == [(["000002", "000003"], "2026-05-26", "2026-05-29")]
         assert response["job"]["total_symbols"] == 2
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_service_fetch_capital_flow_empty_symbols_reports_no_gaps_without_starting_job(tmp_path):
+    class FakeProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def list_symbols(self):
+            self.calls += 1
+            return ["000002", "000003"]
+
+    class FakeSyncManager:
+        def __init__(self):
+            self.calls = []
+
+        def start_capital_flow_backfill(self, symbols, start_date, end_date):
+            self.calls.append((symbols, start_date, end_date))
+            raise AssertionError("窗口内没有资金流缺口时不得启动补齐任务")
+
+    server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
+    provider = FakeProvider()
+    server.state.provider = provider
+    server.state.warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000001"] * 4,
+                "trade_date": pd.to_datetime(
+                    ["2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29"]
+                ),
+                "open": [10.0] * 4,
+                "high": [10.5] * 4,
+                "low": [9.8] * 4,
+                "close": [10.2] * 4,
+                "volume": [1000] * 4,
+                "main_net_inflow": [1_000_000.0] * 4,
+            }
+        )
+    )
+    manager = FakeSyncManager()
+    server.state.sync_manager = manager
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        request = Request(
+            f"http://127.0.0.1:{port}/fetch/capital-flow",
+            data=json.dumps(
+                {"symbols": [], "start_date": "2026-05-26", "end_date": "2026-05-29"}
+            ).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with _OPENER.open(request, timeout=_LOOPBACK_TIMEOUT_S) as raw:
+            # "没活干"是 200 正常结果，不是 validation_error。
+            assert raw.status == 200
+            response = json.loads(raw.read().decode("utf-8"))
+
+        assert manager.calls == []
+        assert provider.calls == 0
+        assert response["status"] == "ok"
+        assert "job" not in response
+        assert "capital_flow_backfill_no_gaps" in {item["code"] for item in response["diagnostics"]}
+        assert response["failures"] == []
+        assert response["logs"] and response["logs"][-1]["message"]
+        assert isinstance(response["coverage"], list)
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -4496,6 +4747,91 @@ def test_service_cancels_sync_job_by_id(tmp_path):
 
         assert response["job"]["status"] == "cancelling"
         assert response["job"]["returned_rows"] == 8
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_service_fetch_capital_flow_no_gaps_response_reports_filled_missing_rows(tmp_path):
+    """空缺口响应必须与其它路径字段同构：filled_missing_rows 不能缺席（前端 types.ts 已声明）。"""
+
+    class FakeSyncManager:
+        def start_capital_flow_backfill(self, symbols, start_date, end_date):
+            raise AssertionError("窗口内没有资金流缺口时不得启动补齐任务")
+
+    server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
+    server.state.warehouse.write_daily_bars(
+        pd.DataFrame(
+            {
+                "symbol": ["000001"] * 4,
+                "trade_date": pd.to_datetime(["2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29"]),
+                "open": [10.0] * 4,
+                "high": [10.5] * 4,
+                "low": [9.8] * 4,
+                "close": [10.2] * 4,
+                "volume": [1000] * 4,
+                "main_net_inflow": [1_000_000.0] * 4,
+            }
+        )
+    )
+    server.state.sync_manager = FakeSyncManager()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        response = _request_json(
+            "POST",
+            f"http://127.0.0.1:{port}/fetch/capital-flow",
+            {"symbols": [], "start_date": "2026-05-26", "end_date": "2026-05-29"},
+        )
+
+        assert response["status"] == "ok"
+        assert response["filled_missing_rows"] == 0
+        assert "capital_flow_backfill_no_gaps" in {item["code"] for item in response["diagnostics"]}
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_service_missing_only_refreshes_lifecycle_before_building_gap_list(tmp_path):
+    """/sync/missing-only 必须先 best-effort 刷新 symbol_lifecycle 再算缺口名单（§9 同款）。
+
+    真退市股先标 delisted 再进完整性快照，否则每轮"只补缺口"都会把停更股
+    重复算进名单；刷新本身 never-raises，这里只钉住调用次序。
+    """
+    order: list[str] = []
+
+    class FakeManager:
+        def incomplete_symbols(self, start_date, end_date):
+            order.append("incomplete_symbols")
+            return []
+
+        def start_full_market(self, symbols, start_date, end_date):
+            raise AssertionError("名单为空时不得启动全市场任务")
+
+    server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
+    server.state.sync_manager = FakeManager()
+
+    def fake_refresh():
+        order.append("refresh_symbol_lifecycle")
+        return {"listed_upserts": 0, "delisted_upserts": 0}
+
+    server.state.refresh_symbol_lifecycle_best_effort = fake_refresh
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        response = _request_json(
+            "POST",
+            f"http://127.0.0.1:{port}/sync/missing-only",
+            {"start_date": "2026-05-26", "end_date": "2026-05-29"},
+        )
+
+        assert order == ["refresh_symbol_lifecycle", "incomplete_symbols"], (
+            "lifecycle 刷新必须发生在缺口名单计算之前，否则真退市股会每轮重复进名单"
+        )
+        assert response["started"] is False
+        assert response["missing_symbols"] == 0
     finally:
         server.shutdown()
         thread.join(timeout=5)

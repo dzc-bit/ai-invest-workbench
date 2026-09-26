@@ -592,6 +592,34 @@ def test_condition_registry_stays_in_sync():
     assert set(MASK_BUILDERS) == registry_ids
 
 
+def test_turnover_between_row_and_mask_agree_on_percent_scale():
+    """``turnover_between`` 的两套实现必须同口径（引擎 prefilter 走 MASK）。
+
+    仓库 ``turnover_rate`` 是百分数量纲（实测 229 万行：median 0.38、max 98.28），
+    条件参数是分数（推荐策略用 ``{min: 0.02, max: 0.08}`` = 换手率 2%~8%）。
+    旧实现只在行级把 >1 的值除以 100，MASK 直接拿分数区间比百分数——2% 的股票
+    行级判 True、MASK 判 False，prefilter 于是把候选**全部**丢掉，
+    ``turnover_between`` 在向量化路径上永远筛不出股票。
+    """
+    node = ConditionNode(
+        id="turnover",
+        condition_id="turnover_between",
+        params={"min": 0.02, "max": 0.08},
+    )
+    frame = pd.DataFrame({"turnover_rate": [0.38, 2.0, 5.0, 9.0, 0.5, float("nan")]})
+    mask = MASK_BUILDERS["turnover_between"](node, frame)
+
+    for index, value in enumerate(frame["turnover_rate"]):
+        row_passed = evaluate_condition(node, pd.Series({"turnover_rate": value}), frame).passed
+        assert bool(mask.iloc[index]) == row_passed, (
+            f"turnover_rate={value!r}: row evaluator and mask builder disagree "
+            f"(row={row_passed}, mask={bool(mask.iloc[index])})"
+        )
+
+    # 2% 与 5% 必须都通过（落在 2%~8% 内），9% 与 0.38% 不通过。
+    assert mask.tolist() == [False, True, True, False, False, False]
+
+
 def test_backtest_settings_defaults_to_conservative_execution():
     settings = BacktestSettings(
         start_date=date(2024, 1, 2),

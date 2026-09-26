@@ -53,6 +53,22 @@ def sina_summary_symbol(symbol: str) -> str | None:
     return f"s_{code}" if code else None
 
 
+def is_st_name(name: str | None) -> bool:
+    """A-share 名称是否带 ST / *ST 风险警示标记。
+
+    交易所通过**证券简称**表达风险警示（``ST``/``*ST``），上游行情接口不带独立
+    的 ``is_st`` 字段，所以入库时必须由名称派生——否则
+    ``engine._stock_limit_pct`` 会把 ST 股按 10% 判涨跌停（实际 5%），
+    ``BacktestSettings.exclude_st`` 也会失效。``SST``/``S*ST``（旧制度）落在
+    ``ST`` 子串内。
+
+    刻意**不含**退市整理期的"退"字：那类股票涨跌幅仍是 10%，标成 ``is_st``
+    会给出错误的 5% 涨跌停口径（``data/risk.py`` 另有独立的退市风险告警）。
+    """
+    text = str(name or "").strip().upper()
+    return "ST" in text
+
+
 def market_code(code: str) -> int:
     """Eastmoney numeric market prefix: 1 for Shanghai (6/9), 0 otherwise.
 

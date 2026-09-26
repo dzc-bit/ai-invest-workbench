@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 import requests
 from astock_backtester.data.http_transport import resilient_get, scraping_get, scraping_session, should_allow_alternate_transport
+from astock_backtester.data.parsing import parse_money_amount
 from astock_backtester.data.realtime import (
     HeavyMarketCrawlerProvider,
     RealtimeMarketProvider,
@@ -1303,6 +1304,40 @@ class TestParseFloat:
 
     def test_invalid(self):
         assert parse_float("abc") is None
+
+
+class TestParseMoneyAmount:
+    """资金流金额解析的唯一归属（``data/parsing.py``）。
+
+    东财 f52、新浪 netamount、百度 extMainIn 三源实测同值且单位都是**元**；
+    百度带中文数量级后缀。混进差 1e4/1e8 的量级会让同一列不可比。
+    """
+
+    def test_wan_suffix_scales_to_yuan(self):
+        assert parse_money_amount("3298.68万") == 32_986_800.0
+
+    def test_yi_suffix_scales_to_yuan(self):
+        assert parse_money_amount("-1.81亿") == -181_000_000.0
+
+    def test_sign_is_preserved(self):
+        assert parse_money_amount("+100万") == 1_000_000.0
+
+    def test_thousand_separators_and_yuan_suffix(self):
+        assert parse_money_amount("1,234.5万元") == 12_345_000.0
+
+    def test_plain_number_is_yuan(self):
+        assert parse_money_amount("2000000") == 2_000_000.0
+
+    def test_scientific_notation_keeps_the_exponent(self):
+        """``1.2e8`` 必须整体解析：旧实现只取 ``1.2``，静默差 8 个数量级。"""
+        assert parse_money_amount("1.2e8") == 120_000_000.0
+
+    def test_blank_placeholders(self):
+        for value in (None, "", "-", "--"):
+            assert parse_money_amount(value) is None
+
+    def test_non_numeric(self):
+        assert parse_money_amount("abc") is None
 
 
 class TestNormalizeChangePct:

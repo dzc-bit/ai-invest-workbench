@@ -248,10 +248,21 @@ def _close_below_ma(node: ConditionNode, row: pd.Series, frame: pd.DataFrame) ->
     return ConditionResult(value < 0, f"close {row['close']:.2f} below MA{window} {row[f'ma_{window}']:.2f}", value)
 
 
+def _turnover_ratio(value: float) -> float:
+    """Normalize the warehouse's percent-scale ``turnover_rate`` to a fraction.
+
+    ``turnover_rate`` 在仓库里是**百分数量纲**（实测 229 万行：中位数 0.38、最大
+    98.28；``volume / 流通股 × 100`` 恰好等于该列），而条件参数是分数
+    （``{"min": 0.02, "max": 0.08}`` = 换手率 2%~8%）。行级 evaluator 与向量化
+    mask builder 必须共用这一处归一：二者给出相反结论时，engine 的 prefilter
+    （走 MASK）会把行级判定为通过的股票全部提前丢掉，推荐策略的换手率条件会
+    永远筛不出任何股票。
+    """
+    return value / 100.0 if value > 1 else value
+
+
 def _turnover_between(node: ConditionNode, row: pd.Series, frame: pd.DataFrame) -> ConditionResult:
-    value = float(row["turnover_rate"])
-    if value > 1:
-        value = value / 100
+    value = _turnover_ratio(float(row["turnover_rate"]))
     minimum = float(node.params["min"])
     maximum = float(node.params["max"])
     return ConditionResult(
@@ -414,7 +425,11 @@ def _mask_close_below_ma(node: ConditionNode, data: pd.DataFrame) -> pd.Series:
 
 
 def _mask_turnover_between(node: ConditionNode, data: pd.DataFrame) -> pd.Series:
-    return data["turnover_rate"].between(float(node.params["min"]), float(node.params["max"]), inclusive="both")
+    # 与行级 ``_turnover_between`` 共用 ``_turnover_ratio``：百分数 >1 归一到分数。
+    # 不归一时 MASK 会用分数区间去比百分数量纲，prefilter 把候选全部丢掉。
+    values = pd.to_numeric(data["turnover_rate"], errors="coerce")
+    normalized = values.where(values <= 1, values / 100.0)
+    return normalized.between(float(node.params["min"]), float(node.params["max"]), inclusive="both")
 
 
 def _mask_past_return_at_most(node: ConditionNode, data: pd.DataFrame) -> pd.Series:
