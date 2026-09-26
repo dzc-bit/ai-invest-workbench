@@ -1,8 +1,6 @@
 import logging
 import threading
-import time
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
 
 import pandas as pd
 from astock_backtester.cli import handle_command
@@ -13,6 +11,7 @@ from astock_backtester.data.astock_adapter import (
     AStockDataUnavailable,
     HttpAStockFetcher,
 )
+from astock_backtester.data.http_transport import HostThrottle
 
 
 class _FakeResponse:
@@ -911,12 +910,25 @@ def test_production_construction_throttles_per_host():
 
 
 def test_every_outbound_request_path_is_throttled():
-    """四条出站路径（公开 K 线、腾讯报价、东财资金流/信息、百度兜底）都要过同一个每 host 限速器。"""
+    """四条出站路径（公开 K 线、腾讯报价、东财资金流/信息、百度兜底）都要过同一个每 host 限速器。
+
+    断言的是**限速器被调用**而不是墙钟间隔：``time.sleep`` 在 Windows 上粒度约 15ms，
+    同一 host 两次请求的实测墙钟差可能略小于设定间隔（CI 实测 0.047 < 0.05），按墙钟
+    断言会变成 flaky 测试。这里给限速器注入确定性时钟：每 host 的第二次请求必须正好
+    申请 ``interval`` 的等待，路径绕过限速器则计数对不上。
+    """
     interval = 0.05
-    stamps: dict[str, list[float]] = {}
+    sleeps: list[float] = []
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
 
     def stamp(url, payload):
-        stamps.setdefault(urlparse(url).netloc, []).append(time.monotonic())
         return payload
 
     def public_json(url, params, headers, timeout):
@@ -931,7 +943,7 @@ def test_every_outbound_request_path_is_throttled():
         return stamp(url, {"data": {"f58": "股票"}})
 
     fetcher = HttpAStockFetcher(json_get=json_get, public_json_get=public_json, public_text_get=public_text)
-    fetcher.min_request_interval = interval
+    fetcher._throttle = HostThrottle(interval, clock=fake_clock, sleep=fake_sleep)
 
     kline_url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     fetcher._request_public_json(kline_url, {}, {}, 5)
@@ -949,10 +961,11 @@ def test_every_outbound_request_path_is_throttled():
     fetcher._fetch_baidu_market_data("600519", "2026-09-24")
     fetcher._fetch_baidu_market_data("600519", "2026-09-24")
 
-    assert len(stamps) == 5, f"expected five distinct hosts, got {sorted(stamps)}"
-    for host, times in stamps.items():
-        assert len(times) == 2, f"{host}: expected two same-host requests"
-        assert times[1] - times[0] >= interval, f"{host}: same-host requests must be >= {interval}s apart"
+    # 五条不同 host：每条的第二笔请求都要向同一个限速器申请一次等待。
+    assert len(sleeps) == 5, f"expected one throttled wait per host, got {len(sleeps)}: {sleeps}"
+    for seconds in sleeps:
+        # 浮点累加（slot 基于增量时钟）会带来 1e-14 级误差，用容差比较。
+        assert abs(seconds - interval) < 1e-9, f"each host re-request must wait {interval}s, got {seconds}"
 
 
 def test_public_kline_path_never_writes_fake_zero_turnover_rate():

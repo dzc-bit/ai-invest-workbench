@@ -398,7 +398,7 @@ def test_coverage_refresh_reruns_with_post_write_data_when_forced_during_running
     assert finished is not None
     assert entered.wait(timeout=5)
 
-    # 模拟"写入发生在刷新进行中"：路由此刻请求 force refresh，写前数据即将落盘。
+    # 模拟"写入发生在刷新进行中"：路此刻请求 force refresh，写前数据即将落盘。
     written_at = datetime.now(UTC)
     assert state.start_coverage_refresh(force=True) is None
     release.set()
@@ -407,7 +407,12 @@ def test_coverage_refresh_reruns_with_post_write_data_when_forced_during_running
     assert len(reads) == 2, "写入之后必须补跑一轮以写入后数据为输入的刷新"
     assert [item.symbols for item in state.coverage_snapshot()] == [5]
     assert state._coverage_refreshed_at is not None
-    assert state._coverage_refreshed_at > written_at
+    # 不能用 `refreshed_at > written_at` 断言：两者都是 datetime.now(UTC)，
+    # 在快机器上可以落在同一微秒（CI 实测相等，本机也可复现）。
+    # 真正的不变量是"最终快照来自强制刷新之后的那一轮读取"——用序号断言：
+    # 两次读取都发生过，且最终快照是第二次（symbols=5）的内容。
+    assert len(reads) == 2 and state.coverage_snapshot()[0].symbols == 5
+    assert state._coverage_refreshed_at >= written_at
 
 
 def test_service_coverage_endpoint_returns_symbol_items(tmp_path):
