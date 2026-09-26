@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 
+from astock_backtester.data.filelock import CrossProcessFileLock
 from astock_backtester.data.importer import normalize_daily_bars
 from astock_backtester.models import DatasetCoverage
 
@@ -42,26 +44,57 @@ class LocalCache:
 
     def write_daily_bars(self, frame: pd.DataFrame) -> None:
         normalized = normalize_daily_bars(frame)
-        current = self.read_daily_bars()
-        if not current.empty:
-            normalized = (
-                normalized.set_index(["symbol", "trade_date"])
-                .combine_first(current.set_index(["symbol", "trade_date"]))
-                .reset_index()
-                .sort_values(["symbol", "trade_date"])
-                .reset_index(drop=True)
-            )
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
+        # 跨进程互斥：read-modify-write 必须全程持锁，否则并发写者交错会丢失更新。
+        # 读侧（read_daily_bars/coverage）不加锁：os.replace 原子替换保证读取者
+        # 只会看到旧文件或完整新文件，且本方法内部会调 read_daily_bars，读侧加锁会自锁。
+        with CrossProcessFileLock(self.daily_bars_path):
+            current = self.read_daily_bars()
+            if not current.empty:
+                normalized = (
+                    normalized.set_index(["symbol", "trade_date"])
+                    .combine_first(current.set_index(["symbol", "trade_date"]))
+                    .reset_index()
+                    .sort_values(["symbol", "trade_date"])
+                    .reset_index(drop=True)
+                )
+            try:
+                self._atomic_write_parquet(normalized, self.daily_bars_path)
+                if self.daily_bars_pickle_path.exists():
+                    self.daily_bars_pickle_path.unlink()
+            except ImportError:
+                self._atomic_write_pickle(normalized, self.daily_bars_pickle_path)
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO datasets(dataset, updated_at) VALUES('daily_bars', CURRENT_TIMESTAMP)"
+                )
+
+    @staticmethod
+    def _atomic_write_parquet(frame: pd.DataFrame, path: Path) -> None:
+        """临时文件写完后 ``os.replace`` 原子替换。
+
+        ``to_parquet`` 直接写目标路径时会先 truncate 再逐块写，写一半崩溃会
+        留下损坏 parquet。写到同目录下的临时文件再 ``os.replace`` 保证读取者
+        要么看到旧文件、要么看到完整新文件。
+        """
+        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
-            normalized.to_parquet(self.daily_bars_path, index=False)
-            if self.daily_bars_pickle_path.exists():
-                self.daily_bars_pickle_path.unlink()
-        except ImportError:
-            normalized.to_pickle(self.daily_bars_pickle_path)
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO datasets(dataset, updated_at) VALUES('daily_bars', CURRENT_TIMESTAMP)"
-            )
+            frame.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _atomic_write_pickle(frame: pd.DataFrame, path: Path) -> None:
+        """pickle 兜底路径同样走临时文件 + ``os.replace``，不直写目标。"""
+        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            frame.to_pickle(tmp_path)
+            os.replace(tmp_path, path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def read_daily_bars(self) -> pd.DataFrame:
         if self.daily_bars_path.exists():

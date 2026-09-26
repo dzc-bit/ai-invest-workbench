@@ -2,6 +2,22 @@
 
 发布历史的归档地。`README.md` 只讲"现在能做什么"，每轮发布的新增内容写在这里，不再往 README 上堆。
 
+## 1.6.1
+
+- **修复 `turnover_between` 双注册语义漂移（换手率条件在向量化路径上永远筛不出股票）**：`conditions.py` 的两套实现口径不一致——行级 `EVALUATORS` 会把 >1 的百分数除以 100 归一，向量化 `MASK_BUILDERS` 直接拿分数区间比百分数量纲。实测 2% 换手率行级判 `True`、MASK 判 `False`，而引擎 prefilter 走 MASK，于是 4 个推荐策略的换手率条件把候选**全部**提前丢掉。现在两套共用 `_turnover_ratio`，守卫 `test_turnover_between_row_and_mask_agree_on_percent_scale`。
+- **公开 XHR 日 K 不再写入假换手率 0，改为逐行推导**：`_with_derived_columns` 此前只把 `amount` 置 NaN，没管 `turnover_rate`，`normalize_daily_bars` 的缺列默认值 `0.0` 就被当成"换手率 0%"写进新行——0 是合法值，无法与真实 0% 区分，同时污染 `turnover_between` 与候选打分。现在显式置 NaN，再由 `_apply_turnover_rate` 用 `volume/流通股×100` 按仓库口径（**百分数**，实测 229 万行 median≈0.38）回填；推不出流通股的行保持 NaN。
+- **`is_st` 从证券简称派生（此前全库恒为 False）**：仓库实测 229 万行 `is_st` 全为 `False`，而 `engine._stock_limit_pct` 依赖它判 5% 涨跌停、`BacktestSettings.exclude_st`（默认 True）依赖它过滤。上游行情接口不带该字段，现在由简称派生（`symbols.is_st_name`，`ST` 子串口径，刻意**不含**"退"字——退市整理期涨跌幅仍是 10%，标成 ST 会给错的 5% 口径）。语义说明：用**当前**简称整窗标记，属保守口径，与 `risk.py` 用最新名称识别 ST 一致。
+- **逐行市值不再被报价法覆盖**：百度日 K 按每行 `volume/(turnover/100)×close` 推市值（反映**当日**股本），腾讯/新浪路径用"当前股本 × 历史收盘"。此前后者会用 `combine_first` 整列覆盖前者，解禁/增发后历史市值系统性偏大。现在只补空缺行。
+- **腾讯日 K 分页加墙钟预算**：页数上限 `TENCENT_KLINE_MAX_PAGES`(=64) × 单次 `timeout`(=15s) = 最坏 960s/票，页数上限并不是时间上限。新增 `TENCENT_KLINE_WALK_BUDGET_SECONDS`(=90s)，触顶按欠覆盖记录并交上层 provider 接力（`astock_adapter._fetch_tencent_kline`）。
+- **北交所日 K 直接走新浪**：实测腾讯 `bj920xxx` 恒返回空 `day`，此前每只北交所股票都要先打一次注定为空的腾讯往返；现在 `bj` 段跳过腾讯。
+- **资金流 crawler 四项边界收紧**：① 新浪资金流端点改 **https**（实测与 http 同载荷，同文件其余端点本就是 https）；② 新浪限速的 `sleep` 移出 `_sina_request_lock`——持锁睡眠把 8 个 worker 全串行化在 0.25s 间隔上（全市场约 23 分钟纯睡眠），与 `HostThrottle` 的"sleep 只在锁外"纪律一致；③ 东财变体矩阵加**组合**上限 `EASTMONEY_VARIANT_MAX_COMBINATIONS`(=6)——403/429 这类"连得上但拿不到数据"的失败原本会走满全部组合；按组合而非传输计数是有意的：按传输计数会让双传输形态把预算全花在第一个端点，`push2 kline` 备用端点永远轮不到（守卫 `test_eastmoney_variant_cap_still_reaches_the_kline_endpoint` 实测 cap≤4 即红）；④ 百度补日按「最近 N 个缺失日」封顶 `BAIDU_SUPPLEMENT_MAX_MISSING_DATES`(=20) 并写 `date_coverage_shortfall`；最近成功缓存按符号数封顶 `RECENT_SUCCESS_CACHE_MAX_SYMBOLS`(=512)（全市场补齐原本会常驻约 5500 个符号的全部行）。
+- **金额解析收归唯一归属**：crawler 私建的 `_parse_money_amount` 移入 `data/parsing.py::parse_money_amount`（§15-1）。顺带修掉一个静默错值：旧正则 `[-+]?\d+(?:\.\d+)?` 遇到科学计数法 `1.2e8` 只取 `1.2`，丢掉指数、静默差 8 个数量级；新实现整体匹配并保留中文数量级后缀。实测三源同日同值（东财 f52 / 新浪 netamount / 百度 `+3298.68万` 均为**元**），等价性有守卫。
+- **`_diagnostics_should_skip_eastmoney` 三处实现合并为一处**（crawler 导出，`sync.py` 与 `scripts/run-capital-flow-backfill.py` 导入），消除谓词漂移（`tests/test_capital_flow_crawler.py` 有跨模块引用守卫）。
+- **交易日历查询加缓存**：`has_acceptable_coverage` 逐票调用 `a_share_trade_dates`（5500 票 × 最多 3 个 provider ≈ 1.6 万次全窗口重建 `date_range(freq="B")` + 节假日展开）。节假日表是静态数据，现在按 (start, end) 记忆化（返回副本，容量上限 4096 条），语义与性能都有守卫。
+- **`scripts/backfill-market-cap.py` 纳入版本库**：§9 提到的历史遗留 null 市值回填脚本此前未跟踪，补齐（`--dry-run` 只数不写）。
+- **`.gitignore` 收敛与清理**：新增 `.zcode/`、`.claude/`、`.ruff_cache/`、`*.egg-info/`、`*.exe`、`*.sig`、`latest.json` 等忽略规则，并保留 `!tests/**/*.log` 否定规则（守卫 `test_gitignore_keeps_test_log_negation_rule`）；同时删除历史上被误提交的 `.zcode/` 三个命令/技能文件与根目录探针残留。
+- **数据正确性复核（本条为审查结论，非代码变更）**：另有两处疑似数据错误经**真实上游探针实测证伪**，不应再按误报修复——① 百度日 K `volume` **已是股**（同日腾讯 31239 手 ↔ 百度 3123935 股，且两者推出的流通股与腾讯报价一致），无需 ×100；② 东财/新浪/百度资金流单位**统一为元**，不存在差 1e4 的混列问题。
+
 ## 1.6.0
 
 - **AI 实时优先：行情必须走实时通道，数据仓只作历史与回测**：本地数据仓同步有延迟（实测停更时 5219 只股票的数据停在 4 个交易日前），模型曾把几天前的收盘价当成"现在"讲。现在：① 新增实时个股工具 `realtime_stock_detail`（腾讯公开行情，不读仓）——现价/涨跌幅/开高低/当日区间分位/量比/换手/市值，以及**涨停、跌停、炸板（盘中触及涨停后回落）判定**与停牌识别，最多 8 只一次；② `CORE_RULES` 新增"数据时效纪律"硬规则：凡"当前/今天/盘中"的行情问题（指数、红绿家数、板块强弱、个股价格、涨跌停、量能）必须先走实时通道（`realtime_market_snapshot` / `realtime_stock_detail` / `limit_up_pool`），本地工具只用于历史区间、横截面与回测，实时失败必须明说、不得用历史数据包装成实时；`facade.today_context` 与三个风格的取证清单同步改写；③ 本地工具（`recent_daily_bars`/`query_warehouse_sql`/`compute_stock_stats`）返回带 `as_of_date` + `is_realtime:false`，摘要显式写"截止 X 日，距今天 N 个交易日，非实时"。守卫：`test_core_rules_require_realtime_first_for_current_market`、`test_realtime_stock_detail_flags_limit_status_and_range`；新增实时工具同步进前端 mock 并有防漂移守卫。

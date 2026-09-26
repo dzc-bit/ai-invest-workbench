@@ -5,9 +5,12 @@ import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
+from threading import Lock
 from threading import local as thread_local
 from time import monotonic
+from time import sleep as time_sleep
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -65,6 +68,50 @@ def scraping_session() -> requests.Session:
 def scraping_get(url: str, **kwargs: Any) -> Any:
     """``requests.get`` equivalent that never reads proxy environment variables."""
     return scraping_session().get(url, **kwargs)
+
+
+class HostThrottle:
+    """Thread-safe per-host spacing for outbound scraping requests.
+
+    全市场补齐用多个 worker 并发跑同一个 fetcher，它们会同时向同一 host 连发
+    请求；这里按 host 预留"下一次允许发出的时刻"，把并发请求摊到 ``min_interval``
+    的间隔上。三条纪律：
+
+    - ``min_interval <= 0`` 时完全旁路——注入式构造的密闭测试不应被限速拖慢；
+    - ``sleep`` 只在锁外调用——持锁睡眠会把整批补齐串行化；
+    - 阈值每次求值（可传可调用对象），调用方可以在运行时调整（测试把
+      ``min_request_interval`` 改小即可断言间隔）。
+
+    该类与 ``create_scraping_session`` 同属 §15-2 的 HTTP 策略层：新数据源出站
+    请求应经过这里，而不是各自维护一套 ``time.sleep`` 限速。
+    """
+
+    def __init__(
+        self,
+        min_interval: float | Callable[[], float],
+        *,
+        clock: Callable[[], float] = monotonic,
+        sleep: Callable[[float], None] = time_sleep,
+    ) -> None:
+        self._interval: Callable[[], float] = min_interval if callable(min_interval) else (lambda: float(min_interval))
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = Lock()
+        self._next_allowed: dict[str, float] = {}
+
+    def wait(self, url: str) -> None:
+        """Block until this host's next slot is due (no-op when disabled)."""
+        interval = self._interval()
+        if interval <= 0:
+            return
+        host = urlparse(url).netloc or url
+        with self._lock:
+            now = self._clock()
+            slot = max(now, self._next_allowed.get(host, now))
+            delay = slot - now
+            self._next_allowed[host] = slot + interval
+        if delay > 0:
+            self._sleep(delay)
 
 
 def _curl_get(url: str, **kwargs: Any) -> Any:
@@ -206,6 +253,30 @@ def should_allow_alternate_transport(
     return requester in (requests.get, scraping_get)
 
 
+# 备用传输（curl_cffi）在本机彻底不可用时（例如直连 IP 对东财域名连不上），主传输
+# 再失败就会整条链路断掉，但此前只写 diagnostics——全市场补齐跑几小时，日志里完全看
+# 不出"备用传输本身坏了、已退化成单传输"。这里做一次性告警：第一次失败打 warning，
+# 之后静默（同一原因会重复成千上万次，每次刷屏反而淹没真正的主因）。
+# diagnostics 行为不变：它的语义是"每次请求都带"，仍按请求追加（AGENTS 错误码契约不动）。
+_alternate_transport_failed_once = False
+
+
+def _warn_alternate_transport_failed_once(source: str, exc: Exception) -> None:
+    """Log one visible warning the first time the alternate transport fails."""
+    global _alternate_transport_failed_once
+    if _alternate_transport_failed_once:
+        return
+    _alternate_transport_failed_once = True
+    summary = f"{type(exc).__name__}: {exc}"
+    if len(summary) > 300:
+        summary = summary[:300] + "..."
+    logger.warning(
+        "备用传输（curl_cffi）失败，已退化为仅主传输（本进程只告警一次）: source=%s, error=%s",
+        source,
+        summary,
+    )
+
+
 def resilient_get(
     requester: Callable[..., Any],
     url: str,
@@ -243,6 +314,7 @@ def resilient_get(
             return response
         except Exception as exc:
             diagnostics.append(f"{source} alternate transport failed: {exc}")
+            _warn_alternate_transport_failed_once(source, exc)
             raise exc from primary_error
 
     if primary_error is not None:

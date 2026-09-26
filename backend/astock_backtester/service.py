@@ -61,8 +61,10 @@ from astock_backtester.data.warehouse import Warehouse
 from astock_backtester.models import (
     BacktestSettings,
     ClsFinanceResponse,
+    DataOperationResult,
     DatasetCoverage,
     ServiceHealth,
+    ServiceLogEntry,
     StockSymbolValidationResult,
     StrategyConfig,
 )
@@ -131,6 +133,9 @@ class DataServiceState:
         self.logs: deque[dict[str, str]] = deque(maxlen=100)
         self._coverage_lock = Lock()
         self._coverage_refreshing = False
+        # 写入发生在刷新进行中时置位：当前刷新结束后必须再跑一轮，
+        # 保证"写入之后一定有一次以写入后数据为输入的刷新"。
+        self._coverage_refresh_dirty = False
         self._coverage_snapshot = self._empty_coverage()
         self._coverage_refreshed_at: datetime | None = None
         self.log("info", "local data service started")
@@ -192,6 +197,21 @@ class DataServiceState:
     def coverage_snapshot(self) -> list[DatasetCoverage]:
         with self._coverage_lock:
             return [item.model_copy(deep=True) for item in self._coverage_snapshot]
+
+    def set_coverage_snapshot(self, items: list[DatasetCoverage]) -> None:
+        """Adopt a coverage snapshot computed as part of a write operation.
+
+        ``DataOperationResult.coverage`` is fresh (it is computed right after
+        the rows land), so a route that just wrote data can hand it straight to
+        the state instead of leaving ``/health`` to disagree with the response
+        body until the next background refresh. Public API: callers must not
+        touch ``_coverage_snapshot`` directly (§15.3).
+        """
+        if not items:
+            return
+        with self._coverage_lock:
+            self._coverage_snapshot = [item.model_copy(deep=True) for item in items]
+            self._coverage_refreshed_at = datetime.now(UTC)
 
     def health_payload(self) -> ServiceHealth:
         refresh_finished = self.start_coverage_refresh()
@@ -263,20 +283,42 @@ class DataServiceState:
         return age < HEALTH_COVERAGE_REFRESH_TTL_SECONDS
 
     def start_coverage_refresh(self, *, force: bool = False) -> Event | None:
+        """Start a background coverage refresh unless one is already running.
+
+        ``force`` (used right after a write) must never be answered by a
+        snapshot read from *before* that write. When a refresh is already
+        running, ``force`` only marks it dirty; the running loop re-reads the
+        warehouse once more before it stops, so "写入之后一定有一次以写入后
+        数据为输入的刷新". The returned event resolves only after every dirty
+        round, so waiting on it guarantees a post-write read has happened.
+        """
         with self._coverage_lock:
             if self._coverage_refreshing:
+                if force:
+                    self._coverage_refresh_dirty = True
                 return None
             if not force and self._has_fresh_coverage_snapshot():
                 return None
             self._coverage_refreshing = True
+            self._coverage_refresh_dirty = False
         finished = Event()
 
         def refresh() -> None:
             try:
-                coverage = self._read_coverage_snapshot()
-                with self._coverage_lock:
-                    self._coverage_snapshot = [item.model_copy(deep=True) for item in coverage]
-                    self._coverage_refreshed_at = datetime.now(UTC)
+                while True:
+                    coverage = self._read_coverage_snapshot()
+                    with self._coverage_lock:
+                        self._coverage_snapshot = [item.model_copy(deep=True) for item in coverage]
+                        self._coverage_refreshed_at = datetime.now(UTC)
+                        if self._coverage_refresh_dirty:
+                            # 写入发生在本轮读取之后：清标记并再读一轮，
+                            # 绝不把写前数据当最终快照。
+                            self._coverage_refresh_dirty = False
+                            continue
+                        # 判定"无待补跑"与下调 refreshing 必须在同一把锁里，
+                        # 否则夹在两者之间的 force 会置了 dirty 却没人消费。
+                        self._coverage_refreshing = False
+                        break
             finally:
                 with self._coverage_lock:
                     self._coverage_refreshing = False
@@ -947,6 +989,8 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 )
                 for entry in result.logs:
                     self.server.state.log(entry.level, entry.message)
+                if result.coverage:
+                    self.server.state.set_coverage_snapshot(result.coverage)
                 self.server.state.start_coverage_refresh(force=True)
                 self._send_json(result.model_dump(mode="json"))
                 return
@@ -962,6 +1006,8 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 )
                 for entry in result.logs:
                     self.server.state.log(entry.level, entry.message)
+                if result.coverage:
+                    self.server.state.set_coverage_snapshot(result.coverage)
                 self.server.state.start_coverage_refresh(force=True)
                 self._send_json(result.model_dump(mode="json"))
                 return
@@ -970,7 +1016,40 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 if not symbols:
                     symbols = self._capital_flow_backfill_symbols(payload["start_date"], payload["end_date"])
                     if not symbols:
-                        raise ValueError("No symbols available for capital-flow backfill.")
+                        # 缺口口径下"没活干"是正常结果（200），不是失败；
+                        # 绝不启动 0 元素任务冒充已补齐（§9 缺口基准）。
+                        # 响应体走 DataOperationResult.model_dump，与其它路径字段同构
+                        # （前端 types.ts 的 filled_missing_rows 因此不会在这里缺席）。
+                        self._send_json(
+                            DataOperationResult(
+                                status="ok",
+                                imported_rows=0,
+                                returned_rows=0,
+                                filled_missing_rows=0,
+                                requested_symbols=[],
+                                fetched_symbols=[],
+                                missing_symbols=[],
+                                skipped_symbols=[],
+                                coverage=self.server.state.coverage_snapshot(),
+                                logs=[
+                                    ServiceLogEntry(
+                                        level="info",
+                                        message="窗口内没有需要补齐的资金流缺口，未启动补齐任务。",
+                                    )
+                                ],
+                                diagnostics=[
+                                    {
+                                        "code": "capital_flow_backfill_no_gaps",
+                                        "source": "capital_flow_crawler",
+                                        "start_date": payload["start_date"],
+                                        "end_date": payload["end_date"],
+                                        "requested_symbols": 0,
+                                    }
+                                ],
+                                failures=[],
+                            ).model_dump(mode="json")
+                        )
+                        return
                     job = self.server.state.sync_manager.start_capital_flow_backfill(
                         symbols=symbols,
                         start_date=payload["start_date"],
@@ -980,37 +1059,36 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                         "info",
                         f"Capital-flow backfill {job.status}: {job.completed_symbols}/{job.total_symbols} symbols",
                     )
-                    self._send_json(
-                        {
-                            "status": "ok",
-                            "imported_rows": 0,
-                            "returned_rows": 0,
-                            "requested_symbols": symbols,
-                            "fetched_symbols": [],
-                            "missing_symbols": [],
-                            "skipped_symbols": [],
-                            "coverage": [
-                                item.model_dump(mode="json")
-                                for item in self.server.state.coverage_snapshot()
-                            ],
-                            "logs": [
-                                {
-                                    "level": "info",
-                                    "message": f"Capital-flow backfill started for {len(symbols)} symbols",
-                                }
-                            ],
-                            "diagnostics": [
-                                {
-                                    "code": "capital_flow_backfill_job_started",
-                                    "source": "capital_flow_crawler",
-                                    "job_id": job.job_id,
-                                    "requested_symbols": len(symbols),
-                                }
-                            ],
-                            "failures": [],
-                            "job": job.model_dump(mode="json"),
-                        }
-                    )
+                    # 任务刚启动，实际补了多少行还没发生：filled_missing_rows 必须显式为 0，
+                    # 不能让前端因为字段缺席而退回别的展示口径。响应体同样走模型保证字段同构。
+                    response = DataOperationResult(
+                        status="ok",
+                        imported_rows=0,
+                        returned_rows=0,
+                        filled_missing_rows=0,
+                        requested_symbols=symbols,
+                        fetched_symbols=[],
+                        missing_symbols=[],
+                        skipped_symbols=[],
+                        coverage=self.server.state.coverage_snapshot(),
+                        logs=[
+                            ServiceLogEntry(
+                                level="info",
+                                message=f"Capital-flow backfill started for {len(symbols)} symbols",
+                            )
+                        ],
+                        diagnostics=[
+                            {
+                                "code": "capital_flow_backfill_job_started",
+                                "source": "capital_flow_crawler",
+                                "job_id": job.job_id,
+                                "requested_symbols": len(symbols),
+                            }
+                        ],
+                        failures=[],
+                    ).model_dump(mode="json")
+                    response["job"] = job.model_dump(mode="json")
+                    self._send_json(response)
                     return
                 result = fetch_capital_flow_into_cache(
                     cache=self.server.state.cache,
@@ -1022,6 +1100,8 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 )
                 for entry in result.logs:
                     self.server.state.log(entry.level, entry.message)
+                if result.coverage:
+                    self.server.state.set_coverage_snapshot(result.coverage)
                 self.server.state.start_coverage_refresh(force=True)
                 self._send_json(result.model_dump(mode="json"))
                 return
@@ -1114,6 +1194,10 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 # 本端点不承载任何轮询/连接性判定。
                 end_date = str(payload.get("end_date") or date.today().isoformat())
                 start_date = str(payload.get("start_date") or (date.today() - timedelta(days=30)).isoformat())
+                # 缺口名单前 best-effort 刷新 lifecycle（§9 同款：全市场同步入口
+                # 也先刷新），真退市股先标 delisted 再算名单，避免每轮重复补
+                # 停更股；失败只记日志、名单退回旧口径。
+                self.server.state.refresh_symbol_lifecycle_best_effort()
                 missing = self.server.state.sync_manager.incomplete_symbols(start_date, end_date)
                 if not missing:
                     self._send_json(
@@ -1185,31 +1269,56 @@ class DataServiceHandler(BaseHTTPRequestHandler):
         return self.server.state._fetch_capital_flow(symbols, start_date, end_date)
 
     def _capital_flow_backfill_symbols(self, start_date: str | None = None, end_date: str | None = None) -> list[str]:
-        all_symbols: set[str] = set()
+        """Resolve the symbol list for an empty-symbols capital-flow backfill.
+
+        四分支（缺口基准，§9）：
+
+        1. 本地有 OHLC 且给了窗口，缺口非空 → 返回本地与缺口名单的交集；
+        2. 同上但窗口内缺口为空 → 返回 ``[]``，**绝不**回落成全市场抓取
+           （调用方据此返回 no-gaps diagnostics，不启动任务）；
+        3. 本地没有任何 OHLC 行（bootstrap）→ 走 ``provider.list_symbols()``
+           全量补齐，本地缺口口径无从谈起；
+        4. 缺口检查抛异常 → 保守回落本地全量 + warning，不让一次读仓失败
+           把补齐静默变成空操作。
+        """
+        local_symbols: set[str] = set()
         try:
-            all_symbols.update(str(symbol) for symbol in self.server.state.warehouse.read_daily_symbols(require_ohlc=True))
+            local_symbols.update(str(symbol) for symbol in self.server.state.warehouse.read_daily_symbols(require_ohlc=True))
         except Exception as exc:
             self.server.state.log(
                 "warning",
                 f"capital-flow symbol read failed from warehouse: {exc}",
             )
-        if not all_symbols:
+        if not local_symbols:
+            # 分支 3：bootstrap。本地无日线行时缺口名单必然是空的，
+            # 但那意味着"没数据"而不是"没缺口"，所以按数据源名单全量补。
             try:
-                all_symbols.update(str(symbol) for symbol in self.server.state.provider.list_symbols())
+                provider_symbols = {str(symbol) for symbol in self.server.state.provider.list_symbols()}
             except Exception as exc:
                 self.server.state.log("warning", f"capital-flow provider symbol read failed: {exc}")
+                provider_symbols = set()
+            if not provider_symbols:
+                raise ValueError("No symbols available for capital-flow backfill.")
+            return sorted(provider_symbols)
 
-        if start_date and end_date and all_symbols:
+        if start_date and end_date:
             try:
-                missing_symbols = self.server.state.warehouse.read_capital_flow_missing_symbols(
-                    start_date, end_date
-                )
-                if missing_symbols:
-                    return sorted(all_symbols & missing_symbols)
+                missing_symbols = self.server.state.warehouse.read_capital_flow_missing_symbols(start_date, end_date)
             except Exception as exc:
+                # 分支 4
                 self.server.state.log("warning", f"capital-flow coverage inspection failed: {exc}")
+                return sorted(local_symbols)
+            if not missing_symbols:
+                # 分支 2
+                self.server.state.log(
+                    "info",
+                    f"capital-flow backfill skipped: 窗口 {start_date}~{end_date} 内无资金流缺口",
+                )
+                return []
+            # 分支 1
+            return sorted(local_symbols & missing_symbols)
 
-        return sorted(all_symbols)
+        return sorted(local_symbols)
 
 
 def create_server(host: str, port: int, cache_dir: str | Path) -> DataServiceServer:

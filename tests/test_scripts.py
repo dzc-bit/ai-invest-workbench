@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tomllib
 from pathlib import Path
 
@@ -993,3 +994,179 @@ def test_deprecated_full_array_strategy_mutation_is_removed():
     assert deprecated_helper not in production
     assert "upsert_saved_strategy" in production
     assert "delete_saved_strategy" in production
+
+
+def test_gitignore_keeps_test_log_negation_rule():
+    """``*.log`` 兜底不能静默吞掉测试 fixture：``!tests/**/*.log`` 必须一直存在且排在它之后。
+
+    gitignore 后写的规则覆盖先写的：否定规则被删、或被挪到 ``*.log`` 之前都会失效，
+    未来测试树里一旦出现 .log 扩展名的 fixture，就会变成"测试跑得过、git status
+    看不见"的隐形文件。守卫它，避免有人顺手清理注释时把规则一起删掉。
+    """
+    lines = [line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()]
+    wildcard_logs = [index for index, line in enumerate(lines) if line == "*.log"]
+    negations = [index for index, line in enumerate(lines) if line == "!tests/**/*.log"]
+
+    assert negations, ".gitignore 缺少 !tests/**/*.log 否定规则：测试 fixture 会被 *.log 兜底静默忽略"
+    assert not wildcard_logs or negations[-1] > wildcard_logs[-1], "否定规则必须排在 *.log 之后才生效"
+
+
+# ---------------------------------------------------------------------------
+# Market cap backfill script tests
+# ---------------------------------------------------------------------------
+
+
+def load_market_cap_script():
+    script_path = Path(__file__).parents[1] / "scripts" / "backfill-market-cap.py"
+    spec = importlib.util.spec_from_file_location("backfill_market_cap", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _market_cap_rows(symbol: str = "000001") -> pd.DataFrame:
+    """3 行：前两行市值缺失、第三行已有市值（必须原样保留）。"""
+    return pd.DataFrame(
+        {
+            "symbol": [symbol, symbol, symbol],
+            "trade_date": ["2026-06-05", "2026-06-08", "2026-06-09"],
+            "open": [10.0, 11.0, 12.0],
+            "high": [10.5, 11.5, 12.5],
+            "low": [9.8, 10.8, 11.8],
+            "close": [10.0, 11.0, 12.0],
+            "volume": [1000, 1100, 1200],
+            "amount": [12345.0, 23456.0, 34567.0],
+            "float_market_cap": [float("nan"), float("nan"), 555.0],
+            "total_market_cap": [float("nan"), 999.0, 888.0],
+        }
+    )
+
+
+def _share_history() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "stock_code": ["000001"],
+            "change_date": ["2026-01-01"],
+            "total_shares": [2000],
+            "list_a_shares": [1000],
+        }
+    )
+
+
+def test_backfill_market_cap_fills_null_rows_and_preserves_existing_columns(tmp_path):
+    """回填 = 整行回写：市值按股本历史算，其余列（含已有总市值）一律保持原值。
+
+    ``write_daily_bars`` 先跑 ``normalize_daily_bars``：只写市值列会给缺失可选列
+    填默认值（amount=0.0 等），这些非空默认值会经 ``combine_first`` 覆盖真实数据。
+    """
+    module = load_market_cap_script()
+    warehouse = module.Warehouse(tmp_path)
+    warehouse.write_daily_bars(_market_cap_rows())
+
+    result = module.backfill_market_cap(warehouse, share_fetcher=lambda _code: _share_history())
+
+    assert result["filled"] == 2
+    assert result["skipped"] == 0
+    assert result["failed"] == 0
+    assert result["filled_symbols"] == ["000001"]
+
+    loaded = warehouse.read_daily_bars(symbols=["000001"]).sort_values("trade_date").reset_index(drop=True)
+    # 市值 = list_a_shares × close（merge_asof backward 把变动日快照对齐到交易日）
+    assert loaded["float_market_cap"].tolist() == [10000.0, 11000.0, 555.0]
+    assert loaded["amount"].tolist() == [12345.0, 23456.0, 34567.0]
+    assert loaded["close"].tolist() == [10.0, 11.0, 12.0]
+    assert loaded["volume"].tolist() == [1000, 1100, 1200]
+    # adata 推导的 total_market_cap 不进写入帧：原值保留，原 null 仍是 null
+    assert pd.isna(loaded.loc[0, "total_market_cap"])
+    assert loaded["total_market_cap"].tolist()[1:] == [999.0, 888.0]
+
+
+def test_backfill_market_cap_dry_run_counts_without_writing(tmp_path):
+    module = load_market_cap_script()
+    warehouse = module.Warehouse(tmp_path)
+    warehouse.write_daily_bars(_market_cap_rows())
+
+    result = module.backfill_market_cap(warehouse, dry_run=True, share_fetcher=lambda _code: _share_history())
+
+    assert result["filled"] == 2
+    loaded = warehouse.read_daily_bars(symbols=["000001"])
+    assert loaded["float_market_cap"].isna().tolist() == [True, True, False], "dry-run 不得写库"
+
+
+def test_backfill_market_cap_skips_symbols_without_usable_share_history(tmp_path):
+    """股本历史为空、缺必需列、或 list_a_shares 全空 → 计入 skipped，不写库。"""
+    module = load_market_cap_script()
+    unusable = {
+        "empty": pd.DataFrame(),
+        "no_column": pd.DataFrame({"change_date": ["2026-01-01"], "total_shares": [1000]}),
+        "all_null": pd.DataFrame({"change_date": ["2026-01-01"], "list_a_shares": [float("nan")]}),
+    }
+
+    for label, shares in unusable.items():
+        warehouse = module.Warehouse(tmp_path / label)
+        warehouse.write_daily_bars(_market_cap_rows())
+        result = module.backfill_market_cap(warehouse, share_fetcher=lambda _code, _shares=shares: _shares)
+
+        assert result["filled"] == 0, label
+        assert result["skipped"] == 1, label
+        assert result["failed"] == 0, label
+        assert result["skipped_symbols"] == ["000001"], label
+        loaded = warehouse.read_daily_bars(symbols=["000001"])
+        assert loaded["float_market_cap"].isna().tolist()[:2] == [True, True], label
+
+
+def test_backfill_market_cap_keeps_going_after_a_share_history_failure(tmp_path):
+    """单股票取股本历史抛异常 → 计入 failed 且不中断其余股票。"""
+    module = load_market_cap_script()
+    warehouse = module.Warehouse(tmp_path)
+    warehouse.write_daily_bars(pd.concat([_market_cap_rows("000001"), _market_cap_rows("000002")], ignore_index=True))
+
+    def fetcher(code):
+        if code == "000002":
+            raise RuntimeError("adata exploded")
+        return _share_history()
+
+    result = module.backfill_market_cap(warehouse, share_fetcher=fetcher)
+
+    assert result["failed"] == 1
+    assert result["failed_symbols"] == ["000002"]
+    assert result["filled"] == 2
+    assert result["filled_symbols"] == ["000001"]
+    skipped = warehouse.read_daily_bars(symbols=["000002"])
+    assert skipped["float_market_cap"].isna().tolist() == [True, True, False]
+
+
+def test_backfill_market_cap_filters_by_explicit_symbols(tmp_path):
+    module = load_market_cap_script()
+    warehouse = module.Warehouse(tmp_path)
+    warehouse.write_daily_bars(pd.concat([_market_cap_rows("000001"), _market_cap_rows("000002")], ignore_index=True))
+
+    result = module.backfill_market_cap(warehouse, symbols=["SZ000002"], share_fetcher=lambda _code: _share_history())
+
+    assert result["filled"] == 2
+    assert result["filled_symbols"] == ["000002"]
+    untouched = warehouse.read_daily_bars(symbols=["000001"])
+    assert untouched["float_market_cap"].isna().tolist() == [True, True, False]
+
+
+def test_backfill_market_cap_cli_dry_run_prints_summary(monkeypatch, tmp_path, capsys):
+    module = load_market_cap_script()
+    cache_dir = tmp_path / "仓"
+    module.Warehouse(cache_dir).write_daily_bars(_market_cap_rows())
+    monkeypatch.setattr(module, "fetch_share_history", lambda _code: _share_history())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["backfill-market-cap.py", "--cache-dir", str(cache_dir), "--dry-run"],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert "filled=2 rows" in output
+    assert "skipped=0 symbols" in output
+    assert "dry-run" in output
+    loaded = module.Warehouse(cache_dir).read_daily_bars(symbols=["000001"])
+    assert loaded["float_market_cap"].isna().tolist() == [True, True, False]

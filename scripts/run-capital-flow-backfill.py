@@ -18,7 +18,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from astock_backtester.data.cache import LocalCache
-from astock_backtester.data.capital_flow_crawler import CapitalFlowCrawler
+from astock_backtester.data.capital_flow_crawler import CapitalFlowCrawler, diagnostics_should_skip_eastmoney
 from astock_backtester.data.operations import fetch_capital_flow_into_cache
 from astock_backtester.data.providers import (
     ADataProvider,
@@ -184,16 +184,6 @@ def operation_to_dict(result: object) -> dict[str, Any]:
         "imported_rows": 0,
         "failures": [{"code": "unexpected_result", "message": repr(result)}],
     }
-
-
-def diagnostics_should_skip_eastmoney(diagnostics: Sequence[object]) -> bool:
-    return any(
-        isinstance(item, dict)
-        and item.get("code") == "provider_attempt_failed"
-        and item.get("provider") == "eastmoney"
-        and item.get("error_code") == "network_error"
-        for item in diagnostics
-    )
 
 
 def chunks(items: Sequence[str], size: int) -> list[list[str]]:

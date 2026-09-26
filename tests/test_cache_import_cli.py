@@ -1,5 +1,9 @@
 import logging
+import threading
+import time
+from pathlib import Path
 
+import pandas as pd
 from astock_backtester.cli import handle_command
 from astock_backtester.data.cache import LocalCache
 from astock_backtester.data.importer import normalize_daily_bars
@@ -260,3 +264,65 @@ def test_cli_rejects_unknown_command():
 
     assert response["ok"] is False
     assert response["error"]["code"] == "unknown_command"
+
+
+def test_local_cache_write_daily_bars_writes_via_temp_file_then_atomically_replaces(tmp_path, monkeypatch):
+    cache = LocalCache(tmp_path)
+    targets: list[Path] = []
+    original_to_parquet = pd.DataFrame.to_parquet
+
+    def spy(self, path, *args, **kwargs):
+        targets.append(Path(path))
+        return original_to_parquet(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", spy)
+
+    cache.write_daily_bars(sample_daily_bars())
+
+    assert targets, "to_parquet must be called"
+    assert all(target != cache.daily_bars_path for target in targets)
+    assert cache.daily_bars_path.exists()
+    assert not list(cache.parquet_dir.glob("*.tmp"))
+    assert len(cache.read_daily_bars()) == 10
+
+
+def test_local_cache_write_daily_bars_acquires_cross_process_lock(tmp_path):
+    cache = LocalCache(tmp_path)
+
+    cache.write_daily_bars(sample_daily_bars())
+
+    assert (cache.parquet_dir / "daily_bars.parquet.lock").exists()
+
+
+def test_local_cache_concurrent_writes_leave_complete_readable_parquet(tmp_path, monkeypatch):
+    cache = LocalCache(tmp_path)
+    original_read = LocalCache.read_daily_bars
+
+    def slow_read(self):
+        frame = original_read(self)
+        time.sleep(0.05)
+        return frame
+
+    monkeypatch.setattr(LocalCache, "read_daily_bars", slow_read)
+    first = sample_daily_bars()
+    second = sample_daily_bars().assign(symbol=lambda frame: frame["symbol"].map({"AAA": "CCC", "BBB": "DDD"}))
+    errors: list[Exception] = []
+
+    def write(frame: pd.DataFrame) -> None:
+        try:
+            cache.write_daily_bars(frame)
+        except Exception as exc:  # noqa: BLE001 - surfaced via the errors list below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(frame,)) for frame in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    loaded = original_read(cache)
+    assert set(loaded["symbol"]) == {"AAA", "BBB", "CCC", "DDD"}
+    assert len(loaded) == len(first) + len(second)
+    assert not list(cache.parquet_dir.glob("*.tmp"))

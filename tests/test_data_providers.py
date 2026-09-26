@@ -5,12 +5,16 @@ import math
 import pandas as pd
 from astock_backtester.data.importer import normalize_daily_bars
 from astock_backtester.data.providers import (
+    COVERAGE_MISSING_RATIO_LIMIT,
+    COVERAGE_TAIL_GAP_LIMIT_DAYS,
     ADataProvider,
     AkshareProvider,
     CompositeProvider,
     ProviderError,
     enrich_market_cap_from_share_history,
+    has_acceptable_coverage,
 )
+from astock_backtester.data.trading_calendar import a_share_trade_dates
 
 
 def test_normalize_daily_bars_preserves_market_cap_fields():
@@ -248,3 +252,136 @@ def test_akshare_provider_normalizes_spot_symbols_and_daily_bars():
     assert result.loc[0, "trade_date"].strftime("%Y-%m-%d") == "2026-06-05"
     assert result.loc[0, "close"] == 1612.0
     assert result.loc[0, "source"] == "akshare"
+
+
+def _window_dates(start_date: str, end_date: str) -> list[str]:
+    return [day.strftime("%Y-%m-%d") for day in sorted(a_share_trade_dates(start_date, end_date))]
+
+
+def _daily_frame(symbol: str, dates: list[str]) -> pd.DataFrame:
+    count = len(dates)
+    return pd.DataFrame(
+        {
+            "symbol": [symbol] * count,
+            "trade_date": dates,
+            "open": [1.0] * count,
+            "high": [1.1] * count,
+            "low": [0.9] * count,
+            "close": [1.0] * count,
+            "volume": [100] * count,
+        }
+    )
+
+
+class _RecordingProvider:
+    def __init__(self, name: str, dates: list[str]):
+        self.name = name
+        self.dates = dates
+        self.calls = 0
+
+    def fetch_daily_bars(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls += 1
+        return _daily_frame(symbol, [date for date in self.dates if start_date <= date <= end_date])
+
+    def fetch_share_history(self, symbol: str) -> pd.DataFrame:
+        return pd.DataFrame()
+
+
+def test_has_acceptable_coverage_accepts_frame_covering_full_window():
+    start_date, end_date = "2024-01-02", "2024-02-05"
+    frame = _daily_frame("000001", _window_dates(start_date, end_date))
+
+    assert has_acceptable_coverage(frame, start_date, end_date)
+
+
+def test_has_acceptable_coverage_rejects_tail_gap_beyond_limit():
+    start_date, end_date = "2024-01-02", "2024-02-05"
+    dates = _window_dates(start_date, end_date)
+    frame = _daily_frame("000001", dates[: -COVERAGE_TAIL_GAP_LIMIT_DAYS - 1])
+
+    # 缺失比例仍在限额内：本用例专门证伪"只看缺失比例"的实现
+    assert (len(dates) - len(frame)) / len(dates) <= COVERAGE_MISSING_RATIO_LIMIT
+    assert not has_acceptable_coverage(frame, start_date, end_date)
+
+
+def test_has_acceptable_coverage_rejects_missing_ratio_beyond_limit():
+    start_date, end_date = "2024-01-02", "2024-02-05"
+    dates = _window_dates(start_date, end_date)
+    kept = [date for index, date in enumerate(dates) if index not in range(4, 10)]
+    frame = _daily_frame("000001", kept)
+
+    # 尾部齐、只缺窗口中段：本用例专门证伪"只看尾部差距"的实现
+    assert kept[-1] == dates[-1]
+    assert (len(dates) - len(kept)) / len(dates) > COVERAGE_MISSING_RATIO_LIMIT
+    assert not has_acceptable_coverage(frame, start_date, end_date)
+
+
+def test_composite_provider_merges_next_provider_until_window_covered():
+    start_date, end_date = "2024-01-02", "2024-01-08"
+    dates = _window_dates(start_date, end_date)
+    primary = _RecordingProvider("http", dates[:1])
+    secondary = _RecordingProvider("adata", dates)
+    provider = CompositeProvider([primary, secondary])
+
+    result = provider.fetch_daily_bars("000001", start_date, end_date)
+
+    assert primary.calls == 1
+    assert secondary.calls == 1
+    assert result["trade_date"].dt.strftime("%Y-%m-%d").tolist() == dates
+    assert has_acceptable_coverage(result, start_date, end_date)
+    source_by_date = dict(zip(result["trade_date"].dt.strftime("%Y-%m-%d"), result["source"], strict=True))
+    assert source_by_date[dates[0]] == "http"
+    assert all(source_by_date[date] == "adata" for date in dates[1:])
+
+
+def test_composite_provider_stops_after_primary_covers_full_window():
+    start_date, end_date = "2024-01-02", "2024-01-08"
+    dates = _window_dates(start_date, end_date)
+    primary = _RecordingProvider("http", dates)
+    secondary = _RecordingProvider("adata", dates)
+    provider = CompositeProvider([primary, secondary])
+
+    result = provider.fetch_daily_bars("000001", start_date, end_date)
+
+    assert primary.calls == 1
+    assert secondary.calls == 0
+    assert set(result["source"]) == {"http"}
+
+
+def test_composite_provider_raises_with_every_provider_name_when_all_return_empty():
+    providers = [_RecordingProvider(name, []) for name in ("http", "adata", "akshare")]
+    provider = CompositeProvider(providers)
+
+    try:
+        provider.fetch_daily_bars("000001", "2024-01-02", "2024-01-08")
+    except ProviderError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected ProviderError when all providers return empty")
+
+    for name in ("http", "adata", "akshare"):
+        assert f"{name}: returned no daily rows" in message
+    assert all(item.calls == 1 for item in providers)
+
+
+def test_composite_provider_continues_after_primary_raises():
+    start_date, end_date = "2024-01-02", "2024-01-08"
+    dates = _window_dates(start_date, end_date)
+
+    class ExplodingProvider:
+        name = "http"
+
+        def fetch_daily_bars(self, symbol, start_date, end_date):
+            raise RuntimeError("RemoteDisconnected")
+
+        def fetch_share_history(self, symbol):
+            return pd.DataFrame()
+
+    secondary = _RecordingProvider("adata", dates)
+    provider = CompositeProvider([ExplodingProvider(), secondary])
+
+    result = provider.fetch_daily_bars("000001", start_date, end_date)
+
+    assert secondary.calls == 1
+    assert result["trade_date"].dt.strftime("%Y-%m-%d").tolist() == dates
+    assert set(result["source"]) == {"adata"}

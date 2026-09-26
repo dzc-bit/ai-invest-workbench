@@ -9,14 +9,18 @@ import pandas as pd
 from astock_backtester.data.astock_adapter import AStockDataAdapter
 from astock_backtester.data.importer import normalize_daily_bars
 from astock_backtester.data.symbols import normalize_symbol
+from astock_backtester.data.trading_calendar import a_share_trade_dates
 
 __all__ = [
+    "COVERAGE_MISSING_RATIO_LIMIT",
+    "COVERAGE_TAIL_GAP_LIMIT_DAYS",
     "ADataProvider",
     "AkshareProvider",
     "CompositeProvider",
     "DailyDataProvider",
     "HttpAStockProvider",
     "ProviderError",
+    "has_acceptable_coverage",
     "normalize_symbol",
 ]
 
@@ -270,6 +274,60 @@ class AkshareProvider:
         return pd.DataFrame()
 
 
+COVERAGE_TAIL_GAP_LIMIT_DAYS = 3
+"""frame 尾部允许落后请求窗口 end_date 的 A 股交易日数上限。
+
+取 3：周末/节假日边界与上游 T+0/T+1 更新滞后会造成 1~2 个交易日的自然尾差，
+3 天能容忍该滞后；超过 3 天说明该源的数据停在一周以前，必须问下一个 provider。
+"""
+
+COVERAGE_MISSING_RATIO_LIMIT = 0.2
+"""窗口内允许缺失的交易日占比上限（缺失日数 / 窗口交易日数）。
+
+取 0.2：停牌日的 K 线公开渠道天然拿不到（AGENTS §9），要求 100% 覆盖会让每只
+停牌/零星缺日的票都触发下一个 provider 的整窗口抓取，全市场补齐时是 5000+ 只票
+的额外网络请求；20% 约等于 20 个交易日窗口里允许 4 个停牌或零星缺日，
+超过则认为该源对本窗口覆盖明显不足。
+"""
+
+
+def has_acceptable_coverage(frame: pd.DataFrame, start_date: str, end_date: str) -> bool:
+    """frame 是否已充分覆盖 ``[start_date, end_date]`` 的 A 股交易日窗口。
+
+    两个条件同时满足才可接受（交易日集合来自 ``data/trading_calendar``）：
+
+    1. 尾部差距：frame 最新一根 K 线距窗口内最后一个交易日 ≤ ``COVERAGE_TAIL_GAP_LIMIT_DAYS``；
+    2. 缺失比例：窗口内 frame 没有的交易日占比 ≤ ``COVERAGE_MISSING_RATIO_LIMIT``。
+
+    空 frame 不可接受；窗口内没有交易日（非法区间或整段休市）时无可补内容，视为可接受。
+    """
+    if frame.empty or "trade_date" not in frame.columns:
+        return False
+    expected = sorted(a_share_trade_dates(start_date, end_date))
+    if not expected:
+        return True
+    frame_dates = {pd.Timestamp(value).normalize() for value in frame["trade_date"]}
+    latest = max(frame_dates)
+    tail_gap = sum(1 for day in expected if day > latest)
+    missing = sum(1 for day in expected if day not in frame_dates)
+    return tail_gap <= COVERAGE_TAIL_GAP_LIMIT_DAYS and missing / len(expected) <= COVERAGE_MISSING_RATIO_LIMIT
+
+
+def _combine_first_provider_rows(base: pd.DataFrame, extra: pd.DataFrame) -> pd.DataFrame:
+    """按 trade_date 合并两个已 normalize 的日线帧，先到的 provider 优先。
+
+    ``base`` 是已合并结果且放左边：它已有的非空字段不被 ``extra`` 覆盖，
+    ``extra`` 只补 ``base`` 缺的 trade_date 行、以及 base 同日行里的空字段。
+    因此合并结果的 ``source`` 列天然是**逐行来源**：先到 provider 提供的行保留它的
+    名字，后到 provider 只给它补齐的行打上自己的名字。
+    """
+    left = base.set_index("trade_date")
+    right = extra.set_index("trade_date")
+    left = left[~left.index.duplicated(keep="first")]
+    right = right[~right.index.duplicated(keep="first")]
+    return left.combine_first(right).reset_index()
+
+
 @dataclass
 class CompositeProvider:
     providers: list[DailyDataProvider]
@@ -308,17 +366,27 @@ class CompositeProvider:
 
     def fetch_daily_bars(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         errors: list[str] = []
+        merged: pd.DataFrame | None = None
         for provider in self.providers:
             try:
                 frame = provider.fetch_daily_bars(symbol, start_date, end_date)
+                if frame.empty:
+                    errors.append(f"{provider.name}: returned no daily rows")
+                    continue
+                if "source" not in frame.columns:
+                    frame["source"] = provider.name
+                # 逐个 provider 先 normalize：缺必填列的坏帧按"该 provider 尝试失败"
+                # 聚合进 errors 继续问下一个，而不是把坏帧混进已合并结果。
+                frame = normalize_daily_bars(frame)
             except Exception as exc:
                 errors.append(f"{provider.name}: {exc}")
                 continue
-            if not frame.empty:
-                if "source" not in frame.columns:
-                    frame["source"] = provider.name
-                return normalize_daily_bars(frame)
-            errors.append(f"{provider.name}: returned no daily rows")
-        if errors:
-            raise ProviderError("; ".join(errors))
-        return pd.DataFrame()
+            merged = frame if merged is None else _combine_first_provider_rows(merged, frame)
+            # 首个 provider 覆盖已可接受时立即返回，不再发任何额外请求。
+            if has_acceptable_coverage(merged, start_date, end_date):
+                break
+        if merged is None:
+            if errors:
+                raise ProviderError("; ".join(errors))
+            return pd.DataFrame()
+        return normalize_daily_bars(merged)

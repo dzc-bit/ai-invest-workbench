@@ -1,11 +1,18 @@
 from threading import Event
 
+import pandas as pd
 import pytest
+import requests
+from astock_backtester.data import capital_flow_crawler
 from astock_backtester.data.capital_flow_crawler import (
     EASTMONEY_FUND_FLOW_KLINE_URL,
+    EASTMONEY_FUND_FLOW_URL,
     SINA_FUND_FLOW_URL,
     CapitalFlowCrawler,
     CapitalFlowFetchError,
+    _parse_baidu_content,
+    _parse_payload,
+    _parse_sina_payload,
 )
 from astock_backtester.data.symbols import normalize_symbol
 
@@ -391,6 +398,88 @@ def test_fetch_fund_flow_uses_push2_kline_fallback_when_daykline_fails():
     assert calls[-1][0] == EASTMONEY_FUND_FLOW_KLINE_URL
     assert calls[-1][1]["klt"] == "101"
     assert calls[-1][1]["lmt"] == "40"
+
+
+def test_fetch_fund_flow_raises_network_error_after_injected_transport_timeout():
+    calls = []
+
+    def timeout_json_get(url, params, headers, timeout):
+        calls.append((url, dict(params), headers["Referer"]))
+        raise requests.exceptions.Timeout("read timed out")
+
+    crawler = CapitalFlowCrawler(json_get=timeout_json_get)
+
+    with pytest.raises(CapitalFlowFetchError) as exc_info:
+        crawler.fetch_fund_flow("600519", "2024-01-01", "2024-01-31")
+
+    assert exc_info.value.code == "network_error"
+    assert len(calls) == 1
+    assert calls[0][0] == EASTMONEY_FUND_FLOW_URL
+    assert "ut" not in calls[0][1]
+    assert calls[0][2] == "https://data.eastmoney.com/zjlx/detail.html"
+
+
+def test_eastmoney_timeout_on_both_transports_prunes_remaining_variants():
+    eastmoney_calls = []
+
+    def timeout_json_get(url, params, headers, timeout):
+        eastmoney_calls.append((url, dict(params), headers["Referer"]))
+        raise requests.exceptions.Timeout("read timed out")
+
+    def fake_baidu_json_get(url, params, headers, timeout):
+        return {"Result": {"content": [{"date": "2026/06/05", "extMainIn": "100\u4e07"}]}}
+
+    crawler = CapitalFlowCrawler(
+        baidu_json_get=fake_baidu_json_get,
+        eastmoney_json_getters=(
+            ("requests", timeout_json_get),
+            ("curl_cffi", timeout_json_get),
+        ),
+    )
+
+    result = crawler.fetch_many_fund_flows(["000001"], "2026-06-05", "2026-06-05")
+
+    assert len(eastmoney_calls) == 2
+    assert {call[0] for call in eastmoney_calls} == {EASTMONEY_FUND_FLOW_URL}
+    assert all("ut" not in call[1] for call in eastmoney_calls)
+    assert all(call[2] == "https://data.eastmoney.com/zjlx/detail.html" for call in eastmoney_calls)
+    assert result["failures"] == []
+    assert result["rows"][0]["main_net_inflow"] == 1000000.0
+    assert any(
+        item["symbol"] == "000001"
+        and item["code"] == "provider_attempt_failed"
+        and item["provider"] == "eastmoney"
+        and item["error_code"] == "network_error"
+        for item in result["diagnostics"]
+    )
+
+
+def test_eastmoney_http_rejection_keeps_trying_param_and_header_variants():
+    calls = []
+
+    def fake_json_get(url, params, headers, timeout):
+        calls.append((dict(params), headers["Referer"]))
+        if "ut" not in params:
+            raise RuntimeError("456 Client Error: Forbidden")
+        return {
+            "data": {
+                "klines": [
+                    "2024-01-02,2000000,-1500000,-500000,1200000,800000,4.2,-3.1,-1.1,2.5,1.7,1688.0,1.5",
+                ]
+            }
+        }
+
+    crawler = CapitalFlowCrawler(json_get=fake_json_get)
+
+    rows = crawler.fetch_fund_flow("600519", "2024-01-01", "2024-01-31")
+
+    assert rows[0]["main_net_inflow"] == 2000000.0
+    assert len(calls) == 3
+    assert calls[0][1] == "https://data.eastmoney.com/zjlx/detail.html"
+    assert calls[1][1] == "https://quote.eastmoney.com/"
+    assert "ut" not in calls[0][0]
+    assert "ut" not in calls[1][0]
+    assert calls[2][0]["ut"]
 
 
 def test_fetch_many_fund_flows_keeps_successful_rows_and_reports_failures(monkeypatch):
@@ -1003,3 +1092,145 @@ def test_normalize_code_accepts_common_a_share_symbol_forms():
     assert normalize_symbol("SH600519") == "600519"
     assert normalize_symbol("600519.SH") == "600519"
     assert normalize_symbol(" sz000001 ") == "000001"
+
+
+def test_sina_fund_flow_endpoint_uses_https():
+    """同文件其余端点都是 https；明文 http 会被中间设备改写或投毒（实测同载荷）。"""
+    assert SINA_FUND_FLOW_URL.startswith("https://"), SINA_FUND_FLOW_URL
+
+
+def test_eastmoney_variant_matrix_stops_at_combination_cap(monkeypatch):
+    """变体矩阵必须有上限：403/429 这类非网络层失败原本会走满全部组合。"""
+    cap = capital_flow_crawler.EASTMONEY_VARIANT_MAX_COMBINATIONS
+    assert isinstance(cap, int) and cap > 0
+    combinations = 0
+
+    def always_forbidden(url, params, headers, timeout):
+        nonlocal combinations
+        combinations += 1
+        raise RuntimeError("456 Client Error: Forbidden")
+
+    # 双传输生产形态：按**组合**计数，上限不能被传输数放大。
+    crawler = CapitalFlowCrawler(
+        eastmoney_json_getters=(("requests", always_forbidden), ("curl_cffi", always_forbidden)),
+    )
+
+    with pytest.raises(CapitalFlowFetchError):
+        crawler.fetch_fund_flow("600519", "2024-01-01", "2024-01-31")
+
+    assert combinations == cap * 2, f"each combination may try both transports, ran {combinations}"
+
+
+def test_eastmoney_variant_cap_still_reaches_the_kline_endpoint():
+    """上限按组合计数必须保证备用端点仍被轮到（否则 push2 kline 永远拿不到机会）。
+
+    这是按传输计数的旧写法会退化的地方：双传输形态把预算全花在 daykline 上，
+    注入单传输的用例发现不了。
+    """
+    cap = capital_flow_crawler.EASTMONEY_VARIANT_MAX_COMBINATIONS
+    assert cap >= 3, "cap must leave room to reach the alternate endpoint"
+    seen_urls: list[str] = []
+
+    def forbidden(url, params, headers, timeout):
+        seen_urls.append(url)
+        raise RuntimeError("456 Client Error: Forbidden")
+
+    crawler = CapitalFlowCrawler(
+        eastmoney_json_getters=(("requests", forbidden), ("curl_cffi", forbidden)),
+    )
+
+    with pytest.raises(CapitalFlowFetchError):
+        crawler.fetch_fund_flow("600519", "2024-01-01", "2024-01-31")
+
+    assert EASTMONEY_FUND_FLOW_KLINE_URL in seen_urls, (
+        f"the push2 kline alternate endpoint must still be attempted; tried {sorted(set(seen_urls))}"
+    )
+
+
+def test_baidu_supplement_caps_missing_dates_and_reports_shortfall(monkeypatch):
+    """缺失日无上限时，长窗口 + 新浪大面积缺日会退化成 N×500 次百度请求。"""
+    cap = capital_flow_crawler.BAIDU_SUPPLEMENT_MAX_MISSING_DATES
+    assert 0 < cap < 200
+    fetched_windows: list[tuple[str, str]] = []
+
+    def fake_sina(url, params, headers, timeout):
+        # 新浪只给窗口最后一天 → 前面全是"缺失日"。
+        return [{"opendate": "2024-03-29", "netamount": "1000000.0", "trade": "10.0"}]
+
+    def fake_baidu(url, params, headers, timeout):
+        cursor = str(params["date"])
+        fetched_windows.append((cursor, cursor))
+        # 每个窗口只回一天且不再往前推进，避免补日循环真的跑起来。
+        return {"Result": {"content": [{"date": "2024/03/28", "extMainIn": "1万", "closepx": "10.0"}]}}
+
+    crawler = CapitalFlowCrawler(sina_json_get=fake_sina, baidu_json_get=fake_baidu)
+    rows, diagnostics = crawler._fetch_fund_flow_with_diagnostics(
+        "600519",
+        "2024-01-02",
+        "2024-03-29",
+        skip_eastmoney=True,
+    )
+
+    assert rows, "Sina rows must still come back"
+    assert len(fetched_windows) <= cap, (
+        f"Baidu supplement must respect the per-symbol cap of {cap} missing dates, "
+        f"issued {len(fetched_windows)} requests"
+    )
+    assert any(item.get("code") == "date_coverage_shortfall" for item in diagnostics), (
+        "dates dropped by the cap must be reported instead of silently skipped"
+    )
+
+
+def test_recent_success_cache_is_bounded(monkeypatch):
+    """缓存只服务同批兜底：全市场补齐不能把它撑成 5500 个符号的常驻大对象。"""
+    cap = capital_flow_crawler.RECENT_SUCCESS_CACHE_MAX_SYMBOLS
+    assert isinstance(cap, int) and cap > 0
+    crawler = CapitalFlowCrawler(json_get=lambda url, params, headers, timeout: {"data": {"klines": []}})
+
+    for index in range(cap + 50):
+        crawler._remember_success_rows(f"{index:06d}", [{"trade_date": "2024-01-02", "main_net_inflow": 1.0}])
+
+    assert len(crawler._recent_success_rows) == cap
+    # 最新的符号必须还在（淘汰的是最久未使用的一端）。
+    assert f"{cap + 49:06d}" in crawler._recent_success_rows
+    assert "000000" not in crawler._recent_success_rows
+
+
+def test_sina_rate_limit_sleeps_outside_the_lock(monkeypatch):
+    """限速必须在锁外 sleep：持锁睡眠把 8 个 worker 全串行化，等于放弃并发。"""
+    clock = iter([0.0, 0.0, 0.0, 0.0, 10.0, 10.0])
+    monkeypatch.setattr("astock_backtester.data.capital_flow_crawler.time.monotonic", lambda: next(clock))
+    sleeps: list[float] = []
+    monkeypatch.setattr("astock_backtester.data.capital_flow_crawler.time.sleep", sleeps.append)
+    crawler = CapitalFlowCrawler(json_get=lambda url, params, headers, timeout: {"data": {"klines": []}})
+
+    crawler._wait_for_sina_request_slot()
+    crawler._wait_for_sina_request_slot()
+
+    assert sleeps == [0.25], "second call must wait only the remaining interval"
+
+
+def test_parsed_money_amounts_are_yuan_across_eastmoney_sina_and_baidu():
+    """三源金额单位必须同为**元**：混进差 1e4/1e8 的量级会让同一列不可比。"""
+    eastmoney_rows, _ = _parse_payload(
+        "600519",
+        {"data": {"klines": ["2026-06-05,32986800.0,-100,0,0,0"]}},
+        "2026-06-05",
+        "2026-06-05",
+    )
+    sina_rows, _ = _parse_sina_payload(
+        "600519",
+        [{"opendate": "2026-06-05", "netamount": "32986800.0"}],
+        "2026-06-05",
+        "2026-06-05",
+    )
+    baidu_rows, _ = _parse_baidu_content(
+        "600519",
+        [{"date": "2026/06/05", "extMainIn": "+3298.68万"}],
+        "2026-06-05",
+        "2026-06-05",
+    )
+
+    values = [eastmoney_rows[0]["main_net_inflow"], sina_rows[0]["main_net_inflow"], baidu_rows[0]["main_net_inflow"]]
+    assert values == [32_986_800.0, 32_986_800.0, 32_986_800.0], values
+    assert pd.notna(values).all()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -19,6 +20,18 @@ from astock_backtester.data.astock_adapter import AStockDataAdapter  # noqa: E40
 from astock_backtester.data.providers import ADataProvider  # noqa: E402
 from astock_backtester.data.symbols import normalize_symbol  # noqa: E402
 from astock_backtester.data.warehouse import Warehouse  # noqa: E402
+
+_HTTP_ADAPTER: AStockDataAdapter | None = None
+_HTTP_ADAPTER_LOCK = threading.Lock()
+
+
+def _http_adapter() -> AStockDataAdapter:
+    global _HTTP_ADAPTER
+    if _HTTP_ADAPTER is None:
+        with _HTTP_ADAPTER_LOCK:
+            if _HTTP_ADAPTER is None:
+                _HTTP_ADAPTER = AStockDataAdapter.from_http_sources()
+    return _HTTP_ADAPTER
 
 
 def append_jsonl(path: Path, payload: dict) -> None:
@@ -112,7 +125,7 @@ def fetch_daily_bars(symbol: str, start_date: str, end_date: str, adata_provider
     if not frame.empty:
         return frame, "adata"
 
-    frame = AStockDataAdapter.from_http_sources().fetch_daily_bars([symbol], start_date, end_date)
+    frame = _http_adapter().fetch_daily_bars([symbol], start_date, end_date)
     if not frame.empty:
         return frame, "http"
 
@@ -127,13 +140,13 @@ def fetch_daily_bars_from_source(
     adata_provider: ADataProvider,
 ) -> tuple[pd.DataFrame, str]:
     if source == "http":
-        frame = AStockDataAdapter.from_http_sources().fetch_daily_bars([symbol], start_date, end_date)
+        frame = _http_adapter().fetch_daily_bars([symbol], start_date, end_date)
         return frame, "http" if not frame.empty else "empty"
     if source == "adata":
         frame = adata_provider.fetch_daily_bars(symbol, start_date, end_date)
         return frame, "adata" if not frame.empty else "empty"
 
-    frame = AStockDataAdapter.from_http_sources().fetch_daily_bars([symbol], start_date, end_date)
+    frame = _http_adapter().fetch_daily_bars([symbol], start_date, end_date)
     if not frame.empty:
         return frame, "http"
     frame = adata_provider.fetch_daily_bars(symbol, start_date, end_date)

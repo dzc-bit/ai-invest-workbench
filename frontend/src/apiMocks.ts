@@ -653,11 +653,72 @@ export function mockFetchDailyBarsResult(
   };
 }
 
+/** 「补全缺失数据」资金流优先编排的三种预览/测试场景（§见 DataCenter.runCapitalFlowFirstFullMarket）：
+ * - `no_gap`：后端无缺口 200 立即返回，没有 job → 编排应直接启动全市场日线；
+ * - `running_job`：返回 running 的资金流 job → 编排应等 job 结束再衔接日线；
+ * - `failure`：抛错 → 编排不得阻断日线补齐。
+ * `auto` 保持历史行为（空 symbols 给 completed job，非空不带 job），既有用例不回归。 */
+export type CapitalFlowMockScenario = "auto" | "no_gap" | "running_job" | "failure";
+
 export function mockFetchCapitalFlowResult(
   symbols: string[],
   startDate: string,
-  endDate: string
+  endDate: string,
+  scenario: CapitalFlowMockScenario = "auto"
 ): FetchResult {
+  if (scenario === "failure") {
+    throw new Error("capital-flow upstream disconnected (preview mock)");
+  }
+  if (scenario === "no_gap") {
+    return {
+      status: "ok",
+      imported_rows: 0,
+      requested_symbols: symbols,
+      fetched_symbols: symbols,
+      missing_symbols: [],
+      coverage: [
+        { dataset: "daily_bars", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+        { dataset: "capital_flow", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+        { dataset: "market_cap", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 }
+      ],
+      logs: [{ level: "info", message: "Capital-flow gaps already filled, nothing to backfill" }],
+      diagnostics: [{ code: "capital_flow_no_gaps", source: "capital_flow_crawler" }],
+      failures: []
+    };
+  }
+  if (scenario === "running_job") {
+    return {
+      status: "ok",
+      imported_rows: 0,
+      requested_symbols: symbols,
+      fetched_symbols: symbols,
+      missing_symbols: [],
+      coverage: [
+        { dataset: "daily_bars", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+        { dataset: "capital_flow", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 },
+        { dataset: "market_cap", symbols: 2, start_date: startDate, end_date: endDate, missing_rows: 0, suspension_rows: 0 }
+      ],
+      logs: [{ level: "info", message: "Capital-flow backfill started for all preview symbols" }],
+      diagnostics: [{ code: "capital_flow_backfill_job_started", source: "capital_flow_crawler" }],
+      failures: [],
+      job: {
+        job_id: "preview-capital-flow-running",
+        mode: "capital_flow_backfill",
+        status: "running",
+        total_symbols: 2,
+        completed_symbols: 0,
+        failed_symbols: 0,
+        processed_symbols: 0,
+        skipped_symbols: 0,
+        imported_rows: 0,
+        returned_rows: 0,
+        current_symbol: "600519",
+        start_date: startDate,
+        end_date: endDate,
+        errors: []
+      }
+    };
+  }
   if (symbols.length === 0) {
     return {
       status: "ok",

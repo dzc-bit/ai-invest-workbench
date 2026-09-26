@@ -4,7 +4,9 @@ import logging
 import math
 
 import pandas as pd
+from astock_backtester.data import operations
 from astock_backtester.data.cache import LocalCache
+from astock_backtester.data.filelock import FileLockTimeout
 from astock_backtester.data.importer import normalize_daily_bars
 from astock_backtester.data.operations import (
     _read_existing_daily_bars,
@@ -17,6 +19,7 @@ from astock_backtester.data.operations import (
 from astock_backtester.data.realtime_parsers import (
     aggregate_ths_hot_topics as _aggregate_ths_hot_topics,
 )
+from astock_backtester.data.trading_calendar import a_share_trade_dates
 from astock_backtester.data.warehouse import Warehouse
 
 
@@ -1072,6 +1075,348 @@ def test_import_recreates_missing_local_parquet_directory(tmp_path):
     assert result.imported_rows == 1
     assert cache.daily_bars_path.exists() or cache.daily_bars_pickle_path.exists()
     assert len(cache.read_daily_bars()) == 1
+
+
+def _coverage_days(start_date: str, end_date: str) -> list[pd.Timestamp]:
+    return sorted(a_share_trade_dates(pd.Timestamp(start_date), pd.Timestamp(end_date)))
+
+
+def _rows_for_days(symbol: str, days: list[pd.Timestamp], *, listing_days: int = 90) -> list[tuple[object, ...]]:
+    return [
+        (symbol, day, 10.0, 11.0, 9.0, 10.5, 1000, 0.1, 9_000_000_000.0, float("nan"), False, False, listing_days)
+        for day in days
+    ]
+
+
+def test_fetch_daily_bars_marks_tail_coverage_shortfall_as_partial(tmp_path):
+    cache = LocalCache(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-15")
+
+    def fake_fetcher(symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        assert (start_date, end_date) == ("2026-06-01", "2026-06-15")
+        return _bars(_rows_for_days("AAA", days[:3]))
+
+    result = fetch_daily_bars_into_cache(
+        cache=cache,
+        fetcher=fake_fetcher,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+    )
+
+    shortfalls = [item for item in result.diagnostics if item.get("code") == "date_coverage_shortfall"]
+    assert result.status == "partial"
+    assert "AAA" in result.missing_symbols
+    assert [item["symbol"] for item in shortfalls] == ["AAA"]
+    assert shortfalls[0]["source"] == "daily_bars_fetcher"
+    assert "2026-06-15" in str(shortfalls[0]["message"])
+    assert any(entry.level == "warning" and "AAA" in entry.message for entry in result.logs)
+
+
+def test_fetch_daily_bars_does_not_flag_delisted_symbol_tail_as_shortfall(tmp_path):
+    cache = LocalCache(tmp_path)
+    warehouse = Warehouse(tmp_path)
+    warehouse.upsert_symbol_lifecycle(
+        [{"symbol": "AAA", "listing_date": "2026-05-01", "delisted_date": "2026-06-05", "status": "delisted"}]
+    )
+    days = _coverage_days("2026-06-01", "2026-06-15")
+    delisted_tail = [day for day in days if day <= pd.Timestamp("2026-06-05")]
+    assert delisted_tail[-1] == pd.Timestamp("2026-06-05")
+
+    def fake_fetcher(symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        return _bars(_rows_for_days("AAA", delisted_tail, listing_days=9999))
+
+    result = fetch_daily_bars_into_cache(
+        cache=cache,
+        fetcher=fake_fetcher,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+        warehouse=warehouse,
+    )
+
+    assert result.status == "ok"
+    assert result.missing_symbols == []
+    assert not any(item.get("code") == "date_coverage_shortfall" for item in result.diagnostics)
+
+
+def test_fetch_daily_bars_full_window_return_reports_ok(tmp_path):
+    cache = LocalCache(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-15")
+
+    def fake_fetcher(symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        return _bars(_rows_for_days("AAA", days))
+
+    result = fetch_daily_bars_into_cache(
+        cache=cache,
+        fetcher=fake_fetcher,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+    )
+
+    assert result.status == "ok"
+    assert result.missing_symbols == []
+    assert not any(item.get("code") == "date_coverage_shortfall" for item in result.diagnostics)
+
+
+def test_coverage_drops_market_normal_day_gap_from_missing_trade_dates(tmp_path):
+    warehouse = Warehouse(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-15")
+    gap_day = days[4]
+    rows = [
+        *_rows_for_days("BBB", days),
+        *_rows_for_days("CCC", days),
+        *_rows_for_days("AAA", [day for day in days if day != gap_day]),
+    ]
+    warehouse.write_daily_bars(_bars(rows))
+
+    details = build_daily_bars_coverage(
+        cache=LocalCache(tmp_path),
+        warehouse=warehouse,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+    )
+
+    missing = {day.isoformat() for day in details.items[0].missing_trade_dates}
+    assert gap_day.date().isoformat() not in missing
+    assert details.items[0].missing_trade_dates == []
+
+
+def test_coverage_keeps_thin_day_gap_in_missing_trade_dates(tmp_path):
+    warehouse = Warehouse(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-15")
+    thin_day = days[4]
+    rows = [
+        *(row for row in _rows_for_days("AAA", days) if row[1] != thin_day),
+        *(row for row in _rows_for_days("BBB", days) if row[1] != thin_day),
+        *(row for row in _rows_for_days("CCC", days) if row[1] != thin_day),
+    ]
+    warehouse.write_daily_bars(_bars(rows))
+
+    details = build_daily_bars_coverage(
+        cache=LocalCache(tmp_path),
+        warehouse=warehouse,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+    )
+
+    missing = {day.isoformat() for day in details.items[0].missing_trade_dates}
+    assert missing == {thin_day.date().isoformat()}
+
+
+def test_coverage_keeps_stale_tail_after_symbol_last_row(tmp_path):
+    warehouse = Warehouse(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-15")
+    rows = [
+        *_rows_for_days("AAA", days[:5]),
+        *_rows_for_days("BBB", days),
+        *_rows_for_days("CCC", days),
+    ]
+    warehouse.write_daily_bars(_bars(rows))
+
+    details = build_daily_bars_coverage(
+        cache=LocalCache(tmp_path),
+        warehouse=warehouse,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+    )
+
+    missing = {day.isoformat() for day in details.items[0].missing_trade_dates}
+    assert missing == {day.date().isoformat() for day in days[5:]}
+
+
+def test_coverage_keeps_flat_calendar_without_warehouse(tmp_path):
+    cache = LocalCache(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-15")
+    gap_day = days[4]
+    cache.write_daily_bars(_bars(_rows_for_days("AAA", [day for day in days if day != gap_day])))
+
+    details = build_daily_bars_coverage(
+        cache=cache,
+        warehouse=None,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+    )
+
+    missing = {day.isoformat() for day in details.items[0].missing_trade_dates}
+    assert missing == {gap_day.date().isoformat()}
+
+
+def test_coverage_keeps_flat_calendar_when_market_trade_date_counts_fail(tmp_path, monkeypatch):
+    warehouse = Warehouse(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-15")
+    gap_day = days[4]
+    rows = [
+        *_rows_for_days("BBB", days),
+        *_rows_for_days("CCC", days),
+        *_rows_for_days("AAA", [day for day in days if day != gap_day]),
+    ]
+    warehouse.write_daily_bars(_bars(rows))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("counts unavailable")
+
+    monkeypatch.setattr(warehouse, "market_trade_date_counts", boom)
+
+    details = build_daily_bars_coverage(
+        cache=LocalCache(tmp_path),
+        warehouse=warehouse,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-15",
+    )
+
+    missing = {day.isoformat() for day in details.items[0].missing_trade_dates}
+    assert missing == {gap_day.date().isoformat()}
+
+
+def test_coverage_keeps_missing_dates_when_window_is_below_classification_minimum(tmp_path):
+    warehouse = Warehouse(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-03")
+    gap_day = days[1]
+    rows = [
+        *_rows_for_days("BBB", days),
+        *_rows_for_days("CCC", days),
+        *_rows_for_days("AAA", [day for day in days if day != gap_day]),
+    ]
+    warehouse.write_daily_bars(_bars(rows))
+
+    details = build_daily_bars_coverage(
+        cache=LocalCache(tmp_path),
+        warehouse=warehouse,
+        symbols=["AAA"],
+        start_date=days[0].date().isoformat(),
+        end_date=days[-1].date().isoformat(),
+    )
+
+    missing = {day.isoformat() for day in details.items[0].missing_trade_dates}
+    assert missing == {gap_day.date().isoformat()}
+
+
+def test_coverage_keeps_thin_day_gap_when_calendar_has_zero_row_days(tmp_path):
+    """0 行日不能混进横截面中位数。
+
+    market_trade_date_counts 按交易日历给每个交易日补 0；把 0 混进中位数会把
+    阈值压到 1，让“只有 1 行”的 06-03 被误判成市场正常日、缺口被吞掉。
+    过滤 0 后中位数是 4、阈值 2，06-03 是 thin day 照算，0 行日也不在
+    market_normal_days 里、按平日历口径保留——与 coverage()/sync 两个出口一致。
+    """
+    warehouse = Warehouse(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-09")
+    assert [day.date().isoformat() for day in days] == [
+        "2026-06-01",
+        "2026-06-02",
+        "2026-06-03",
+        "2026-06-04",
+        "2026-06-05",
+        "2026-06-08",
+        "2026-06-09",
+    ]
+    thin_day = days[2]  # 06-03：只有 DDD 有行
+    full_tail = [days[0], days[1], days[6]]
+    rows = [
+        *_rows_for_days("AAA", full_tail),
+        *_rows_for_days("BBB", full_tail),
+        *_rows_for_days("CCC", full_tail),
+        *_rows_for_days("DDD", [*full_tail, thin_day]),
+    ]
+    warehouse.write_daily_bars(_bars(rows))
+
+    details = build_daily_bars_coverage(
+        cache=LocalCache(tmp_path),
+        warehouse=warehouse,
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-09",
+    )
+
+    missing = sorted(day.isoformat() for day in details.items[0].missing_trade_dates)
+    assert missing == ["2026-06-03", "2026-06-04", "2026-06-05", "2026-06-08"]
+
+
+def _fail_first_cache_write(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    original_write = LocalCache.write_daily_bars
+
+    def flaky_write(self, frame):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            raise FileLockTimeout(str(self.daily_bars_path), 120.0)
+        return original_write(self, frame)
+
+    monkeypatch.setattr(LocalCache, "write_daily_bars", flaky_write)
+    monkeypatch.setattr(operations, "WRITE_LOCK_RETRY_BACKOFF_SECONDS", 0)
+    return calls
+
+
+def test_fetch_daily_bars_retries_cache_write_after_lock_timeout(tmp_path, monkeypatch):
+    cache = LocalCache(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-02")
+    calls = _fail_first_cache_write(monkeypatch)
+
+    result = fetch_daily_bars_into_cache(
+        cache=cache,
+        fetcher=lambda symbols, start_date, end_date: _bars(_rows_for_days("AAA", days)),
+        symbols=["AAA"],
+        start_date="2026-06-01",
+        end_date="2026-06-02",
+        refresh_coverage=False,
+    )
+
+    assert calls == [1, 2]
+    assert result.status == "ok"
+    assert len(cache.read_daily_bars()) == len(days)
+
+
+def test_import_daily_bars_retries_cache_write_after_lock_timeout(tmp_path, monkeypatch):
+    cache = LocalCache(tmp_path)
+    days = _coverage_days("2026-06-01", "2026-06-02")
+    calls = _fail_first_cache_write(monkeypatch)
+
+    result = import_daily_bars_into_cache(
+        cache=cache,
+        frame=_bars(_rows_for_days("AAA", days)),
+        source="unit-test",
+    )
+
+    assert calls == [1, 2]
+    assert result.status == "ok"
+    assert len(cache.read_daily_bars()) == len(days)
+
+
+def test_fetch_capital_flow_retries_cache_write_after_lock_timeout(tmp_path, monkeypatch):
+    cache = LocalCache(tmp_path)
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(_bars(_rows_for_days("AAA", [pd.Timestamp("2024-01-02")])))
+
+    def fake_capital_flow_fetcher(symbols: list[str], start_date: str, end_date: str) -> dict:
+        return {
+            "rows": [{"symbol": "AAA", "trade_date": "2024-01-02", "main_net_inflow": 1_500_000.0}],
+            "failures": [],
+            "diagnostics": [],
+        }
+
+    calls = _fail_first_cache_write(monkeypatch)
+
+    result = fetch_capital_flow_into_cache(
+        cache=cache,
+        warehouse=warehouse,
+        capital_flow_fetcher=fake_capital_flow_fetcher,
+        symbols=["AAA"],
+        start_date="2024-01-02",
+        end_date="2024-01-02",
+        refresh_coverage=False,
+    )
+
+    assert calls == [1, 2]
+    assert result.status == "ok"
+    assert result.imported_rows == 1
+    assert cache.read_daily_bars()["main_net_inflow"].tolist() == [1_500_000.0]
 
 
 def test_aggregate_ths_hot_topics_ranks_normalized_topics():
