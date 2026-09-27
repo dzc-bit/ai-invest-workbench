@@ -1170,3 +1170,135 @@ def test_backfill_market_cap_cli_dry_run_prints_summary(monkeypatch, tmp_path, c
     assert "dry-run" in output
     loaded = module.Warehouse(cache_dir).read_daily_bars(symbols=["000001"])
     assert loaded["float_market_cap"].isna().tolist() == [True, True, False]
+
+
+# ---------------------------------------------------------------------------
+# 发布依赖锁 + sidecar 冒烟验证（发布门禁）
+# ---------------------------------------------------------------------------
+
+
+def load_dependency_lock_script():
+    script_path = Path(__file__).parents[1] / "scripts" / "write-dependency-lock.py"
+    spec = importlib.util.spec_from_file_location("write_dependency_lock", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_dependency_lock_covers_every_declared_runtime_dependency(tmp_path):
+    """锁的最低价值是"声明过的一定在里面"：漏一个就意味着包里没有它。"""
+    module = load_dependency_lock_script()
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    declared = module.declared_dependencies(pyproject)
+
+    resolved = module.closure(declared)
+
+    assert declared <= set(resolved), sorted(declared - set(resolved))
+    # 每一项都是精确版本，且规范化包名可回溯到 dist 元数据。
+    assert all("==" not in name and version for name, version in resolved.items())
+    assert resolved["pandas"]
+
+
+def test_dependency_lock_name_parsing_ignores_extras_and_markers():
+    module = load_dependency_lock_script()
+
+    assert module._normalize("akshare>=1.16") == "akshare"
+    assert module._normalize("langchain-text-splitters>=0.3") == "langchain-text-splitters"
+    assert module._normalize("importlib_metadata; python_version<'3.9'") == "importlib-metadata"
+    assert module._normalize("curl_cffi>=0.15") == "curl-cffi"
+
+
+def test_dependency_lock_writes_auditable_header_and_fails_on_missing_decl(tmp_path, monkeypatch, capsys):
+    module = load_dependency_lock_script()
+    out = tmp_path / "requirements-release.lock.txt"
+
+    code = module.main(["--out", str(out), "--pyproject", str(Path(__file__).parents[1] / "pyproject.toml")])
+
+    assert code == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("# 自动生成")
+    assert any(line.startswith("# python ") for line in lines)
+    assert any(line.startswith("# 生成解释器：") for line in lines)
+    assert any(line == "pandas==" + module.closure({"pandas"})["pandas"] for line in lines)
+    assert "wrote" in capsys.readouterr().out
+
+    # 声明了却装不上 → 非零退出，绝不写出一份"看起来完整"的锁。
+    monkeypatch.setattr(
+        module,
+        "declared_dependencies",
+        lambda _path: {"pandas", "this-package-does-not-exist-12345"},
+    )
+    assert module.main(["--out", str(tmp_path / "second.txt")]) == 1
+    assert not (tmp_path / "second.txt").exists()
+
+
+def test_sidecar_smoke_reports_a_broken_executable_as_failure(tmp_path):
+    """门禁的关键用例：文件存在但起不来，必须是失败而不是异常或假绿。"""
+    smoke_module = _load_smoke_script()
+    broken = tmp_path / "astock-data-service.exe"
+    broken.write_text("这不是可执行文件", encoding="utf-8")
+
+    ok, detail = smoke_module.smoke([str(broken)], timeout_seconds=5)
+
+    assert ok is False
+    assert "无法启动" in detail
+
+
+def test_sidecar_smoke_requires_exactly_one_launch_mode(tmp_path):
+    smoke_module = _load_smoke_script()
+
+    assert smoke_module.main(["--timeout", "1"]) == 2
+    assert smoke_module.main(["--exe", str(tmp_path / "nope.exe"), "--module"]) == 2
+
+
+def _load_smoke_script():
+    script_path = Path(__file__).parents[1] / "scripts" / "smoke-data-service.py"
+    spec = importlib.util.spec_from_file_location("smoke_data_service", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_ci_package_job_runs_the_lock_and_the_smoke_gate():
+    """发布链路的顺序本身就是契约：先锁、再按锁重建环境、再打包、最后启动验证。"""
+    workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    build_step = workflow.index("Build data-service sidecar")
+
+    assert "write-dependency-lock.py" in workflow
+    assert "pip install -r requirements-release.lock.txt" in workflow
+    assert workflow.index("Write release dependency lock") < build_step
+    assert "ASTOCK_BACKTESTER_PYTHON" in workflow
+    assert "smoke-data-service.py --exe src-tauri/bin/astock-data-service.exe" in workflow
+    assert workflow.index("Verify packaged sidecar companions") < workflow.index("Smoke test the packaged sidecar")
+
+
+def test_release_python_matrix_matches_declared_support_range():
+    """CI 矩阵必须等于 requires-python 的上下界，否则声明与验证会各说各话。"""
+    pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    spec = tomllib.loads(pyproject)
+    requires = spec["project"]["requires-python"]
+    workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert requires == ">=3.11,<3.14"
+    lower = requires.split(">=")[1].split(",")[0]
+    upper = requires.split("<")[1].split(",")[0]
+    upper_major, upper_minor = (int(part) for part in upper.split(".")[:2])
+    lower_major, lower_minor = (int(part) for part in lower.split(".")[:2])
+    assert upper_major == lower_major
+
+    def _minor(version: str) -> int:
+        return int(version.split(".")[1])
+
+    # 上界是独占的：声明 <3.14 意味着最高支持的次版本是 3.13，矩阵必须覆盖它。
+    # 只比较主版本号（"3"）会让"声明 <3.14 却只测 3.11"这类失配溜过去。
+    highest = f"{upper_major}.{upper_minor - 1}"
+    tested = json.loads(workflow.split("python-version: ")[1].split("\n")[0])
+
+    assert lower in tested, f"CI 矩阵 {tested} 缺少声明下界 {lower}"
+    assert highest in tested, f"CI 矩阵 {tested} 缺少声明上界内的最高版本 {highest}（requires-python {requires}）"
+    out_of_range = [version for version in tested if not lower_minor <= _minor(version) <= upper_minor - 1]
+    assert not out_of_range, f"CI 矩阵 {tested} 含声明范围外的版本：{out_of_range}"

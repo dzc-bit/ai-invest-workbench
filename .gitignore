@@ -40,7 +40,10 @@ frontend/vite.config.ts.timestamp-*.mjs
 .claude/
 .ruff_cache/
 .venv/
+.venv-release/
 venv/
+# 发布依赖锁由打包环境现生成（scripts/write-dependency-lock.py），只作为 CI artifact 留存
+requirements-release.lock.txt
 *.egg-info/
 
 # 发布产物与日志兜底（当前只靠 release-assets/ 与 src-tauri/bin/ 两个目录规则兜底）

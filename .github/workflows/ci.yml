@@ -7,14 +7,19 @@ on:
 
 jobs:
   backend:
-    name: Backend (pytest + ruff)
+    name: Backend (pytest + ruff) py${{ matrix.python-version }}
     runs-on: windows-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # 与 pyproject 的 requires-python 上下一界保持一致：矩阵就是声明的支持范围。
+      matrix:
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install backend with dev dependencies
         run: python -m pip install -e ".[dev]"
@@ -25,7 +30,7 @@ jobs:
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
-          name: backend-coverage
+          name: backend-coverage-py${{ matrix.python-version }}
           path: coverage.xml
           if-no-files-found: error
 
@@ -101,14 +106,28 @@ jobs:
         # esbuild / jsdom 的本地产物是 node.exe 与 xhr-sync-worker.js 的来源
         run: npm ci
       - name: Install backend with dev dependencies
-        run: python -m pip install -e ".[dev]" pyinstaller
+        run: python -m pip install -e ".[dev]"
       - name: Stage pinned-node layout for the build script
         # 构建脚本要求 .tools\node-v20.18.1-win-x64\node.exe（本机发布的固定
         # 工具链）；CI 只做存在性验证，把 setup-node 安装的 Node 复制到位即可。
         run: |
           New-Item -ItemType Directory -Force .tools/node-v20.18.1-win-x64 | Out-Null
           Copy-Item (Get-Command node).Source .tools/node-v20.18.1-win-x64/node.exe -Force
+      - name: Write release dependency lock
+        # 锁由"将要参与解析"的解释器写出：pyproject 只有下限，没有这一步就无法
+        # 回答"这次发布的包里 pandas 是哪一版"。
+        run: python scripts/write-dependency-lock.py --out requirements-release.lock.txt
+      - name: Recreate the build environment from the lock
+        # PyInstaller 打包的是解释器里实际装着的包，所以真正决定包内容的是这一份
+        # 确定输入；后续构建全部改用 .venv-release 里的 python。
+        run: |
+          python -m venv .venv-release
+          .\.venv-release\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv-release\Scripts\python.exe -m pip install -r requirements-release.lock.txt
+          .\.venv-release\Scripts\python.exe -m pip install -e . --no-deps
       - name: Build data-service sidecar
+        env:
+          ASTOCK_BACKTESTER_PYTHON: ${{ github.workspace }}\.venv-release\Scripts\python.exe
         run: .\scripts\build-data-service.ps1
       - name: Verify packaged sidecar companions
         # §5 红线：桌面安装版 sidecar 旁边必须同时带 node.exe、
@@ -126,3 +145,15 @@ jobs:
             throw "packaged sidecar missing files: $($missing -join ', ')"
           }
           Write-Host "all 4 sidecar companions present"
+      - name: Smoke test the packaged sidecar
+        # 文件齐全 ≠ 起得来：真的启动它并要求 GET /ping 回答 {"ok": true}。
+        # 脚本自带隔离缓存目录与进程清理，不读主数据仓、不打外网。
+        run: python scripts/smoke-data-service.py --exe src-tauri/bin/astock-data-service.exe --timeout 90
+      - name: Upload release dependency lock
+        uses: actions/upload-artifact@v4
+        # 冒烟失败时恰恰最需要锁文件排查依赖，不能因为上一步失败就跳过上传。
+        if: always()
+        with:
+          name: requirements-release-lock
+          path: requirements-release.lock.txt
+          if-no-files-found: error
