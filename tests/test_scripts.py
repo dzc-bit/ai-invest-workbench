@@ -1275,6 +1275,45 @@ def test_sidecar_smoke_prints_failure_reason_on_a_cp1252_console(tmp_path):
     assert "UnicodeEncodeError" not in output
 
 
+def test_sidecar_smoke_kills_the_whole_process_tree(monkeypatch):
+    """PyInstaller --onefile 是引导进程 + 内层进程两段：只 terminate 父进程会漏内层。
+
+    实测 2026-09-27：冒烟跑完后 ``astock-data-service.exe`` 仍在监听端口、临时缓存
+    目录删不掉——脚本的口径写着"结束时无条件终止"，漏内层就是语料与行为不一致。
+    """
+    smoke_module = _load_smoke_script()
+    calls: list[list[str]] = []
+
+    class _FakeProcess:
+        pid = 4321
+        returncode: int | None = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            raise AssertionError("Windows 上应先走 taskkill /T，而不是只 terminate")
+
+        def kill(self):
+            raise AssertionError("taskkill 成功后不应再走 kill")
+
+    def _fake_run(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(smoke_module.sys, "platform", "win32")
+    monkeypatch.setattr(smoke_module.subprocess, "run", _fake_run)
+
+    smoke_module._terminate_process_tree(_FakeProcess())
+
+    assert calls, "未调用任何终止命令"
+    assert calls[0][:4] == ["taskkill", "/F", "/T", "/PID"]
+    assert calls[0][4] == "4321"
+
+
 def _load_smoke_script():
     script_path = Path(__file__).parents[1] / "scripts" / "smoke-data-service.py"
     spec = importlib.util.spec_from_file_location("smoke_data_service", script_path)

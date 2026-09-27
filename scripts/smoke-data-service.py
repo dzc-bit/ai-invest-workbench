@@ -8,7 +8,9 @@ import 失败 / 打包漏了 data 文件"的包可以一路绿灯进发布。这
 隔离口径（AGENTS.md §12/§11）：
 - 用 ``tempfile`` 下的空缓存目录，绝不指向 ``运行产物\\本地数据仓``；
 - 只打回环 ``/ping``，不碰任何外部行情源；
-- 结束时无条件终止子进程并删除临时目录（含超时被杀的情况）。
+- 结束时无条件终止**整棵进程树**并删除临时目录（含超时被杀的情况）——PyInstaller
+  ``--onefile`` 是引导进程 + 内层进程两段结构，只终止父进程会留下内层进程占着
+  端口与缓存目录。
 """
 
 from __future__ import annotations
@@ -105,14 +107,36 @@ def smoke(launch: list[str], *, timeout_seconds: float) -> tuple[bool, str]:
             time.sleep(0.25)
         return False, f"{timeout_seconds:.0f} 秒内 /ping 没有回答（端口 {port} 未就绪）"
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:  # 只在冒烟验证的子进程上用 kill 兜底
-                process.kill()
-                process.wait(timeout=10)
+        _terminate_process_tree(process)
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes] | None) -> None:
+    """终止 sidecar 及其子进程。
+
+    PyInstaller ``--onefile`` 在 Windows 上是"引导进程 + 解包后真正干活的内层进程"
+    两段结构：只 ``terminate()`` 父进程会留下内层进程继续占着端口与缓存目录
+    （实测：冒烟后 ``astock-data-service.exe`` 仍在监听，缓存目录删不掉）。因此
+    必须按进程树结束；taskkill 不可用时退回单进程终止。
+    """
+    if process is None or process.poll() is not None:
+        return
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            capture_output=True,
+        )
+        try:
+            process.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:  # 只在冒烟验证的子进程上用 kill 兜底
+        process.kill()
+        process.wait(timeout=10)
 
 
 def main(argv: list[str] | None = None) -> int:
