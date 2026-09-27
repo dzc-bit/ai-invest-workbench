@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -1251,6 +1253,26 @@ def test_sidecar_smoke_requires_exactly_one_launch_mode(tmp_path):
 
     assert smoke_module.main(["--timeout", "1"]) == 2
     assert smoke_module.main(["--exe", str(tmp_path / "nope.exe"), "--module"]) == 2
+
+
+def test_sidecar_smoke_prints_failure_reason_on_a_cp1252_console(tmp_path):
+    """CI 的 Windows runner stdout 是 cp1252 管道：中文提示不得把失败路径自己弄崩。
+
+    实测 2026-09-27：本脚本首次进 CI 的 Package job，`print("找不到 sidecar：…")`
+    直接抛 UnicodeEncodeError，退出码 1 却看不到原因——门禁必须能说清"为什么红"。
+    """
+    script_path = Path(__file__).parents[1] / "scripts" / "smoke-data-service.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(script_path), "--exe", str(tmp_path / "nope.exe")],
+        capture_output=True,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+
+    assert proc.returncode == 1, proc.stderr
+    output = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+    assert "找不到 sidecar" in output
+    assert "UnicodeEncodeError" not in output
 
 
 def _load_smoke_script():

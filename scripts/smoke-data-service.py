@@ -29,6 +29,24 @@ from pathlib import Path
 NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def _configure_stdio() -> None:
+    """让中文提示在非 UTF-8 控制台上也不会把失败路径自己弄崩。
+
+    CI 的 Windows runner 把 stdout 接到 cp1252 管道，`print("找不到 sidecar：…")`
+    会先抛 ``UnicodeEncodeError``（实测 2026-09-27 首次跑该门禁即红）——那正是
+    这套脚本最该说清楚话的失败分支。改成 UTF-8 后管道里是 UTF-8 字节，日志
+    按 UTF-8 解码；本机旧代码页顶多显示乱码，但绝不吞掉失败原因。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -98,6 +116,7 @@ def smoke(launch: list[str], *, timeout_seconds: float) -> tuple[bool, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", help="打包出来的 astock-data-service.exe 路径（发布构建用这个）")
     parser.add_argument(
