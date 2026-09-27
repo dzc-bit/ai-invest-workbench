@@ -313,6 +313,30 @@ def test_score_group_requires_threshold():
     assert result.score == 35
 
 
+def test_score_group_without_threshold_does_not_pass():
+    """SCORE 组缺阈值必须判不通过，不能折叠成 0。
+
+    ``float(score_threshold or 0.0)`` 会让 ``None`` 变成 0，而 ``score >= 0``
+    对任意打分结果恒真 —— 用户以为在按分数过滤，实际是零过滤，候选质量被
+    静默放大。分数仍然要算出来，供调用方诊断与展示。
+    """
+    df = enriched_frame()
+    row = df[(df["symbol"] == "AAA") & (df["trade_date"] == pd.Timestamp("2024-01-04"))].iloc[0]
+    group = ConditionGroup(
+        id="score",
+        operator=ConditionOperator.SCORE,
+        conditions=[
+            ConditionNode(id="cap", condition_id="market_cap_between", params={"min": 1, "max": 10_000_000_000}, weight=20),
+            ConditionNode(id="hot", condition_id="market_rising_ratio_at_least", params={"min_ratio": 0.5}, weight=15),
+        ],
+    )
+
+    result = evaluate_group(group, row, df, score_threshold=None)
+
+    assert result.passed is False
+    assert result.score == 35
+
+
 def test_volume_ratio_between_uses_prior_average_volume():
     df = enriched_frame()
     row = df[(df["symbol"] == "AAA") & (df["trade_date"] == pd.Timestamp("2024-01-04"))].iloc[0]
@@ -606,7 +630,9 @@ def test_turnover_between_row_and_mask_agree_on_percent_scale():
         condition_id="turnover_between",
         params={"min": 0.02, "max": 0.08},
     )
-    frame = pd.DataFrame({"turnover_rate": [0.38, 2.0, 5.0, 9.0, 0.5, float("nan")]})
+    # 含 ≤1 边界两侧的取值：旧实现按 ``value > 1`` 猜量纲，0.7 被当成 70%、
+    # 0.05 被当成 5%，低换手区间的判定与用户意图正好相反。
+    frame = pd.DataFrame({"turnover_rate": [0.38, 2.0, 5.0, 9.0, 0.5, 0.7, 0.05, 1.0, float("nan")]})
     mask = MASK_BUILDERS["turnover_between"](node, frame)
 
     for index, value in enumerate(frame["turnover_rate"]):
@@ -616,8 +642,9 @@ def test_turnover_between_row_and_mask_agree_on_percent_scale():
             f"(row={row_passed}, mask={bool(mask.iloc[index])})"
         )
 
-    # 2% 与 5% 必须都通过（落在 2%~8% 内），9% 与 0.38% 不通过。
-    assert mask.tolist() == [False, True, True, False, False, False]
+    # 2% 与 5% 必须都通过（落在 2%~8% 内）；9%、0.38%、0.5%、0.7%、0.05%、1.0%
+    # 都不通过（仓库列是百分数，0.7 表示 0.7% 而不是 70%）。
+    assert mask.tolist() == [False, True, True, False, False, False, False, False, False]
 
 
 def test_backtest_settings_defaults_to_conservative_execution():

@@ -1,5 +1,6 @@
 import pandas as pd
 import pytest
+from astock_backtester import engine
 from astock_backtester.engine import run_backtest
 from astock_backtester.indicators import add_market_heat, add_moving_average, add_returns
 from astock_backtester.models import (
@@ -1218,6 +1219,53 @@ def test_limit_down_block_uses_board_specific_thresholds(symbol, is_st, open_pri
         assert result.trades[0].sell_date.isoformat() == "2024-01-05"
     else:
         assert result.trades[0].sell_date.isoformat() == "2024-01-04"
+
+
+@pytest.mark.parametrize(
+    ("symbol", "is_st", "expected"),
+    [
+        # 主板 10%，ST 在主板基础上降到 5%。
+        ("600001", False, 0.10),
+        ("000001", True, 0.05),
+        # 创业板（含后来的 301/302 新股段）与科创板 20%：
+        # 先判 ST 会把创业板/科创板 ST 股错按 5% 算。
+        ("300001", False, 0.20),
+        ("301001", False, 0.20),
+        ("302001", False, 0.20),
+        ("688001", False, 0.20),
+        ("300001", True, 0.20),
+        ("688001", True, 0.20),
+        # 北交所 30%，且不适用 ST 降幅规则。
+        ("920001", False, 0.30),
+        ("830001", False, 0.30),
+        ("920001", True, 0.30),
+    ],
+)
+def test_stock_limit_pct_follows_board_before_st(symbol, is_st, expected):
+    """涨跌停阈值必须先看板块再看 ST，并覆盖 301/302 与北交所。
+
+    旧实现 ``if is_st: return 0.05`` 在板块判断之前，创业板/科创板 ST 股实际
+    仍是 20% 却按 5% 判涨跌停，``limit_up_blocks_buy`` 会错误拦截；板块只认
+    ``300/688``，301/302 创业板新股被按主板 10% 算；北交所 30% 完全缺失。
+    """
+    row = pd.Series({"symbol": symbol, "is_st": is_st, "pre_close": 10.0})
+
+    assert engine._stock_limit_pct(row) == pytest.approx(expected)
+
+
+def test_stock_pool_gem_includes_later_gem_segments():
+    """创业板池必须含 301/302：只认 300 会把创业板新股排除在池外。"""
+    frame = pd.DataFrame({"symbol": ["300001", "301001", "302001", "688001", "600001"]})
+    settings = BacktestSettings(
+        start_date=pd.Timestamp("2024-01-02").date(),
+        end_date=pd.Timestamp("2024-01-05").date(),
+        initial_cash=100_000,
+        stock_pool="gem",
+    )
+
+    mask = engine._stock_pool_mask(frame, settings)
+
+    assert mask.tolist() == [True, True, True, False, False]
 
 
 def test_conservative_execution_records_actual_buy_and_sell_prices_and_amounts():

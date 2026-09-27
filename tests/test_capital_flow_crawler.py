@@ -661,20 +661,18 @@ def test_fetch_many_fund_flows_uses_sina_fallback_before_baidu_when_eastmoney_fa
     assert result["rows"][0]["super_large_net_inflow"] == -98860100.0
     assert result["rows"][0]["main_net_inflow_pct"] == pytest.approx(1.48)
     assert eastmoney_calls
-    assert sina_calls == [
-        (
-            SINA_FUND_FLOW_URL,
-            {
-                "page": "1",
-                "num": "5000",
-                "sort": "opendate",
-                "asc": "0",
-                "daima": "sz000001",
-            },
-            "https://money.finance.sina.com.cn/moneyflow/",
-            15,
-        )
-    ]
+    assert len(sina_calls) == 1
+    url, params, referer, timeout = sina_calls[0]
+    assert url == SINA_FUND_FLOW_URL
+    assert referer == "https://money.finance.sina.com.cn/moneyflow/"
+    assert timeout == 15
+    assert params["daima"] == "sz000001"
+    assert params["sort"] == "opendate"
+    assert params["page"] == "1"
+    # num 必须是"从今天回看到 start_date"的交易日数，而不是恒取 5000 行。
+    # 恒取 5000 在东财不可用时会让全市场补齐变成约 3.3GB 流量。
+    assert int(params["num"]) == capital_flow_crawler._sina_requested_rows("2026-06-04", "2026-06-05")
+    assert 0 < int(params["num"]) <= 5000
     assert baidu_calls == []
     assert any(
         item["symbol"] == "000001"
@@ -683,6 +681,71 @@ def test_fetch_many_fund_flows_uses_sina_fallback_before_baidu_when_eastmoney_fa
         and item["rows"] == 2
         for item in result["diagnostics"]
     )
+
+
+def test_sina_requested_rows_uses_lookback_span_not_window_span():
+    """新浪只有 ``num``（最新 N 行）没有日期参数，N 必须是回看跨度。
+
+    按窗口跨度算会取不到目标日期：补 2015 全年时窗口只有一年，但回看跨度是
+    十年。恒取 5000 则会在东财不可用时让全市场补齐变成约 3.3GB 流量。
+    """
+    today = pd.Timestamp.today().normalize()
+    # 只看今天：1 行就够。
+    assert capital_flow_crawler._sina_requested_rows(today.isoformat(), today.isoformat()) >= 1
+
+    # 十年前到现在：回看跨度约 2400 个交易日，必须是大数且被 5000 封顶。
+    decade_ago = (today - pd.Timedelta(days=365 * 10)).isoformat()
+    decade_rows = capital_flow_crawler._sina_requested_rows(decade_ago, today.isoformat())
+    assert decade_rows > 1000
+    assert decade_rows <= 5000
+
+    # 单调性：起点越早，回看跨度越长。
+    year_ago = (today - pd.Timedelta(days=365)).isoformat()
+    assert capital_flow_crawler._sina_requested_rows(year_ago, today.isoformat()) < decade_rows
+
+
+def test_fallback_failure_is_not_recorded_as_eastmoney_failure_and_runs_once():
+    """兜底源的失败不得记成东财失败，兜底链也不能跑第二遍。
+
+    旧实现把兜底调用放在东财的 ``try`` 里：新浪/百度自己失败时被 except 捕获
+    并记一条 ``provider=eastmoney`` 的 ``network_error``（进而让作业级"东财已
+    挂"的跳过开关误判主源），且 except 分支会把已经跑过的兜底链再跑一遍
+    （sina 3 次重试 + 退避、baidu 3 次重试，单票最坏多花约 10 秒）。
+    """
+
+    def fake_eastmoney_json_get(url, params, headers, timeout):
+        # 东财覆盖不全（只给一天），触发兜底。
+        return {
+            "data": {
+                "klines": [
+                    "2026-06-05,32986800.0,-98860100.0,132000000.0,-50850700.0,17863900.0,0.0148",
+                ]
+            }
+        }
+
+    sina_calls: list[dict[str, str]] = []
+    baidu_calls: list[str] = []
+
+    def fake_sina_json_get(url, params, headers, timeout):
+        sina_calls.append(dict(params))
+        raise requests.exceptions.ConnectionError("sina down")
+
+    def fake_baidu_json_get(url, params, headers, timeout):
+        baidu_calls.append(params["code"])
+        raise requests.exceptions.ConnectionError("baidu down")
+
+    crawler = CapitalFlowCrawler(
+        baidu_json_get=fake_baidu_json_get,
+        sina_json_get=fake_sina_json_get,
+        eastmoney_json_getters=(("requests", fake_eastmoney_json_get),),
+    )
+
+    with pytest.raises(CapitalFlowFetchError):
+        crawler.fetch_fund_flow("000001", "2026-06-04", "2026-06-05")
+
+    # 兜底链每个源只跑一轮重试序列：sina 3 次、baidu 3 次，绝不翻倍。
+    assert len(sina_calls) == 3
+    assert len(baidu_calls) == 3
 
 
 def test_sina_history_fallback_retries_transient_http_errors_before_baidu(monkeypatch):

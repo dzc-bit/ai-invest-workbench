@@ -1300,3 +1300,140 @@ def test_coverage_delegates_cross_section_classification_to_module_function(tmp_
     # = 2 计入 missing；06-01/06-03 无内部洞；三只都同步到 06-03 → 尾部 0。
     assert coverage["daily_bars"].missing_rows == 2
     assert coverage["daily_bars"].suspension_rows == 0
+
+
+def _multi_year_frame(symbols=("600001.SH", "600002.SH", "000001.SZ"), days=("2024-06-03", "2024-06-04", "2025-06-05")):
+    rows = [
+        {
+            "symbol": symbol,
+            "trade_date": pd.Timestamp(day),
+            "open": 1.0,
+            "high": 2.0,
+            "low": 0.5,
+            "close": 1.5,
+            "volume": 100,
+            "float_market_cap": 1e9,
+            "main_net_inflow": 1e5,
+            "listing_days": 500,
+        }
+        for symbol in symbols
+        for day in days
+    ]
+    return pd.DataFrame(rows)
+
+
+def _legacy_read(warehouse: Warehouse, **kwargs):
+    """下推之前的实现：整读所有分区，再在 pandas 侧过滤。用作等价性基线。"""
+    paths = warehouse._partition_paths_for_range(kwargs.get("start_date"), kwargs.get("end_date"))
+    frames = [warehouse._safe_read_parquet(path) for path in paths]
+    frames = [frame for frame in frames if not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    frame = pd.concat(frames, ignore_index=True)
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    symbols = kwargs.get("symbols")
+    if symbols:
+        selected = {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
+        frame = frame[frame["symbol"].astype(str).isin(selected)]
+    if kwargs.get("start_date"):
+        frame = frame[frame["trade_date"] >= pd.Timestamp(kwargs["start_date"])]
+    if kwargs.get("end_date"):
+        frame = frame[frame["trade_date"] <= pd.Timestamp(kwargs["end_date"])]
+    if kwargs.get("require_ohlc"):
+        frame = frame.dropna(subset=["open", "high", "low", "close"])
+    return frame.sort_values(["symbol", "trade_date"]).reset_index(drop=True)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"start_date": "2024-06-04"},
+        {"end_date": "2024-06-04"},
+        {"start_date": "2024-06-03", "end_date": "2024-06-04"},
+        {"symbols": ["600002.SH"]},
+        {"symbols": ["600002.SH", "000001.SZ"], "start_date": "2024-06-03", "end_date": "2024-06-04"},
+        {"symbols": ["999999.SH"], "start_date": "2024-01-01", "end_date": "2025-12-31"},
+        {"require_ohlc": True},
+        {"symbols": ["600001.SH"], "require_ohlc": True},
+    ],
+)
+def test_read_daily_bars_pushdown_returns_exactly_the_unfiltered_rows(tmp_path, kwargs):
+    """下推只是少解码，一行都不能多一行都不能少（含边界日、空命中）。"""
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(_multi_year_frame())
+
+    pushed = warehouse.read_daily_bars(**kwargs)
+    baseline = _legacy_read(warehouse, **kwargs)
+
+    pd.testing.assert_frame_equal(pushed, baseline)
+
+
+def test_read_daily_bars_column_projection_keeps_filter_and_ohlc_columns(tmp_path):
+    from astock_backtester.data.warehouse import OHLC_COLUMNS
+
+    warehouse = Warehouse(tmp_path)
+    warehouse.write_daily_bars(_multi_year_frame())
+
+    projected = warehouse.read_daily_bars(
+        start_date="2024-06-03",
+        end_date="2025-06-05",
+        require_ohlc=True,
+        columns=["symbol", "trade_date", *OHLC_COLUMNS, "float_market_cap"],
+    )
+    full = warehouse.read_daily_bars(start_date="2024-06-03", end_date="2025-06-05", require_ohlc=True)
+
+    assert len(projected) == len(full) == 9
+    assert list(projected.columns) == ["symbol", "trade_date", *OHLC_COLUMNS, "float_market_cap"]
+    assert "main_net_inflow" not in projected.columns
+    # 被裁掉的列不参与结果：剩下的列与整读逐值相同。
+    pd.testing.assert_frame_equal(projected[["symbol", "trade_date", "close"]], full[["symbol", "trade_date", "close"]])
+
+
+def test_read_daily_bars_projects_around_a_partition_that_lacks_the_column(tmp_path):
+    """旧分区缺列时必须退回可用列，而不是读出一个空壳或抛错。"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    warehouse = Warehouse(tmp_path)
+    legacy = _multi_year_frame(symbols=("600003.SH",), days=("2023-05-04", "2023-05-05")).drop(
+        columns=["float_market_cap", "main_net_inflow"]
+    )
+    path = warehouse.daily_bars_root / "year=2023" / "daily_bars.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(legacy, preserve_index=False), path)
+
+    read = warehouse.read_daily_bars(
+        start_date="2023-05-04",
+        end_date="2023-05-05",
+        require_ohlc=True,
+        columns=["symbol", "trade_date", "float_market_cap"],
+    )
+
+    assert len(read) == 2
+    assert "float_market_cap" not in read.columns
+    assert read["symbol"].unique().tolist() == ["600003.SH"]
+    baseline = _legacy_read(warehouse, start_date="2023-05-04", end_date="2023-05-05", require_ohlc=True)
+    # 投影只裁列，不动行：共有列与整读逐值一致。
+    pd.testing.assert_frame_equal(read[sorted(set(read.columns) & set(baseline.columns))],
+                                  baseline[sorted(set(read.columns) & set(baseline.columns))])
+
+
+def test_read_daily_bars_keeps_capital_flow_only_rows_out_of_ohlc_reads(tmp_path):
+    """资金流独立行不能让股票变成可回测日线：require_ohlc 的下推路径口径不变。"""
+    warehouse = Warehouse(tmp_path)
+    frame = _multi_year_frame(symbols=("600009.SH",), days=("2025-06-05", "2025-06-06"))
+    flow_only = frame.iloc[[-1]].copy()
+    flow_only["trade_date"] = pd.Timestamp("2025-06-09")
+    for column in ("open", "high", "low", "close"):
+        flow_only[column] = None
+    warehouse.write_daily_bars(pd.concat([frame, flow_only], ignore_index=True))
+
+    strict = warehouse.read_daily_bars(
+        symbols=["600009.SH"], start_date="2025-06-01", end_date="2025-06-30", require_ohlc=True
+    )
+    loose = warehouse.read_daily_bars(symbols=["600009.SH"], start_date="2025-06-01", end_date="2025-06-30")
+
+    assert len(strict) == 2
+    assert len(loose) == 3
+    assert set(strict["trade_date"].dt.strftime("%Y-%m-%d")) == {"2025-06-05", "2025-06-06"}

@@ -63,7 +63,8 @@ def _stock_pool_mask(data: pd.DataFrame, settings: BacktestSettings) -> pd.Serie
     if settings.stock_pool == "main_board":
         return symbols.str.startswith(("000", "001", "002", "003", "600", "601", "603", "605"))
     if settings.stock_pool == "gem":
-        return symbols.str.startswith("300")
+        # 301/302 是创业板后来的新股段，只认 300 会把它们排除在创业板池外。
+        return symbols.str.startswith(("300", "301", "302"))
     if settings.stock_pool == "star":
         return symbols.str.startswith("688")
     if settings.stock_pool == "beijing":
@@ -296,16 +297,32 @@ def _optional_float(row: pd.Series, column: str) -> float | None:
     return float(value)
 
 
+def _board_limit_pct(symbol: str) -> float:
+    """按板块给出涨跌幅限制（ST 之外的基准）。
+
+    创业板是 ``300/301/302``（301/302 是后来的创业板新股段，漏掉会按主板 10%
+    判涨跌停），科创板 ``688`` 与创业板同为 20%，北交所 ``43/83/87/88/92``
+    是 30%，其余主板 10%。
+    """
+    if symbol.startswith(("300", "301", "302", "688")):
+        return 0.20
+    if symbol.startswith(("43", "83", "87", "88", "92")):
+        return 0.30
+    return 0.10
+
+
 def _stock_limit_pct(row: pd.Series) -> float | None:
     pre_close = _optional_float(row, "pre_close")
     if pre_close is None or pre_close <= 0:
         return None
     symbol = str(row.get("symbol", ""))
-    if bool(row.get("is_st", False)):
+    board = _board_limit_pct(symbol)
+    # 先定板块再降 ST：ST 的 5% 是**在主板 10% 基础上**的限制，创业板/科创板
+    # ST 股实际仍是 20%（先判 ST 会把它们按 5% 算，limit_up_blocks_buy 于是
+    # 错误拦截真实涨停之外的价格）。北交所无 ST 降幅规则，保持 30%。
+    if bool(row.get("is_st", False)) and board == 0.10:
         return 0.05
-    if symbol.startswith(("300", "688")):
-        return 0.20
-    return 0.10
+    return board
 
 
 def _is_open_near_limit(row: pd.Series, direction: str) -> bool:

@@ -209,6 +209,31 @@ def _loads_eastmoney_json(text: str) -> dict[str, Any]:
     return payload
 
 
+def _sina_requested_rows(start_date: str, end_date: str) -> int:
+    """新浪兜底要取的行数。
+
+    新浪端点只有 ``num``（"最新 N 行"）没有日期参数，所以 N 必须是**从今天回看
+    到 ``start_date``** 的交易日数，而不是窗口跨度：补 2015 年那一段时窗口只有
+    一年，但回看跨度是十年，按窗口算会取不到任何目标日期的行。恒取 5000 行
+    （旧行为）在东财不可用时会让全市场补齐变成约 3.3GB 流量，其中绝大多数行
+    立刻被按日期过滤丢掉。
+    """
+    try:
+        start = pd.Timestamp(start_date)
+        today = pd.Timestamp.today().normalize()
+    except (ValueError, TypeError):
+        return SINA_PAGE_SIZE
+    if start >= today:
+        return 1
+    # +1 给今天/端点滞后留一格，再上浮 10% 容忍节假日表与上游口径的偏差。
+    try:
+        trade_days = len(a_share_trade_dates(start, today))
+    except Exception:
+        return SINA_PAGE_SIZE
+    estimated = int(trade_days * 1.1) + 1
+    return max(1, min(SINA_PAGE_SIZE, estimated))
+
+
 class CapitalFlowCrawler:
     """Standalone Eastmoney capital-flow crawler for service-level cache backfills."""
 
@@ -292,11 +317,27 @@ class CapitalFlowCrawler:
             diagnostics.append(_fallback_used_diagnostic(code, provider, len(rows)))
             self._remember_success_rows(code, rows)
             return rows, diagnostics
+        eastmoney_error: CapitalFlowFetchError | None = None
         try:
             payload = self._fetch_payload_with_variants(code, params, timeout)
             rows, eastmoney_diagnostics = _parse_payload(code, payload, start_date, end_date)
             diagnostics.extend(eastmoney_diagnostics)
-            if self._should_try_baidu_fallback(rows, eastmoney_diagnostics):
+            needs_fallback = self._should_try_baidu_fallback(rows, eastmoney_diagnostics)
+        except CapitalFlowFetchError as error:
+            if not (self._enable_sina_fallback or self._enable_baidu_fallback):
+                raise
+            eastmoney_error = error
+            diagnostics.append(_provider_failed_diagnostic(code, "eastmoney", error))
+            rows = []
+            needs_fallback = True
+
+        # 兜底必须在 try 之外执行：把兜底调用留在 ``try`` 里会让兜底源自己的失败
+        # 被上面的 except 当成东财失败（记一条 provider=eastmoney 的
+        # network_error，进而让作业级"跳过东财"开关误判主源已挂），而且 except
+        # 分支会把已经跑过的兜底链**再跑一遍**（sina/baidu 各 3 次重试加退避，
+        # 单票最坏多花约 10 秒）。
+        if needs_fallback:
+            if rows:
                 diagnostics.append(
                     {
                         "symbol": code,
@@ -310,25 +351,22 @@ class CapitalFlowCrawler:
                         ),
                     }
                 )
-                fallback_rows, fallback_diagnostics, provider = self._fetch_fallback_rows(code, start_date, end_date, timeout)
-                diagnostics.extend(fallback_diagnostics)
-                diagnostics.append(_fallback_used_diagnostic(code, provider, len(fallback_rows)))
-                self._remember_success_rows(code, fallback_rows)
-                return fallback_rows, diagnostics
-        except CapitalFlowFetchError as eastmoney_error:
-            if not (self._enable_sina_fallback or self._enable_baidu_fallback):
-                raise
-            diagnostics.append(_provider_failed_diagnostic(code, "eastmoney", eastmoney_error))
             try:
-                rows, fallback_diagnostics, provider = self._fetch_fallback_rows(code, start_date, end_date, timeout)
+                fallback_rows, fallback_diagnostics, provider = self._fetch_fallback_rows(
+                    code, start_date, end_date, timeout
+                )
             except CapitalFlowFetchError as fallback_error:
                 diagnostics.append(_provider_failed_diagnostic(code, "fallback", fallback_error))
+                eastmoney_reason = str(eastmoney_error) if eastmoney_error else "no rows"
                 raise CapitalFlowFetchError(
-                    f"Failed to fetch capital flow for {code}: eastmoney={eastmoney_error}; fallback={fallback_error}",
+                    f"Failed to fetch capital flow for {code}: eastmoney={eastmoney_reason}; fallback={fallback_error}",
                     code="network_error",
                 ) from fallback_error
             diagnostics.extend(fallback_diagnostics)
-            diagnostics.append(_fallback_used_diagnostic(code, provider, len(rows)))
+            diagnostics.append(_fallback_used_diagnostic(code, provider, len(fallback_rows)))
+            self._remember_success_rows(code, fallback_rows)
+            return fallback_rows, diagnostics
+
         self._remember_success_rows(code, rows)
         return rows, diagnostics
 
@@ -441,7 +479,7 @@ class CapitalFlowCrawler:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         params = {
             "page": "1",
-            "num": str(SINA_PAGE_SIZE),
+            "num": str(_sina_requested_rows(start_date, end_date)),
             "sort": "opendate",
             "asc": "0",
             "daima": a_share_market_symbol(code),

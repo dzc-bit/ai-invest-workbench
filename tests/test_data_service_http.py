@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from datetime import UTC
+from http import HTTPStatus
 from threading import Event
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -50,6 +51,18 @@ def _request_json(method: str, url: str, payload: dict | None = None) -> dict:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         return json.loads(exc.read().decode("utf-8"))
+
+
+def _request_json_allow_error(method: str, url: str, payload: dict | None = None) -> tuple[int, dict]:
+    """带状态码的版本：``_request_json`` 把 HTTPError 的响应体当成功返回，
+    无法断言 4xx/5xx 映射（准入冲突必须是 409）。"""
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    try:
+        with _OPENER.open(request, timeout=_LOOPBACK_TIMEOUT_S) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 def _request_ndjson(url: str, payload: dict) -> list[dict]:
@@ -498,6 +511,55 @@ def test_service_starts_full_market_sync_job(tmp_path):
 
         assert response["job"]["status"] == "completed"
         assert response["job"]["imported_rows"] == 2
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_service_reports_reused_sync_admission_and_capacity_conflict(tmp_path):
+    """准入结果必须对调用方可见：复用同参数在途任务、以及预算已满都是稳定码。"""
+    from datetime import date
+
+    from astock_backtester.data.sync import SyncCapacityError
+    from astock_backtester.models import SyncJobStatus
+
+    class AdmittingManager:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def start_full_market(self, symbols, start_date, end_date):
+            self.calls += 1
+            admission = "started" if self.calls == 1 else "reused"
+            if self.calls == 3:
+                raise SyncCapacityError(["job-1"], 2)
+            return SyncJobStatus(
+                job_id="job-1",
+                mode="full_market_bootstrap",
+                status="running",
+                admission=admission,
+                total_symbols=len(symbols),
+                start_date=date.fromisoformat(start_date),
+                end_date=date.fromisoformat(end_date),
+            )
+
+    server = create_server(host="127.0.0.1", port=0, cache_dir=tmp_path)
+    manager = AdmittingManager()
+    server.state.sync_manager = manager
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    payload = {"symbols": ["000001"], "start_date": "2015-01-01", "end_date": "2015-01-05"}
+    try:
+        port = server.server_address[1]
+        url = f"http://127.0.0.1:{port}/sync/full-market"
+
+        assert _request_json("POST", url, payload)["job"]["admission"] == "started"
+        assert _request_json("POST", url, payload)["job"]["admission"] == "reused"
+
+        status, body = _request_json_allow_error("POST", url, payload)
+        assert status == HTTPStatus.CONFLICT
+        assert body["code"] == "sync_capacity"
+        assert body["running_jobs"] == ["job-1"]
+        assert "上限 2" in body["message"]
     finally:
         server.shutdown()
         thread.join(timeout=5)
