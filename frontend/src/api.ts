@@ -3,6 +3,7 @@ import type {
   BacktestResult,
   BacktestStreamHandlers,
   BacktestSettingsConfig,
+  BacktestStreamEvent,
   DataServiceHealth,
   DataServiceStatus,
   DailyBarsCoverageResponse,
@@ -75,6 +76,36 @@ export type StreamRequestOptions = {
   idleTimeoutMs?: number;
 };
 
+/** 有限任务流（对话/回测/寻优）没拿到终态事件时使用的稳定码：连接断了但后端
+ * 可能仍在跑，调用方据此保留部分内容并标记未完成，而不是当成成功。 */
+export const STREAM_INCOMPLETE_CODE = "stream_incomplete";
+
+export function streamIncompleteError(label: string): BackendError {
+  return new BackendError(STREAM_INCOMPLETE_CODE, `${label}没有返回最终结果，连接提前结束（已收到的内容不会被丢弃）。`);
+}
+
+/** 非 2xx 响应体里带着后端的稳定业务码，必须原样交给调用方；只有体不可解析
+ * 时才退回通用的 http_error。 */
+export function backendErrorFromStatus(status: number, text: string): BackendError {
+  const fallback = `HTTP ${status}: ${text || "local data service request failed"}`;
+  if (!text) {
+    return new BackendError("http_error", fallback);
+  }
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const code = typeof parsed.code === "string" ? parsed.code : "http_error";
+    const message =
+      typeof parsed.message === "string"
+        ? parsed.message
+        : typeof parsed.detail === "string"
+          ? parsed.detail
+          : fallback;
+    return new BackendError(code, message);
+  } catch {
+    return new BackendError("http_error", fallback);
+  }
+}
+
 export async function consumeNdjsonStream(
   url: string,
   init: RequestInit,
@@ -138,7 +169,7 @@ export async function consumeNdjsonStream(
     if (!response.ok) {
       armIdleTimer();
       const text = await Promise.race([response.text(), idleFailure, abortFailure]);
-      throw new BackendError("http_error", `HTTP ${response.status}: ${text || "local data service request failed"}`);
+      throw backendErrorFromStatus(response.status, text);
     }
     if (!response.body) {
       throw new Error("NDJSON stream is not available in this browser.");
@@ -351,10 +382,10 @@ export async function loadRealtimeMarketSnapshotStream(
   );
 
   if (!finalResult) {
-    throw new BackendError(
-      streamErrorCode,
-      streamError ?? "Realtime market stream ended before a final result was produced."
-    );
+    if (streamError) {
+      throw new BackendError(streamErrorCode, streamError);
+    }
+    throw streamIncompleteError("实时行情");
   }
   return finalResult;
 }
@@ -628,14 +659,7 @@ export async function runBacktestStreamWithDataService(
     if (!line.trim()) {
       return;
     }
-    const event = JSON.parse(line) as
-      | { type: "phase"; phase: string }
-      | { type: "progress"; message: string; trade_date?: string; scanned_days?: number; total_days?: number; open_positions?: number; closed_trades?: number; candidates?: number }
-      | { type: "trade_opened"; trade: BacktestResult["trades"][number] }
-      | { type: "trade_closed"; trade: BacktestResult["trades"][number] }
-      | { type: "trade_blocked"; trade: BacktestResult["trades"][number] }
-      | { type: "result"; result: BacktestResult }
-      | { type: "error"; message?: string; code?: string };
+    const event = JSON.parse(line) as BacktestStreamEvent;
     if (event.type === "phase") {
       handlers.onPhase?.(event.phase);
     } else if (event.type === "progress") {
@@ -663,7 +687,7 @@ export async function runBacktestStreamWithDataService(
   );
 
   if (!finalResult) {
-    throw new Error("Backtest stream ended before a final result was produced.");
+    throw streamIncompleteError("回测");
   }
   return finalResult;
 }

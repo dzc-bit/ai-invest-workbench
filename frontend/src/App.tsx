@@ -1,7 +1,7 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Database, Flame, Gauge, ShieldAlert, Sparkles } from "lucide-react";
 import { AiAssistantPanel } from "./components/AiAssistantPanel";
-import { aiParseConditions, loadAiNewsDigest, loadAiStatus, revealAiKey } from "./aiApi";
+import { aiParseConditions, loadAiNewsDigest, loadAiStatus } from "./aiApi";
 import { isTauriRuntime as isTauri } from "./tauriRuntime";
 import { useAiEventStream } from "./hooks/useAiEventStream";
 import { useMarketModules } from "./hooks/useMarketModules";
@@ -10,6 +10,7 @@ import "./ai-panel.css";
 import { useMarketPolling } from "./hooks/useMarketPolling";
 import {
   BackendError,
+  STREAM_INCOMPLETE_CODE,
   runBacktestStreamWithDataService,
   runConfiguredBacktest,
   validateConditionExpression,
@@ -99,7 +100,34 @@ function marketDegreeTextClass(value: number | null | undefined): "up-text" | "d
   return "flat-text";
 }
 
+function sameCoverage(a: DatasetCoverage[], b: DatasetCoverage[]): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
+  // 覆盖表是若干项的小数组：逐项比较关键字段比 JSON.stringify 便宜，也避免
+  // 键顺序造成的假差异。
+  return a.every((item, index) => {
+    const other = b[index];
+    return (
+      item.dataset === other.dataset &&
+      item.symbols === other.symbols &&
+      item.start_date === other.start_date &&
+      item.end_date === other.end_date &&
+      item.missing_rows === other.missing_rows &&
+      item.suspension_rows === other.suspension_rows
+    );
+  });
+}
+
 function translateError(error: unknown): string {
+  // 稳定码优先于文案：stream_incomplete 的病因是"连接提前结束"，落到下面的
+  // 兜底会变成"请检查数据中心覆盖范围和策略参数"，指向完全错误的方向。
+  if (error instanceof BackendError && error.code === STREAM_INCOMPLETE_CODE) {
+    return `${error.message}已算出的交易记录已保留，可稍后重试；若反复出现请检查本地服务是否仍在运行。`;
+  }
   if (error instanceof BackendError && error.code === "no_local_data") {
     return "未找到已缓存的日线行情，请先确认 a-stock-data 数据包已导入到本地缓存。";
   }
@@ -191,6 +219,11 @@ function mergeBacktestTrades(current: BacktestTrade[], incoming: BacktestTrade[]
   ];
 }
 
+// 流式 trade 的合帧间隔：后端是逐行 flush 的 NDJSON，每读一批就 setState 一次
+// 会把 App 整棵树连同工作台表单、覆盖表与交易表一起重渲染（数千行回测就是
+// 数千次全树渲染）。按节奏批量 flush 后降到每秒几次，视觉上仍然实时。
+const TRADE_FLUSH_INTERVAL_MS = 120;
+
 export function App() {
   const [coverage, setCoverage] = useState<DatasetCoverage[]>([]);
   const [result, setResult] = useState<BacktestResult | null>(null);
@@ -216,6 +249,9 @@ export function App() {
     error: strategyLoadError
   } = useSavedStrategyStore();
   const [conditionValidation, setConditionValidation] = useState<ConditionValidationResult | null>(null);
+  // 流式 trade 的缓冲：只在合帧时刻写进 state，避免每条 trade 一次全树渲染。
+  const pendingTradesRef = useRef<BacktestTrade[]>([]);
+  const tradeFlushTimerRef = useRef<number | null>(null);
   const [isValidatingCondition, setIsValidatingCondition] = useState(false);
   const [stockSymbolValidation, setStockSymbolValidation] = useState<StockSymbolValidationResult | null>(null);
   const [isValidatingStockSymbols, setIsValidatingStockSymbols] = useState(false);
@@ -252,6 +288,17 @@ export function App() {
       cancelled = true;
     };
   }, [dataService]);
+
+  // 卸载时收掉 trade 合帧定时器：它持有 setState 引用，泄漏会在卸载后继续渲染。
+  useEffect(
+    () => () => {
+      if (tradeFlushTimerRef.current !== null) {
+        window.clearTimeout(tradeFlushTimerRef.current);
+        tradeFlushTimerRef.current = null;
+      }
+    },
+    []
+  );
 
   const handleParseConditions = useCallback(
     async (text: string): Promise<AiConditionParseResult> => {
@@ -317,11 +364,14 @@ export function App() {
     setStrategySaveMessage("本次未保存策略，你可以继续调整后再次运行。");
   };
 
-  const handleCoverageChange = (nextCoverage: DatasetCoverage[]) => {
-    setCoverage(nextCoverage);
-  };
+  // 覆盖数据每 1.2 秒会被后台刷新推一次，内容常常完全相同。不做相等跳过的话
+  // 引用一变就会重启依赖 coverage 的 effect（DataCenter 的轮询倒计时被清零、
+  // 推荐策略被立刻重打一次），覆盖刷新期间等于每 1.2 秒多一次全量请求。
+  const handleCoverageChange = useCallback((nextCoverage: DatasetCoverage[]) => {
+    setCoverage((current) => (sameCoverage(current, nextCoverage) ? current : nextCoverage));
+  }, []);
 
-  const handleSettingsChange = (nextSettings: BacktestSettingsConfig) => {
+  const handleSettingsChange = useCallback((nextSettings: BacktestSettingsConfig) => {
     setSettings((current) => {
       if (nextSettings.start_date !== current.start_date || nextSettings.end_date !== current.end_date) {
         setSettingsDateTouched(true);
@@ -334,7 +384,7 @@ export function App() {
       }
       return nextSettings;
     });
-  };
+  }, []);
 
   useEffect(() => {
     if (settingsDateTouched) {
@@ -358,6 +408,34 @@ export function App() {
       };
     });
   }, [coverage, settingsDateTouched]);
+
+  const flushPendingTrades = useCallback(() => {
+    if (tradeFlushTimerRef.current !== null) {
+      window.clearTimeout(tradeFlushTimerRef.current);
+      tradeFlushTimerRef.current = null;
+    }
+    const buffered = pendingTradesRef.current;
+    if (buffered.length === 0) {
+      return;
+    }
+    pendingTradesRef.current = [];
+    setStreamedTrades((current) => mergeBacktestTrades(current, buffered));
+  }, []);
+
+  // 一条 trade 先入缓冲，到点才 flush：把"每批一次 setState"压成每秒几次。
+  const bufferTrade = useCallback(
+    (trade: BacktestTrade) => {
+      pendingTradesRef.current = [...pendingTradesRef.current, trade];
+      if (tradeFlushTimerRef.current !== null) {
+        return;
+      }
+      tradeFlushTimerRef.current = window.setTimeout(() => {
+        tradeFlushTimerRef.current = null;
+        flushPendingTrades();
+      }, TRADE_FLUSH_INTERVAL_MS);
+    },
+    [flushPendingTrades]
+  );
 
   const runBacktest = async () => {
     const validationErrors = validateBacktestSettings(settings, settingsDraftErrors);
@@ -383,6 +461,11 @@ export function App() {
       setError(null);
       setResult(null);
       setStreamedTrades([]);
+      pendingTradesRef.current = [];
+      if (tradeFlushTimerRef.current !== null) {
+        window.clearTimeout(tradeFlushTimerRef.current);
+        tradeFlushTimerRef.current = null;
+      }
       setIsRunningBacktest(true);
       setRunProgressMessage("正在准备历史数据与策略条件。");
       setRunPhases(["校验参数", "读取本地数据"]);
@@ -393,16 +476,21 @@ export function App() {
             onPhase: (phase) =>
               setRunPhases((current) => (current.includes(phase) ? current : [...current, phase])),
             onProgress: (event) => setRunProgressMessage(event.message),
-            onTrade: (trade) =>
-              setStreamedTrades((current) => mergeBacktestTrades(current, [trade])),
+            onTrade: bufferTrade,
             onResult: (completed) => {
               setResult(completed);
+              // 先把缓冲里的流式 trade 落定，再用最终结果合并：合成一个数组传
+              // 进去的话，merge 只对 incoming 与 current 之间去重、不去重
+              // incoming 内部，同身份的流式副本与结果副本会双双留下（React
+              // 撞 key，表格出现重复行）。
+              flushPendingTrades();
               setStreamedTrades((current) => mergeBacktestTrades(current, completed.trades));
               setRunProgressMessage("回测完成，已生成收益曲线和交易明细。");
             }
           })
         : await runConfiguredBacktest(strategy, settings);
       setResult(nextResult);
+      flushPendingTrades();
       setStreamedTrades((current) => mergeBacktestTrades(current, nextResult.trades));
       queueStrategySavePrompt(strategy);
       setRunPhases(["校验参数", "读取本地数据", "计算指标", "撮合交易", "生成结果"]);
@@ -410,6 +498,8 @@ export function App() {
       setError(translateError(caught));
       setRunProgressMessage(null);
     } finally {
+      // 收尾时把缓冲里剩下的补进去：中断路径也要保留已收到的交易。
+      flushPendingTrades();
       setIsRunningBacktest(false);
     }
   };

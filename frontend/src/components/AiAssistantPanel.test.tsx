@@ -1,7 +1,8 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AiChatHandlers, AiChatRequest, AiResultEvent } from "../aiTypes";
+import { BackendError } from "../api";
 import { AiAssistantPanel } from "./AiAssistantPanel";
 
 vi.mock("../aiApi", () => ({
@@ -9,6 +10,7 @@ vi.mock("../aiApi", () => ({
   loadAiConfig: vi.fn(),
   saveAiConfig: vi.fn(),
   runAiChatStream: vi.fn(),
+  cancelAiChat: vi.fn(),
   openAiEventStream: vi.fn(),
   loadAiReports: vi.fn(),
   loadAiReportFile: vi.fn(),
@@ -16,7 +18,9 @@ vi.mock("../aiApi", () => ({
   loadAiSession: vi.fn()
 }));
 
-import { loadAiReportFile, loadAiReports, loadAiSession, loadAiSessions, loadAiStatus, runAiChatStream } from "../aiApi";
+import { loadAiReportFile, loadAiReports, loadAiSession, loadAiSessions, loadAiStatus, cancelAiChat, runAiChatStream } from "../aiApi";
+
+const mockedCancelChat = vi.mocked(cancelAiChat);
 
 const mockedLoadStatus = vi.mocked(loadAiStatus);
 const mockedRunChat = vi.mocked(runAiChatStream);
@@ -150,6 +154,96 @@ describe("AiAssistantPanel", () => {
       expect.anything(),
       expect.objectContaining({ signal: expect.anything() })
     );
+  });
+
+  it("keeps the partial answer and marks it unfinished when the stream never reaches a result", async () => {
+    const user = userEvent.setup();
+    // 传输层现在会因缺少终态而报中断；残缺回答必须留在记录里并标明未完成。
+    mockedRunChat.mockImplementation(async (_baseUrl: string, _request: AiChatRequest, handlers: AiChatHandlers = {}) => {
+      handlers.onToken?.("盘面先看");
+      handlers.onToken?.("量能变化");
+      throw new BackendError("stream_incomplete", "AI 回答没有返回最终结果，连接提前结束（已收到的内容不会被丢弃）。");
+    });
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    const composer = await screen.findByPlaceholderText(/帮我看看 600519/);
+    await user.type(composer, "行情如何");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByText(/盘面先看量能变化/)).toBeTruthy();
+    expect(screen.getByText(/回答中断，可重试/)).toBeTruthy();
+    expect(screen.getByText(/连接提前结束/)).toBeTruthy();
+  });
+
+  it("asks the backend to stop and keeps the reader attached until the turn ends", async () => {
+    let finish: () => void = () => undefined;
+    let signal: AbortSignal | undefined;
+    mockedRunChat.mockImplementation((_baseUrl, _request, handlers = {}, options = {}) => {
+      signal = options.signal ?? undefined;
+      handlers.onSession?.({ type: "session", session_id: "s-stop", title: "会话" });
+      handlers.onToken?.("已经写出来的部分");
+      return new Promise<void>((resolve) => {
+        finish = () => {
+          handlers.onResult?.({ type: "result", session_id: "s-stop", display: [{ role: "assistant", content: "已经写出来的部分（已停止）" }] });
+          resolve();
+        };
+      });
+    });
+    mockedCancelChat.mockResolvedValue({ ok: true, cancelling: true });
+
+    const user = userEvent.setup();
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    const composer = await screen.findByPlaceholderText(/帮我看看 600519/);
+    await user.type(composer, "长任务");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByText(/已经写出来的部分/)).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: "停止生成" }));
+
+    await waitFor(() => expect(mockedCancelChat).toHaveBeenCalledWith("http://x", "s-stop"));
+    expect(screen.getByRole("button", { name: "正在停止" })).toBeDisabled();
+    // 关键：没有断开接收，worker 的终态 result 才能带着保存好的历史回来。
+    expect(signal?.aborted).toBe(false);
+
+    await act(async () => {
+      finish();
+    });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "正在停止" })).not.toBeInTheDocument());
+    expect(screen.getByText(/已经写出来的部分/)).toBeInTheDocument();
+  });
+
+  it("releases the reader when the backend reports nothing left to stop", async () => {
+    let signal: AbortSignal | undefined;
+    mockedRunChat.mockImplementation((_baseUrl, _request, handlers = {}, options = {}) => {
+      signal = options.signal ?? undefined;
+      handlers.onSession?.({ type: "session", session_id: "s-done", title: "会话" });
+      // 真实传输在 abort 后会 reject，面板靠 finally 复位流式状态。
+      return new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("stream request cancelled")), { once: true });
+      });
+    });
+    // 后台说"没有在途轮次"（多半刚好结束）：这时不能一直挂着接收。
+    mockedCancelChat.mockResolvedValue({ ok: true, cancelling: false });
+
+    const user = userEvent.setup();
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    const composer = await screen.findByPlaceholderText(/帮我看看 600519/);
+    await user.type(composer, "长任务");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(mockedRunChat).toHaveBeenCalled());
+
+    await user.click(screen.getByRole("button", { name: "停止生成" }));
+
+    await waitFor(() => expect(mockedCancelChat).toHaveBeenCalledWith("http://x", "s-done"));
+    await waitFor(() => expect(signal?.aborted).toBe(true));
+    // 收流后面板回到可发送状态，不再挂着"正在停止"。
+    await waitFor(() => expect(screen.queryByRole("button", { name: /停止/ })).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "发送" })).toBeInTheDocument();
   });
 
   it("offers strategy application when the result carries a strategy artifact", async () => {

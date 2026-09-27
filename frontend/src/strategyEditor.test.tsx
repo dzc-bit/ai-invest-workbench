@@ -883,7 +883,11 @@ describe("A 股回测工作台界面", () => {
     expect(screen.getByText(/5d 前期涨幅 8\.00% 位于区间/)).toBeInTheDocument();
     expect(screen.getByText(/收盘价 12\.00 突破前 20d 高点 11\.80/)).toBeInTheDocument();
     expect(screen.queryByText(/volume ratio|turnover|MACD histogram|return|prior high/)).not.toBeInTheDocument();
-  });
+  },
+  // 这条用例走的是整个工作台：两次条件校验 + 一次流式回测 + userEvent 逐字输入。
+  // 串行与不带 coverage 时都在 5 秒内，只有 33 个文件并行 + V8 coverage 插桩会被拉到
+  // 5 秒以上（本机实测），因此给它单独的时间上限，断言本身不放宽。
+  20_000);
 
   it("does not add duplicate entry conditions with the same parsed parameters", async () => {
     const user = userEvent.setup();
@@ -1171,6 +1175,11 @@ describe("A 股回测工作台界面", () => {
       emitOpened?.();
     });
     expect(await screen.findByText(/扫描 2024-01-05/)).toBeInTheDocument();
+    // 流式 trade 现在按 120ms 合帧批量进表（避免每条一次全树渲染），推进定时器
+    // 触发一次 flush，而不是假设 setState 同步生效。
+    await act(async () => {
+      vi.advanceTimersByTime(200);
+    });
     expect(screen.getAllByText("持仓中").length).toBeGreaterThan(0);
     expect(screen.getByText("AAA")).toBeInTheDocument();
     act(() => {

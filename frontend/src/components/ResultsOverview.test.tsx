@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 import type { BacktestResult } from "../types";
@@ -228,7 +228,7 @@ it("does not label old backtest matches as today's hits and separates the equity
   expect(screen.getByText("回测区间 2024-01-04 至 2024-03-13")).toBeInTheDocument();
 });
 
-it("normalizes the equity curve by date before rendering the chart", () => {
+it("normalizes the equity curve by date before rendering the chart", async () => {
   render(
     <ResultsOverview
       result={buildResult({
@@ -244,6 +244,8 @@ it("normalizes the equity curve by date before rendering the chart", () => {
     />
   );
 
+  // 图表块 lazy 加载（recharts 不进首屏），断言前等 Suspense 落地。
+  await waitFor(() => expect(screen.getByTestId("line-chart")).toBeInTheDocument());
   expect(screen.getByTestId("line-chart")).toHaveAttribute("data-points", "2");
   expect(screen.getByText("回测区间 2024-01-04 至 2024-01-05")).toBeInTheDocument();
 });

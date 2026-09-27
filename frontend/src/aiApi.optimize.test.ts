@@ -87,4 +87,55 @@ describe("runAiOptimizeStream dispatch", () => {
       })
     ).rejects.toMatchObject({ code: "grid_too_large" });
   });
+
+  it("reports interruption when the grid stream ends without a result event", async () => {
+    // 上一版会在这里静默成功：只收到 combination/progress 也当作寻优完成。
+    consumeNdjsonStream.mockImplementationOnce(
+      async (_url: string, _init: unknown, _options: unknown, _timeout: number, onLine: (line: string) => void) => {
+        onLine(JSON.stringify({ type: "phase", phase: "读取本地数据" }));
+        onLine(
+          JSON.stringify({
+            type: "combination",
+            index: 1,
+            params: { fixed_holding_days: 3 },
+            metrics: { total_return_pct: 0.05 }
+          })
+        );
+        onLine(JSON.stringify({ type: "progress", completed: 1, total: 6 }));
+        onLine(JSON.stringify({ type: "heartbeat" }));
+      }
+    );
+    const combinations: unknown[] = [];
+    const results: unknown[] = [];
+
+    await expect(
+      runAiOptimizeStream(
+        "http://127.0.0.1:9000",
+        { strategy: defaultStrategy, settings: defaultSettings, grid: { fixed_holding_days: [3] } },
+        {
+          onCombination: (combination) => combinations.push(combination),
+          onResult: (result) => results.push(result)
+        }
+      )
+    ).rejects.toMatchObject({ code: "stream_incomplete" });
+
+    // 已经算出来的组合不能因为中断被抹掉。
+    expect(combinations).toHaveLength(1);
+    expect(results).toHaveLength(0);
+  });
+
+  it("treats the result event as terminal even when the transport drops later lines", async () => {
+    consumeNdjsonStream.mockImplementationOnce(
+      async (_url: string, _init: unknown, _options: unknown, _timeout: number, onLine: (line: string) => void) => {
+        onLine(JSON.stringify({ type: "result", result: { combinations: [], failures: [], total: 0, evaluated: 0 } }));
+      }
+    );
+    await expect(
+      runAiOptimizeStream("http://127.0.0.1:9000", {
+        strategy: defaultStrategy,
+        settings: defaultSettings,
+        grid: { fixed_holding_days: [3] }
+      })
+    ).resolves.toBeUndefined();
+  });
 });

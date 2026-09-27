@@ -212,6 +212,10 @@ export function useMarketModules(dataService: DataServiceStatus | null, coverage
         return false;
       }
     },
+    // ``coverage`` 不在函数体里用，但它是**有意的**依赖：useIndependentModuleRefresh
+    // 以 loader 的身份变化重启轮询，coverage 刷新完成后必须立刻重取推荐策略。
+    // 删掉这个依赖等于把"覆盖变化→推荐刷新"这条既有行为一起删掉。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [coverage, dataService]
   );
 

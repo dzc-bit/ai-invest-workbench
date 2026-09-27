@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { SlidersHorizontal } from "lucide-react";
 import { runAiOptimizeStream } from "../aiApi";
 import { translateAiError } from "../aiTypes";
@@ -9,6 +9,7 @@ import type {
   OptimizeSummary,
   StrategyConfig
 } from "../types";
+import { OverfitStrip, useOverfitAssessment } from "./OverfitAssessment";
 
 type Props = {
   strategy: StrategyConfig;
@@ -44,6 +45,27 @@ function formatParamValue(key: OptimizeGridKey, value: number): string {
   return `${value}`;
 }
 
+/** Split a "3, 5, 8" cell into numbers, keeping the rejected tokens so the
+ * caller can name them instead of quietly shrinking the grid. An empty cell is
+ * an error, never an implicit 0. */
+function parseValues(text: string): { values: number[]; invalid: string[] } {
+  const values: number[] = [];
+  const invalid: string[] = [];
+  for (const token of text.split(/[,\s，、]+/)) {
+    const trimmed = token.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const parsed = Number(trimmed);
+    if (Number.isFinite(parsed)) {
+      values.push(parsed);
+    } else {
+      invalid.push(trimmed);
+    }
+  }
+  return { values, invalid };
+}
+
 export function StrategyOptimizer({ strategy, settings, baseUrl, disabled = false }: Props) {
   const [rows, setRows] = useState<OptimizeParamRow[]>([
     { key: "fixed_holding_days", valuesText: "3,5,8" },
@@ -55,19 +77,36 @@ export function StrategyOptimizer({ strategy, settings, baseUrl, disabled = fals
   const [summary, setSummary] = useState<OptimizeSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const overfitRequest = useMemo(() => {
+    if (!summary) {
+      return null;
+    }
+    return {
+      metrics: summary.best?.metrics,
+      combos: summary.combinations,
+      rejectedCombinations: summary.failures.length
+    };
+  }, [summary]);
+  const overfit = useOverfitAssessment(baseUrl, overfitRequest);
+
   const buildGrid = (): Record<string, number[]> | null => {
     const grid: Record<string, number[]> = {};
     for (const row of rows) {
-      const values = row.valuesText
-        .split(/[,\s，、]+/)
-        .map((item) => Number(item))
-        .filter((item) => Number.isFinite(item))
-        .map((item) => (row.percentScale ? item / 100 : item));
-      if (values.length === 0) {
-        setError(`参数“${OPTIMIZE_PARAM_LABELS[row.key]}”的候选值无效，请填写逗号分隔的数字。`);
+      const label = OPTIMIZE_PARAM_LABELS[row.key];
+      const { values, invalid } = parseValues(row.valuesText);
+      if (invalid.length > 0) {
+        setError(`参数“${label}”的候选值里有不是数字的项：${invalid.join("、")}。`);
         return null;
       }
-      grid[row.key] = values;
+      if (values.length === 0) {
+        setError(`参数“${label}”的候选值为空，请填写逗号分隔的数字。`);
+        return null;
+      }
+      if (grid[row.key]) {
+        setError(`参数“${label}”重复登记了多行，请合并为一行。`);
+        return null;
+      }
+      grid[row.key] = values.map((value) => (row.percentScale ? value / 100 : value));
     }
     const total = Object.values(grid).reduce((acc, values) => acc * values.length, 1);
     if (total > MAX_OPTIMIZE_COMBINATIONS) {
@@ -164,7 +203,13 @@ export function StrategyOptimizer({ strategy, settings, baseUrl, disabled = fals
             type="button"
             disabled={isRunning || disabled}
             onClick={() =>
-              setRows((current) => [...current, { key: "max_positions", valuesText: "3,5" }])
+              setRows((current) => {
+                const used = new Set(current.map((item) => item.key));
+                const key =
+                  (Object.keys(OPTIMIZE_PARAM_LABELS) as OptimizeGridKey[]).find((item) => !used.has(item)) ??
+                  "max_positions";
+                return [...current, { key, valuesText: key === "position_size_pct" ? "10,20" : "3,5", percentScale: PERCENT_SCALED_KEYS.includes(key) }];
+              })
             }
           >
             添加参数
@@ -225,6 +270,19 @@ export function StrategyOptimizer({ strategy, settings, baseUrl, disabled = fals
           </table>
         </div>
       ) : null}
+      {summary && summary.failures.length > 0 ? (
+        <div className="optimizer-failures" role="status">
+          {summary.failures.map((failure, failureIndex) => (
+            <p className="condition-validation bad" key={`${failureIndex}-${failure.error}`}>
+              已拒绝的组合 {Object.entries(failure.params)
+                .map(([key, value]) => `${OPTIMIZE_PARAM_LABELS[key as OptimizeGridKey] ?? key} ${formatParamValue(key as OptimizeGridKey, value)}`)
+                .join(" / ")}
+              ：{failure.error}
+            </p>
+          ))}
+        </div>
+      ) : null}
+      <OverfitStrip assessment={overfit} />
       {summary?.insight ? (
         <p className="ai-oneshot-line optimizer-insight">
           {summary.insight}
