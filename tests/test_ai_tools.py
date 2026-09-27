@@ -588,17 +588,22 @@ def test_update_stock_data_full_market_capital_flow_starts_background_job():
     from datetime import date
 
     from astock_backtester.ai.tools.query_tools import build_query_tools
+    from astock_backtester.data.sync import SyncCapacityError
 
     backend = FakeBackend()
     started: dict[str, Any] = {}
 
     class FakeSyncManager:
+        def __init__(self) -> None:
+            self.admission = "started"
+
         def start_capital_flow_backfill(self, symbols: list[str], start_date: str, end_date: str):
             started["symbols"] = list(symbols)
             return SimpleNamespace(
                 job_id="job-1",
                 mode="capital_flow_backfill",
                 status="running",
+                admission=self.admission,
                 total_symbols=len(symbols),
                 start_date=date(2026, 6, 1),
                 end_date=date(2026, 6, 30),
@@ -609,7 +614,8 @@ def test_update_stock_data_full_market_capital_flow_starts_background_job():
             return {"600002", "600001"}
 
     backend.warehouse = GapWarehouse(backend)
-    backend.sync_manager = FakeSyncManager()
+    sync_manager = FakeSyncManager()
+    backend.sync_manager = sync_manager
     registry = ToolRegistry()
     registry.register_all(build_query_tools(backend))
     execution = registry.execute(
@@ -618,8 +624,65 @@ def test_update_stock_data_full_market_capital_flow_starts_background_job():
     )
     assert execution.ok is True
     assert started["symbols"] == ["600001", "600002"]
-    assert "job-1" in execution.summary
+    assert "资金流补齐已转后台任务 job-1" in execution.summary
     assert "sync_job_status" in execution.summary
+
+    # 同一个在途任务被复用时，模型必须看到"并入已有任务"而不是"我新起了一个"。
+    sync_manager.admission = "reused"
+    reused = registry.execute(
+        "update_stock_data",
+        '{"mode": "capital_flow", "start_date": "2026-06-01", "end_date": "2026-06-30"}',
+    )
+    assert reused.ok is True
+    assert "本次并入 job-1" in reused.summary
+
+    # 服务级预算已满要作为可分支的工具失败返回，不能让异常穿透。
+    class BusySyncManager:
+        def start_capital_flow_backfill(self, symbols, start_date, end_date):  # noqa: ANN001
+            raise SyncCapacityError(["job-running"], 2)
+
+    backend.sync_manager = BusySyncManager()
+    busy = registry.execute(
+        "update_stock_data",
+        '{"mode": "capital_flow", "start_date": "2026-06-01", "end_date": "2026-06-30"}',
+    )
+    assert busy.ok is False
+    assert "预算已满" in busy.summary
+    assert busy.code == "sync_capacity"
+
+
+def test_tool_failure_codes_are_registered_constants():
+    """工具失败码必须登记为 ``registry.CODE_*`` 常量。
+
+    这些码会进协议 tool 消息与会话文件，中断恢复/回放要按类别分支（改参数重试
+    还是换工具还是先补数据）。散落成裸字符串时，回放侧无从枚举。
+    """
+    from astock_backtester.ai.tools import registry
+
+    required = [
+        "unknown_tool",
+        "bad_arguments",
+        "tool_error",
+        "no_data",
+        "interrupted",
+        # 后台补齐预算已满：不是工具坏了，模型该改为轮询或先取消。
+        "sync_capacity",
+        # 数据仓分区损坏：该先修损坏而不是继续补数据。
+        "warehouse_corrupt",
+    ]
+    declared = {
+        value
+        for name, value in vars(registry).items()
+        if name.startswith("CODE_") and isinstance(value, str)
+    }
+    missing = [code for code in required if code not in declared]
+    assert not missing, f"工具码未登记为 registry.CODE_*：{missing}"
+
+    # 每个声明的常量都要有对应的具名导出，避免后来者再私建字符串。
+    for code in required:
+        assert any(name.startswith("CODE_") for name in vars(registry)), code
+    assert registry.CODE_SYNC_CAPACITY == "sync_capacity"
+    assert registry.CODE_WAREHOUSE_CORRUPT == "warehouse_corrupt"
 
 
 # ===========================================================================

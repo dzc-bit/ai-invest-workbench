@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pandas as pd
 from pydantic import ValidationError
@@ -54,28 +54,46 @@ def _staleness_note(last_date: str, lag_days: int) -> str:
     return f"截止 {last_date}，距今天 {lag_days} 个交易日，非实时"
 
 
+if TYPE_CHECKING:
+    from threading import Event
+
+    from astock_backtester.data.briefing import MarketBriefingProvider
+    from astock_backtester.data.cache import LocalCache
+    from astock_backtester.data.capital_flow_crawler import CapitalFlowCrawler
+    from astock_backtester.data.news import MarketNewsProvider
+    from astock_backtester.data.providers import CompositeProvider
+    from astock_backtester.data.realtime import RealtimeMarketProvider
+    from astock_backtester.data.risk import RiskAlertProvider
+    from astock_backtester.data.sync import SyncJobManager
+    from astock_backtester.data.warehouse import Warehouse
+    from astock_backtester.models import DatasetCoverage
+
+
 class AiBackend(Protocol):
     """Narrow view of DataServiceState the tools are allowed to touch.
 
     只允许公共接口（AGENTS.md §15-3）：coverage 快照与后台同步任务都走
     DataServiceState/SyncJobManager 的公开方法，不触碰私有属性。
+
+    类型只在检查期可见（``TYPE_CHECKING``），运行时不新增任何 data→ai 反向依赖；
+    写在这里而不是 ``Any`` 是为了让"工具能碰什么"变成可编译验证的边界。
     """
 
-    cache: Any
-    warehouse: Any
-    provider: Any
-    realtime_provider: Any
-    news_provider: Any
-    briefing_provider: Any
-    risk_provider: Any
-    capital_flow_crawler: Any
-    sync_manager: Any
+    cache: LocalCache
+    warehouse: Warehouse
+    provider: CompositeProvider
+    realtime_provider: RealtimeMarketProvider
+    news_provider: MarketNewsProvider
+    briefing_provider: MarketBriefingProvider
+    risk_provider: RiskAlertProvider
+    capital_flow_crawler: CapitalFlowCrawler
+    sync_manager: SyncJobManager
 
     def log(self, level: str, message: str) -> None: ...
 
-    def coverage_snapshot(self) -> list[Any]: ...
+    def coverage_snapshot(self) -> list[DatasetCoverage]: ...
 
-    def start_coverage_refresh(self, *, force: bool = False) -> Any | None: ...
+    def start_coverage_refresh(self, *, force: bool = False) -> Event | None: ...
 
 
 def validated_condition_nodes(expressions: list[str], *, mode: str) -> tuple[list[ConditionNode], list[dict[str, Any]]]:

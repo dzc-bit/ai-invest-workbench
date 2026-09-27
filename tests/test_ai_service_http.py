@@ -218,7 +218,7 @@ def test_ai_chat_stream_with_stubbed_model(tmp_path, monkeypatch):
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+        def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event, cancel=None):
             for event in scripted_events:
                 on_event(event)
             session["display"].append({"role": "assistant", "content": "本地数据正常。", "tool_steps": [], "ts": "now"})
@@ -250,7 +250,7 @@ class _RecordingStubAgent:
     def __init__(self) -> None:
         self.turns: list[dict[str, int]] = []
 
-    def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+    def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event, cancel=None):
         self.turns.append(
             {
                 "protocol": len(session.get("messages") or []),
@@ -269,7 +269,7 @@ class _SystemPromptStubAgent:
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
-    def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+    def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event, cancel=None):
         self.prompts.append(system_prompt)
         session["display"].append({"role": "assistant", "content": "已记录。", "tool_steps": [], "ts": "now"})
         return {}
@@ -279,6 +279,99 @@ def _seed_memory(server) -> None:
     """写一条"自认龙头选手"的长期记忆：这正是会把三种风格揉平的典型内容。"""
     store = server.state.ai_service()._memory
     store.apply_ops([{"op": "add", "content": "自认是龙头选手，偏好连板妖股", "category": "style", "weight": 3}])
+
+
+class _BlockingStubAgent:
+    """卡在生成中的轮次：只有收到取消才收尾，用来验证"停止"打到后台。
+
+    ``blocking`` 关掉后立刻正常返回，用来验证同一会话在停止后能马上重发。
+    """
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.blocking = True
+        self.runs = 0
+
+    def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event, cancel=None):
+        self.runs += 1
+        self.entered.set()
+        if not self.blocking:
+            session["display"].append({"role": "assistant", "content": f"已收到：{user_message}", "tool_steps": [], "ts": "now"})
+            return {}
+        deadline = time.monotonic() + 5
+        while not (cancel is not None and cancel.cancelled) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert cancel is not None and cancel.cancelled, "取消信号没有传到 worker"
+        on_event({"type": "token", "text": "已生成的部分"})
+        session["display"].append(
+            {"role": "assistant", "content": "已生成的部分（本轮已被你停止）", "tool_steps": [], "ts": "now"}
+        )
+        return {}
+
+
+def test_ai_chat_cancel_stops_the_worker_and_releases_the_session(tmp_path, monkeypatch):
+    server, thread, port = _start_server(tmp_path)
+    _request_json(
+        "POST",
+        f"http://127.0.0.1:{port}/ai/config",
+        {"base_url": "http://127.0.0.1:9", "api_key": "sk-test", "model": "demo"},
+    )
+    agent = _BlockingStubAgent()
+    monkeypatch.setattr(server.state.ai_service(), "_agent", agent)
+    events: list[dict] = []
+    stream_error: list[BaseException] = []
+
+    def stream() -> None:
+        try:
+            events.extend(_request_ndjson(f"http://127.0.0.1:{port}/ai/chat/stream", {"message": "长任务"}))
+        except BaseException as exc:  # noqa: BLE001 - 交给主线程断言
+            stream_error.append(exc)
+
+    base = f"http://127.0.0.1:{port}"
+    try:
+        assert _request_json("POST", f"{base}/ai/chat/cancel", {"session_id": "idle-session"}) == {
+            "ok": True,
+            "cancelling": False,
+        }
+
+        worker = threading.Thread(target=stream, daemon=True)
+        worker.start()
+        assert agent.entered.wait(timeout=5), "worker 没有进入生成"
+        session_id = (server.state.ai_service().list_sessions()[0] or {}).get("session_id")
+        assert session_id
+
+        cancelled = _request_json("POST", f"{base}/ai/chat/cancel", {"session_id": session_id})
+        assert cancelled == {"ok": True, "cancelling": True}
+
+        worker.join(timeout=5)
+        assert not worker.is_alive(), "取消后 worker 没有结束"
+        assert not stream_error, stream_error
+        types = [event["type"] for event in events]
+        assert types[-1] == "result", "协作停止也要送出终态，前端才不会当作中断"
+
+        # 会话已保存停止说明，且锁已释放：立即重发必须能进第二次 run。
+        display = _request_json("GET", f"{base}/ai/session?session_id={session_id}")["display"]
+        assert any("本轮已被你停止" in str(turn.get("content")) for turn in display)
+
+        agent.entered.clear()
+        agent.blocking = False
+        follow_up = _request_ndjson(f"{base}/ai/chat/stream", {"message": "第二条", "session_id": session_id})
+        assert follow_up[-1]["type"] == "result"
+        assert agent.runs == 2, "会话锁没有在 worker 结束后释放"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_ai_chat_cancel_requires_session_id(tmp_path):
+    server, thread, port = _start_server(tmp_path)
+    try:
+        status, body = _request_json_allow_error("POST", f"http://127.0.0.1:{port}/ai/chat/cancel", {})
+        assert status == 400
+        assert body["code"] == "validation_error"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
 
 
 def test_ai_chat_stream_states_style_beats_long_term_memory(tmp_path, monkeypatch):
@@ -399,7 +492,7 @@ def test_ai_chat_stream_emits_heartbeat_while_tools_run(tmp_path, monkeypatch):
     )
 
     class _SlowToolAgent:
-        def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+        def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event, cancel=None):
             on_event({"type": "tool_call", "id": "t1", "name": "run_strategy_backtest", "args": {}})
             time.sleep(0.4)  # 模拟一次跑几分钟的全市场回测
             on_event(
@@ -490,7 +583,7 @@ def test_ai_chat_stream_without_session_id_releases_lock_after_turn(tmp_path, mo
             def __init__(self, *args, **kwargs) -> None:
                 pass
 
-            def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event):
+            def run(self, *, session, user_message, system_prompt, max_steps, context=None, on_event, cancel=None):
                 session["display"].append({"role": "assistant", "content": "ok", "tool_steps": [], "ts": "now"})
                 return {}
 

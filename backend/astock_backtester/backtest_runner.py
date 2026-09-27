@@ -73,6 +73,29 @@ def condition_definitions_json() -> list[dict[str, Any]]:
     return [condition_definition_json(item) for item in registered_conditions()]
 
 
+def run_prepared_backtest(
+    prepared: Any,
+    strategy: StrategyConfig,
+    settings: Any,
+    on_trade_closed: Callable[[Any], None] | None = None,
+    on_event: Callable[[dict], None] | None = None,
+) -> Any:
+    """Match an already-enriched frame against one set of settings.
+
+    Reuse across combinations is safe because enrichment is a pure function of
+    ``(frame, strategy)`` — it never sees ``BacktestSettings`` — and
+    ``run_backtest`` copies the frame before writing its own columns, so no
+    combination can mutate the shared prepared data.
+    """
+    return run_backtest(
+        prepared,
+        strategy,
+        settings,
+        on_trade_closed=on_trade_closed,
+        on_event=on_event,
+    )
+
+
 def run_configured_backtest(
     frame: Any,
     strategy: StrategyConfig,
@@ -80,7 +103,7 @@ def run_configured_backtest(
     on_trade_closed: Callable[[Any], None] | None = None,
     on_event: Callable[[dict], None] | None = None,
 ) -> Any:
-    return run_backtest(
+    return run_prepared_backtest(
         enrich_for_strategy(frame, strategy),
         strategy,
         settings,
