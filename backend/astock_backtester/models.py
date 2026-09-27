@@ -180,6 +180,8 @@ class SyncJobStatus(BaseModel):
     job_id: str
     mode: Literal["full_market_bootstrap", "capital_flow_backfill", "incremental_update", "retry_failed"]
     status: Literal["running", "cancelling", "cancelled", "completed", "completed_with_errors", "failed"]
+    # 本次提交是新建了 worker，还是并入了同参数的在途任务（准入对调用方可见）。
+    admission: Literal["started", "reused"] = "started"
     total_symbols: int
     completed_symbols: int = 0
     failed_symbols: int = 0

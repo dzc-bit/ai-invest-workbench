@@ -9,6 +9,7 @@ stay cheap, explainable and runnable with AI unconfigured.
 
 from __future__ import annotations
 
+import statistics
 from typing import Any
 
 MIN_RELIABLE_TRADES = 10
@@ -19,48 +20,114 @@ LOW_TRADE_HIGH_RETURN_TRADES = 30
 SMOOTH_DRAWDOWN = 0.005
 SMOOTH_RETURN = 0.5
 PARAM_DISPERSION_RATIO = 3.0
+# Below this many comparable combinations the distribution is too thin to call
+# anything a warning; the check still reports what it sees, labelled as such.
+MIN_GRID_SAMPLES = 5
 
 
 def _finding(level: str, code: str, message: str) -> dict[str, str]:
     return {"level": level, "code": code, "message": message}
 
 
-def _param_dispersion_findings(combos: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Compare the best combination against the grid median: a best that is
-    many times better than its neighbours is a classic overfit signature."""
+def _grid_sample(combos: list[dict[str, Any]]) -> tuple[list[float], int]:
+    """Returns of the combinations that report a numeric total return, plus how
+    many of them never traded at all (a 0% return there is not a result)."""
     returns: list[float] = []
+    tradeless = 0
     for combo in combos:
         metrics = combo.get("metrics") or {}
         value = metrics.get("total_return_pct")
-        if isinstance(value, (int, float)):
-            returns.append(float(value))
-    if len(returns) < 5:
-        return []
-    ordered = sorted(returns)
-    median = ordered[len(ordered) // 2]
-    best = ordered[-1]
-    if median <= 0:
-        if best > 0:
-            return [
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        returns.append(float(value))
+        trades = metrics.get("trade_count")
+        if isinstance(trades, (int, float)) and not isinstance(trades, bool) and trades == 0:
+            tradeless += 1
+    return returns, tradeless
+
+
+def _param_dispersion_findings(
+    combos: list[dict[str, Any]], *, rejected: int = 0
+) -> list[dict[str, str]]:
+    """Compare the best combination with the rest of the grid.
+
+    A best that is far above its neighbours, or the only positive one, is a
+    classic overfit signature — but only the count of positive combinations can
+    say that, so it is counted rather than inferred from the median.
+    """
+    findings: list[dict[str, str]] = []
+    if rejected > 0:
+        findings.append(
+            _finding(
+                "info",
+                "grid_partial_failures",
+                f"网格里有 {rejected} 个参数组合不合法、已被剔除，下面的分布判断只覆盖剩下的组合。",
+            )
+        )
+    returns, tradeless = _grid_sample(combos)
+    if not returns:
+        findings.append(
+            _finding("info", "grid_no_usable_combinations", "参数网格没有产出任何可比较的组合，无法判断稳健性。")
+        )
+        return findings
+
+    total = len(returns)
+    positive = sum(1 for value in returns if value > 0)
+    best = max(returns)
+    if total < MIN_GRID_SAMPLES:
+        findings.append(
+            _finding(
+                "info",
+                "grid_small_sample",
+                f"网格只有 {total} 组可比结果，样本偏少，以下关于分布的判断仅供参考。",
+            )
+        )
+
+    if positive == 0:
+        findings.append(
+            _finding(
+                "info",
+                "grid_no_positive_combination",
+                f"{total} 组参数收益全部不为正（最优 {best:+.1%}）；这不是过拟合特征，而是策略在该区间没有产出。",
+            )
+        )
+    elif positive == 1:
+        findings.append(
+            _finding(
+                "warning" if total >= MIN_GRID_SAMPLES else "info",
+                "grid_only_best_positive",
+                f"{total} 组里实测只有 1 组收益为正（{best:+.1%}），其余 {total - 1} 组不赚钱；"
+                "最优组可能只是踩中参数噪声，稳健性存疑。",
+            )
+        )
+    elif total >= MIN_GRID_SAMPLES:
+        median = float(statistics.median(returns))
+        if median > 0 and best > 0 and best >= median * PARAM_DISPERSION_RATIO:
+            findings.append(
                 _finding(
                     "warning",
-                    "grid_only_best_positive",
-                    f"参数网格 {len(returns)} 组里只有最优组收益为正（{best:+.1%}），其余均不赚钱，参数大概率过拟合。",
+                    "grid_best_outlier",
+                    f"最优组合收益 {best:+.1%} 是网格中位数（{median:+.1%}）的 {best / median:.1f} 倍，"
+                    f"{total} 组中有 {positive} 组为正；业绩集中在个别参数上，稳健性存疑。",
                 )
-            ]
-        return []
-    if best >= median * PARAM_DISPERSION_RATIO and best > 0:
-        return [
-            _finding(
-                "warning",
-                "grid_best_outlier",
-                f"最优组合收益 {best:+.1%} 是网格中位数（{median:+.1%}）的 {best / median:.1f} 倍，业绩依赖特定参数，稳健性存疑。",
             )
-        ]
-    return []
+    if tradeless:
+        findings.append(
+            _finding(
+                "info",
+                "grid_combinations_without_trades",
+                f"{total} 组里有 {tradeless} 组一笔成交都没有，其 0% 收益不代表该参数可用。",
+            )
+        )
+    return findings
 
 
-def assess_overfit(metrics: dict[str, Any], *, combos: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def assess_overfit(
+    metrics: dict[str, Any],
+    *,
+    combos: list[dict[str, Any]] | None = None,
+    rejected: int = 0,
+) -> dict[str, Any]:
     findings: list[dict[str, str]] = []
     trade_count = metrics.get("trade_count")
     total_return = metrics.get("total_return_pct")
@@ -114,8 +181,8 @@ def assess_overfit(metrics: dict[str, Any], *, combos: list[dict[str, Any]] | No
                 "收益很高而回撤极浅：确认是否真实逐日撮合，警惕成交价按理想价成交的乐观假设。",
             )
         )
-    if combos:
-        findings.extend(_param_dispersion_findings(combos))
+    if combos is not None or rejected:
+        findings.extend(_param_dispersion_findings(combos or [], rejected=rejected))
 
     level = "none"
     if any(item["level"] == "critical" for item in findings):

@@ -15,6 +15,7 @@ from typing import NamedTuple
 
 import pandas as pd
 import pyarrow.parquet as pq
+from pyarrow.lib import ArrowInvalid
 
 from astock_backtester.data.filelock import CrossProcessFileLock
 from astock_backtester.data.importer import normalize_daily_bars
@@ -24,6 +25,9 @@ from astock_backtester.models import DatasetCoverage
 logger = logging.getLogger(__name__)
 
 OHLC_COLUMNS = ["open", "high", "low", "close"]
+# 定向读取时才把股票集合下推成 parquet ``in`` 过滤：集合大到一定程度时构造与
+# 匹配过滤的代价会超过它省下的解码量（全市场读取本来也不传 symbols）。
+SYMBOL_PUSHDOWN_MAX = 500
 GAP_PROFILE_TTL_SECONDS = 600.0
 GAP_PROFILE_DEFAULT_PARTITION_YEARS = 2
 GAP_PROFILE_TOP_STALE = 12
@@ -262,29 +266,116 @@ class Warehouse:
         start_date: str | None = None,
         end_date: str | None = None,
         require_ohlc: bool = False,
+        columns: Sequence[str] | None = None,
     ) -> pd.DataFrame:
+        """读取日线分区，并把日期/股票/列的约束尽量下推给 parquet。
+
+        下推只是**减少解码量**：分区文件可能早于某个列存在，也可能统计信息
+        缺失，所以 pandas 侧的原过滤条件保持权威，结果与下推前逐行一致。
+        ``columns`` 只做投影裁剪，缺列时按需补齐（过滤列与 OHLC 判定列不能被丢掉）。
+        """
         paths = self._partition_paths_for_range(start_date, end_date)
         if not paths:
             return pd.DataFrame()
-        frames = []
+        selected_symbols: set[str] | None = None
+        if symbols:
+            # 传了非空列表就必须过滤：全空白的列表（例如 {"symbols": [""]}）是空
+            # 结果而不是"跳过过滤读全仓"—— 后者会把整仓数据当成定向查询结果。
+            selected_symbols = {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
+            if not selected_symbols:
+                # 保持"过滤生效"的语义，同时给出列名与 dtype 供调用方检查列。
+                empty = self._empty_like(paths, columns)
+                return empty if empty is not None else pd.DataFrame()
+        start_bound = pd.Timestamp(start_date) if start_date else None
+        end_bound = pd.Timestamp(end_date) if end_date else None
+
+        frames: list[pd.DataFrame] = []
+        empty_schema: pd.DataFrame | None = None
         for path in paths:
-            frame = self._safe_read_parquet(path)
-            if not frame.empty:
-                frames.append(frame)
+            read_kwargs = self._pushdown_plan(path, selected_symbols, start_bound, end_bound, columns, require_ohlc)
+            frame = self._safe_read_parquet(path, **read_kwargs)
+            if frame.empty:
+                # 行组被完全剪掉时也要给出列名与 dtype：调用方会检查
+                # frame.columns（例如 {"symbol","trade_date"}.issubset(...)）。
+                if empty_schema is None or len(frame.columns) > len(empty_schema.columns):
+                    empty_schema = frame
+                continue
+            frames.append(frame)
         if not frames:
-            return pd.DataFrame()
+            return empty_schema if empty_schema is not None else pd.DataFrame()
         frame = pd.concat(frames, ignore_index=True)
         frame["trade_date"] = pd.to_datetime(frame["trade_date"])
-        if symbols:
-            selected = {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
-            frame = frame[frame["symbol"].astype(str).isin(selected)]
-        if start_date:
-            frame = frame[frame["trade_date"] >= pd.Timestamp(start_date)]
-        if end_date:
-            frame = frame[frame["trade_date"] <= pd.Timestamp(end_date)]
+        if selected_symbols:
+            frame = frame[frame["symbol"].astype(str).isin(selected_symbols)]
+        if start_bound is not None:
+            frame = frame[frame["trade_date"] >= start_bound]
+        if end_bound is not None:
+            frame = frame[frame["trade_date"] <= end_bound]
         if require_ohlc:
             frame = _require_ohlc_rows(frame)
         return frame.sort_values(["symbol", "trade_date"]).reset_index(drop=True)
+
+    def _empty_like(self, paths: list[Path], columns: Sequence[str] | None) -> pd.DataFrame | None:
+        """给出一个零行但带列名的空帧，供"过滤后必然为空"的早退路径使用。"""
+        for path in paths:
+            try:
+                names = list(pq.ParquetFile(path).schema_arrow.names)
+            except (FileNotFoundError, OSError, ArrowInvalid):
+                continue
+            if columns is not None:
+                projected = [column for column in columns if column in names]
+                if projected:
+                    names = projected
+            return pd.DataFrame({name: pd.Series(dtype="object") for name in names})
+        return None
+
+    def _pushdown_plan(
+        self,
+        path: Path,
+        symbols: set[str] | None,
+        start_bound: pd.Timestamp | None,
+        end_bound: pd.Timestamp | None,
+        columns: Sequence[str] | None,
+        require_ohlc: bool,
+    ) -> dict[str, object]:
+        """按分区实际拥有的列构造下推参数；拿不准的一律不下推（退回整读）。"""
+        kwargs: dict[str, object] = {}
+        try:
+            available_set = set(pq.ParquetFile(path).schema_arrow.names)
+        except (FileNotFoundError, OSError, ArrowInvalid):
+            # 交给 _safe_read_parquet 去区分"不存在"与"损坏"（后者必须上报）。
+            return kwargs
+        if not available_set:
+            return kwargs
+
+        needed: list[str] = []
+        filters: list[tuple[str, str, object]] = []
+        if start_bound is not None and "trade_date" in available_set:
+            filters.append(("trade_date", ">=", start_bound.to_pydatetime()))
+            needed.append("trade_date")
+        if end_bound is not None and "trade_date" in available_set:
+            filters.append(("trade_date", "<=", end_bound.to_pydatetime()))
+            needed.append("trade_date")
+        # 股票集合过大时 ``in`` 过滤本身比多读几列更贵，只在定向读取时下推。
+        if symbols and "symbol" in available_set and len(symbols) <= SYMBOL_PUSHDOWN_MAX:
+            filters.append(("symbol", "in", sorted(symbols)))
+            needed.append("symbol")
+
+        if columns is not None:
+            projected = [column for column in columns if column in available_set]
+            if not projected:
+                # 调用方要的列一根都不在（旧分区）：整读比读出一个空壳更安全，
+                # 但已经算好的日期/股票过滤不能跟着丢掉。
+                if filters:
+                    kwargs["filters"] = filters
+                return kwargs
+            for column in (*needed, *(OHLC_COLUMNS if require_ohlc else ()), "symbol", "trade_date"):
+                if column in available_set and column not in projected:
+                    projected.append(column)
+            kwargs["columns"] = projected
+        if filters:
+            kwargs["filters"] = filters
+        return kwargs
 
     def read_daily_symbols(
         self,

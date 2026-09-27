@@ -3,7 +3,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from astock_backtester.ai.agent import AgentRunner
+from astock_backtester.ai.agent import STOP_NOTE, AgentRunner
+from astock_backtester.ai.cancel import CancelToken
 from astock_backtester.ai.context import ContextBudget, ToolResult, ToolResultStore
 from astock_backtester.ai.tools.registry import AiTool, ToolRegistry
 
@@ -465,10 +466,239 @@ def test_agent_replay_of_untrusted_tool_results_is_fenced():
         [{"id": "replay-1", "function": {"name": "read_tool_result", "arguments": '{"call_id": "crawly-1"}'}}],
         lambda event: None,
         {},
+        CancelToken(),
     )
 
     replayed = [m for m in session["messages"] if m.get("role") == "tool"]
     assert replayed and UNTRUSTED_OPEN in replayed[0]["content"], "续读的爬取正文必须被围栏包裹"
+
+
+def test_session_pairs_stay_valid_after_cancel():
+    """停止后的历史必须直接合法，不能靠下一次运行的 _repair_interrupted_turn 补洞。"""
+    token = CancelToken()
+    model = FakeModel([[_final(tool_calls=[_tool_call("t1", "echo_tool", '{"x": 1}')])]])
+    runner = AgentRunner(model, _registry(), ToolResultStore(), ContextBudget())
+    session = _session()
+
+    def stop_after_first_round(event: dict[str, Any]) -> None:
+        if event["type"] == "tool_result":
+            token.cancel()
+
+    runner.run(
+        session=session,
+        user_message="看看",
+        system_prompt="sys",
+        max_steps=5,
+        on_event=stop_after_first_round,
+        cancel=token,
+    )
+    before = [dict(message) for message in session["messages"]]
+
+    runner._repair_interrupted_turn(session)
+
+    assert session["messages"] == before, "停止时已经补齐了配对，修复阶段不该再改历史"
+
+
+def test_cancel_between_rounds_starts_no_further_model_call():
+    """轮间取消后不得再开新的模型轮次。
+
+    脚本必须真的走到"两轮之间"：首轮返回 tool_calls（这样才会继续下一轮），
+    取消在第二轮开始前发生。旧写法只给一个 final 事件，token 分支根本不触发，
+    断言与取消逻辑无关，删掉取消照样绿。
+    """
+    token = CancelToken()
+    second_round = [_final(content="不该出现")]
+    model = FakeModel(
+        [
+            [
+                _final(tool_calls=[_tool_call("c1", "echo_tool", '{"x": 7}')]),
+            ],
+            second_round,
+        ]
+    )
+    runner = AgentRunner(model, _registry(), ToolResultStore(), ContextBudget())
+    session = _session()
+
+    def stop_after_first_round(event: dict[str, Any]) -> None:
+        # 工具结果写回之后就是轮间边界：此时取消不该再有第二轮。
+        if event.get("type") == "tool_result":
+            token.cancel()
+
+    runner.run(
+        session=session,
+        user_message="说说盘面",
+        system_prompt="sys",
+        max_steps=5,
+        on_event=stop_after_first_round,
+        cancel=token,
+    )
+
+    assert len(model.calls) == 1, "取消后不得再开新的模型轮次"
+    # 每批 tool_call 都必须有配对结果，否则会话会被上游判为协议非法。
+    tool_ids = [
+        message.get("tool_call_id")
+        for message in session["messages"]
+        if message["role"] == "tool"
+    ]
+    assert tool_ids == ["c1"]
+
+
+def test_cancel_after_tool_calls_landed_still_pairs_every_call():
+    """assistant(tool_calls) 已落盘、工具一个都没启动时取消，也必须逐条配对。
+
+    这条覆盖 ``_abandon_tool_calls``：此处不补齐配对，整条会话会被上游判为
+    协议非法，而修复只能留给下次运行的 ``_repair_interrupted_turn``（§15-8 明
+    令禁止）。用"预先已取消"的令牌精确命中该分支——工具提交前的那个安全边界。
+    """
+    token = CancelToken()
+
+    class CancelAfterTurnModel:
+        """模型产出 tool_calls 之后立刻取消：正好卡在工具提交前的边界。"""
+
+        def __init__(self, inner: FakeModel) -> None:
+            self.inner = inner
+
+        def chat(self, messages, *, tools=None):
+            for event in self.inner.chat(messages, tools=tools):
+                yield event
+                # final 已交出（tool_calls 随后落盘），此刻取消命中
+                # "已落盘但未启动工具"这条分支。
+                token.cancel()
+
+        def embed(self, texts):
+            return self.inner.embed(texts)
+
+    model = CancelAfterTurnModel(FakeModel([[_final(tool_calls=[_tool_call("c1", "echo_tool", '{"x": 1}')])]]))
+    runner = AgentRunner(model, _registry(), ToolResultStore(), ContextBudget())
+    session = _session()
+    events: list[dict[str, Any]] = []
+
+    def recorder(event: dict[str, Any]) -> None:
+        events.append(dict(event))
+
+    runner.run(
+        session=session,
+        user_message="说说盘面",
+        system_prompt="sys",
+        max_steps=5,
+        on_event=recorder,
+        cancel=token,
+    )
+
+    assistant = [message for message in session["messages"] if message["role"] == "assistant"]
+    assert assistant[-1].get("tool_calls"), "模型那一轮的 tool_calls 必须已落盘"
+    tool_ids = [message.get("tool_call_id") for message in session["messages"] if message["role"] == "tool"]
+    assert tool_ids == ["c1"], f"每条 tool_call 都要有配对结果，实际 {tool_ids}"
+
+    # 一个都不执行：echo_tool 没被调用过，且停止说明进了展示层。
+    assert STOP_NOTE in session["display"][-1]["content"]
+    assert session["messages"][-1]["role"] == "tool"
+
+    # 修复阶段必须无事可做（配对已完成）。
+    before = [dict(message) for message in session["messages"]]
+    runner._repair_interrupted_turn(session)
+    assert session["messages"] == before
+
+
+def test_cancel_mid_stream_keeps_partial_text_verbatim_in_protocol_history():
+    token = CancelToken()
+
+    class StreamingModel:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def chat(self, messages, *, tools=None):
+            try:
+                for chunk in ("上游", "涨", "停"):
+                    yield ("text", chunk)
+                yield ("final", {"content": "上游涨停", "tool_calls": None})
+            finally:
+                self.closed += 1
+
+        def embed(self, texts):
+            return [[0.0] for _ in texts]
+
+    model = StreamingModel()
+    runner = AgentRunner(model, _registry(), ToolResultStore(), ContextBudget())
+    session = _session()
+
+    def stop_after_second_chunk(event: dict[str, Any]) -> None:
+        if event.get("type") == "token" and event["text"] == "涨":
+            token.cancel()
+
+    runner.run(
+        session=session,
+        user_message="说说盘面",
+        system_prompt="sys",
+        max_steps=5,
+        on_event=stop_after_second_chunk,
+        cancel=token,
+    )
+
+    assistant = [message for message in session["messages"] if message["role"] == "assistant"]
+    assert assistant[-1]["content"] == "上游涨", "协议消息保留模型原文，不含 UI 提示"
+    display = session["display"][-1]
+    assert display["role"] == "assistant"
+    assert STOP_NOTE in display["content"]
+    assert display["content"].startswith("上游涨")
+    assert model.closed == 1, "取消后必须关掉上游流，不能把连接留在那里排队"
+
+
+def test_cancel_skips_remaining_tools_but_keeps_call_pairing():
+    executed: list[str] = []
+    token = CancelToken()
+    registry = ToolRegistry()
+
+    def make_tool(name: str):
+        def run(args: dict[str, Any]) -> dict[str, Any]:
+            executed.append(name)
+            if name == "first_tool":
+                token.cancel()
+            return {"ok": True, "value": name}
+
+        return AiTool(
+            name=name,
+            description=name,
+            parameters={"type": "object", "properties": {}},
+            executor=run,
+            summarizer=lambda payload: str(payload.get("value")),
+        )
+
+    # 未声明 read_only 的工具一律串行执行（_must_serialize 的保守判定），
+    # 于是取消发生在第一个工具里时，第二个一定还没被提交。
+    registry.register(make_tool("first_tool"))
+    registry.register(make_tool("second_tool"))
+    model = FakeModel(
+        [
+            [
+                _final(
+                    tool_calls=[
+                        _tool_call("c1", "first_tool", "{}"),
+                        _tool_call("c2", "second_tool", "{}"),
+                    ]
+                )
+            ],
+            [_final(content="不该被调用")],
+        ]
+    )
+    runner = AgentRunner(model, registry, ToolResultStore(), ContextBudget())
+    session = _session()
+
+    runner.run(
+        session=session,
+        user_message="两个工具",
+        system_prompt="sys",
+        max_steps=5,
+        on_event=lambda event: None,
+        cancel=token,
+    )
+
+    assert executed == ["first_tool"], "取消后不得再启动新的工具"
+    tool_messages = {message["tool_call_id"]: message["content"] for message in session["messages"] if message["role"] == "tool"}
+    assert set(tool_messages) == {"c1", "c2"}, "assistant(tool_calls) 的两条配对都必须存在"
+    assert "[code=interrupted]" in tool_messages["c2"]
+    assert "code=interrupted" not in tool_messages["c1"]
+    assert len(model.calls) == 1, "取消后不再进入下一轮"
 
 
 def test_agent_avoids_splitting_tool_pair_at_window_edge():

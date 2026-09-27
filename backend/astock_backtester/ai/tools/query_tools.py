@@ -19,8 +19,9 @@ import pandas as pd
 
 from astock_backtester.ai.context import retain_rows
 from astock_backtester.ai.tools.local_tools import AiBackend
-from astock_backtester.ai.tools.registry import AiTool
+from astock_backtester.ai.tools.registry import CODE_SYNC_CAPACITY, AiTool
 from astock_backtester.data.symbols import normalize_symbol
+from astock_backtester.data.sync import SyncCapacityError
 
 SQL_MAX_ROWS = 500
 SQL_ROW_LIMIT = 501
@@ -223,7 +224,15 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
                     "imported_rows": 0,
                     "summary_detail": "窗口内没有缺资金流的股票，无需补齐。",
                 }
-            job = backend.sync_manager.start_capital_flow_backfill(sorted(missing), start_date, end_date)
+            try:
+                job = backend.sync_manager.start_capital_flow_backfill(sorted(missing), start_date, end_date)
+            except SyncCapacityError as exc:
+                return {
+                    "ok": False,
+                    "error_code": CODE_SYNC_CAPACITY,
+                    "error": f"后台补齐预算已满：{exc}。可用 sync_job_status 轮询已在跑的任务，或先取消。",
+                }
+            reused = job.admission == "reused"
             return {
                 "ok": True,
                 "mode": mode,
@@ -231,11 +240,17 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
                     "job_id": job.job_id,
                     "mode": job.mode,
                     "status": job.status,
+                    "admission": job.admission,
                     "total_symbols": job.total_symbols,
                     "start_date": job.start_date.isoformat(),
                     "end_date": job.end_date.isoformat(),
                 },
-                "summary_detail": f"已启动全市场资金流补齐后台任务（{job.total_symbols} 只），用 sync_job_status 轮询进度。",
+                "summary_detail": (
+                    f"已有同参数的资金流补齐任务在跑，本次请求并入任务 {job.job_id}（不重复启动），"
+                    "用 sync_job_status 轮询进度。"
+                    if reused
+                    else f"已启动全市场资金流补齐后台任务（{job.total_symbols} 只），用 sync_job_status 轮询进度。"
+                ),
             }
         if len(symbols) > BACKFILL_MAX_SYMBOLS:
             return {"ok": False, "error": f"单次最多补齐 {BACKFILL_MAX_SYMBOLS} 只股票"}
@@ -308,6 +323,12 @@ def build_query_tools(backend: AiBackend) -> list[AiTool]:
     def summarize_update(payload: dict[str, Any]) -> str:
         if payload.get("background_job"):
             job = payload["background_job"]
+            if job.get("admission") == "reused":
+                # 模型必须知道自己并入的是别人的任务，否则会以为又起了一个而重复等。
+                return (
+                    f"已有同参数的资金流补齐任务在跑，本次并入 {job.get('job_id')}"
+                    f"（{job.get('total_symbols')} 只），请轮询 sync_job_status。"
+                )
             return f"资金流补齐已转后台任务 {job.get('job_id')}（{job.get('total_symbols')} 只），请轮询 sync_job_status。"
         detail = payload.get("summary_detail")
         if detail:

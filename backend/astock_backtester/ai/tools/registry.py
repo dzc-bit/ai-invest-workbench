@@ -52,6 +52,14 @@ CODE_UNKNOWN_TOOL = "unknown_tool"
 CODE_BAD_ARGUMENTS = "bad_arguments"
 CODE_TOOL_ERROR = "tool_error"
 CODE_NO_DATA = "no_data"
+# 中断（停止按钮 / 进程退出）导致没有结果：与会话修复路径共用同一个码，
+# 回放时"用户主动停的"和"工具真失败了"要能分开。
+CODE_INTERRUPTED = "interrupted"
+# 后台补齐预算已满（服务端 409 的同一语义）：不是工具坏了，是"已有任务在跑"。
+# 模型据此应该改为轮询或先取消，而不是换工具或改参数重试。
+CODE_SYNC_CAPACITY = "sync_capacity"
+# 数据仓分区损坏：与"缺数据"不同 —— 这时该先修损坏，而不是继续补数据。
+CODE_WAREHOUSE_CORRUPT = "warehouse_corrupt"
 
 
 @dataclass

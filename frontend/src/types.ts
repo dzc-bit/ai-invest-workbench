@@ -78,6 +78,8 @@ export type SyncJobStatus = {
   job_id: string;
   mode: "full_market_bootstrap" | "capital_flow_backfill" | "incremental_update" | "retry_failed";
   status: "running" | "cancelling" | "cancelled" | "completed" | "completed_with_errors" | "failed";
+  /** 本次提交是新建了 worker（started）还是并入了同参数的在途任务（reused）。 */
+  admission?: "started" | "reused";
   total_symbols: number;
   completed_symbols: number;
   failed_symbols: number;
@@ -432,6 +434,17 @@ export type BacktestProgressEvent = {
   message: string;
 };
 
+/** /run/backtest/stream 的 NDJSON 事件联合：终态只有 result 与 error 两种。 */
+export type BacktestStreamEvent =
+  | { type: "phase"; phase: string }
+  | { type: "progress"; message: string; trade_date?: string; scanned_days?: number; total_days?: number; open_positions?: number; closed_trades?: number; candidates?: number }
+  | { type: "data_loaded"; rows: number }
+  | { type: "trade_opened"; trade: Trade }
+  | { type: "trade_closed"; trade: Trade }
+  | { type: "trade_blocked"; trade: Trade }
+  | { type: "result"; result: BacktestResult }
+  | { type: "error"; message?: string; code?: string };
+
 export type BacktestStreamHandlers = {
   onPhase?: (phase: string) => void;
   onProgress?: (event: BacktestProgressEvent) => void;
@@ -563,7 +576,7 @@ export type OptimizeCombination = {
 export type OptimizeSummary = {
   combinations: OptimizeCombination[];
   best: OptimizeCombination | null;
-  failures: Array<{ params: Record<string, number>; error: string }>;
+  failures: Array<{ params: Record<string, number>; error: string; code?: string }>;
   total: number;
   evaluated: number;
   insight?: string | null;

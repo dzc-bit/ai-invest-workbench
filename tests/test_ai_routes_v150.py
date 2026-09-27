@@ -374,6 +374,66 @@ def test_optimize_streams_combinations_and_result(tmp_path):
         thread.join(timeout=5)
 
 
+def test_optimize_reports_illegal_combinations_as_failures_over_http(tmp_path):
+    """The grid used to evaluate max_positions=0 because ``model_copy`` skipped
+    validation; over HTTP it must be reported and stay out of the ranking."""
+    server, thread, port = _start_server(tmp_path)
+    server.state.warehouse.write_daily_bars(sample_daily_bars())
+    try:
+        payload = _optimize_payload()
+        payload["grid"] = {"max_positions": [0, 2]}
+        events = _request_ndjson(f"http://127.0.0.1:{port}/ai/optimize", payload)
+        assert events[-1]["type"] == "result"
+        result = events[-1]["result"]
+        assert result["total"] == 2
+        assert result["evaluated"] == 1
+        assert [combo["params"] for combo in result["combinations"]] == [{"max_positions": 2}]
+        assert result["best"]["params"] == {"max_positions": 2}
+        assert [event["type"] for event in events if event["type"] == "combination"] == ["combination"]
+        failure = result["failures"][0]
+        assert failure["code"] == "invalid_combination"
+        assert failure["params"] == {"max_positions": 0}
+        assert "max_positions" in failure["error"]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_optimize_boundary_stops_when_cancel_token_fires(tmp_path):
+    """取消只作用在组合边界：已跑完的组合保留，之后的组合不再启动。"""
+    from astock_backtester.ai.cancel import CancelToken
+    from astock_backtester.ai.optimizer import run_optimization
+    from astock_backtester.models import BacktestSettings, StrategyConfig
+
+    server, thread, port = _start_server(tmp_path)
+    server.state.warehouse.write_daily_bars(sample_daily_bars())
+    try:
+        settings = BacktestSettings.model_validate(_optimize_payload()["settings"])
+        strategy = StrategyConfig.model_validate(_optimize_payload()["strategy"])
+        frame = server.state.warehouse.read_daily_bars(
+            start_date=settings.start_date.isoformat(),
+            end_date=settings.end_date.isoformat(),
+            require_ohlc=True,
+        )
+        token = CancelToken()
+        events: list[dict] = []
+
+        def write(event: dict) -> None:
+            events.append(event)
+            if event["type"] == "combination":
+                token.cancel()
+
+        summary = run_optimization(frame, strategy, settings, {"max_positions": [2, 3, 5]}, write, cancel=token)
+
+        assert summary["cancelled"] is True
+        assert summary["evaluated"] == 1, "取消后的组合不得再启动"
+        assert summary["total"] == 3
+        assert [event["type"] for event in events].count("combination") == 1
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_optimize_appends_ai_insight_when_configured(tmp_path, monkeypatch):
     server, thread, port = _start_server(tmp_path)
     server.state.warehouse.write_daily_bars(sample_daily_bars())

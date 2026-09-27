@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from astock_backtester.ai.agent import AgentRunner
+from astock_backtester.ai.cancel import TurnRegistry
 from astock_backtester.ai.condition_dsl import parse_conditions_with_llm
 from astock_backtester.ai.config import AiConfig, AiConfigStore, ai_base_dir_from_cache_dir
 from astock_backtester.ai.context import ContextBudget, ToolResultStore
@@ -59,6 +60,10 @@ def today_context(now: datetime | None = None) -> str:
         "与 realtime_stock_detail（个股实时价、量比、涨跌停状态）；limit_up_pool 提供涨停/炸板/跌停池。"
         "本地数据仓只用于历史区间、横截面筛选与回测，引用其数字时必须写出数据截止日期并说明非实时。"
     )
+
+
+def _noop_release() -> None:
+    """轮次登记之前的占位释放句柄（幂等，finally 里可安全调用）。"""
 
 
 class _SessionLockEntry:
@@ -140,6 +145,9 @@ class AiService:
         self._reports.start()
         self._session_locks: dict[str, _SessionLockEntry] = {}
         self._session_locks_guard = threading.Lock()
+        # session_id -> 在途轮次的取消令牌。「停止」按钮要能真正打到 worker，
+        # 而不是只断开前端接收（AGENTS.md §15-8 的会话协议不允许半途而废）。
+        self._turns = TurnRegistry()
         # 动态清理的忙碌判定只有这里知道（会话锁表在 facade 手上）：正在生成中的
         # 会话绝不能被 prune 掉，否则 worker 的 finally 会把文件重新写回来。
         self._sessions.set_busy_check(self._session_busy)
@@ -287,6 +295,7 @@ class AiService:
         worker_started = False
         lock_held = False
         lock_released = False
+        release_turn = _noop_release
 
         def drop_session_ref() -> None:
             """只归还引用计数，不动锁。
@@ -355,6 +364,7 @@ class AiService:
 
             events: queue.Queue[dict[str, Any] | None] = queue.Queue()
             error_holder: list[dict[str, Any]] = []
+            cancel_token, release_turn = self._turns.register(session_id)
 
             def on_event(event: dict[str, Any]) -> None:
                 events.put(event)
@@ -368,6 +378,7 @@ class AiService:
                         max_steps=config.max_steps,
                         context=request.context.model_dump() if request.context else None,
                         on_event=on_event,
+                        cancel=cancel_token,
                     )
                     events.put(
                         {
@@ -386,6 +397,9 @@ class AiService:
                     try:
                         self._sessions.save(session)
                     finally:
+                        # 保存完成后才注销轮次：注销早于保存时，停止请求会打到
+                        # 一个还在写会话文件的轮次上。
+                        release_turn()
                         events.put(None)
                         # 会话锁由 worker 释放：客户端断开（停止按钮）后 worker 仍在跑，
                         # 提前释放会让下一个请求与它并发写同一会话。
@@ -424,7 +438,19 @@ class AiService:
             # 只有 worker 从未启动时才在这里释放锁；worker 已启动的路径由
             # worker 自己在 finally 里释放（客户端断开后它仍在运行）。
             if not worker_started:
+                release_turn()
                 release_session_lock()
+
+    def cancel_turn(self, session_id: str) -> dict[str, Any]:
+        """请求停止某个会话的在途轮次（协作取消，不杀线程、不丢已写入的数据）。
+
+        ``cancelling`` 只在真的命中一个在途轮次时为真：轮次只在安全边界退出，
+        已经开始的写入仍会跑完，因此前端据此区分"已通知停止"与"停止已完成"。
+        """
+        key = sanitize_session_id(session_id) if session_id else ""
+        if not key:
+            return {"ok": True, "cancelling": False}
+        return {"ok": True, "cancelling": self._turns.cancel(key)}
 
     def _remember_from(self, session: dict[str, Any]) -> None:
         """Best-effort long-term memory consolidation after a completed turn.
@@ -574,7 +600,9 @@ class AiService:
         if not isinstance(metrics, dict):
             raise ValueError("缺少回测指标 metrics。")
         combos = payload.get("combos") if isinstance(payload.get("combos"), list) else None
-        return assess_overfit(metrics, combos=combos)
+        rejected = payload.get("rejected_combinations")
+        rejected = rejected if isinstance(rejected, int) and not isinstance(rejected, bool) and rejected > 0 else 0
+        return assess_overfit(metrics, combos=combos, rejected=rejected)
 
     # ---------------------------------------------------------------- events
     def events_stream(self) -> Iterator[dict[str, Any]]:

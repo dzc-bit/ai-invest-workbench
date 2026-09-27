@@ -259,6 +259,57 @@ describe("stream request lifecycle", () => {
     expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
   });
 
+  it("keeps the backend business code from a non-2xx stream response", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ code: "no_local_data", message: "本地仓库还没有日线数据" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        })
+      )
+    );
+
+    await expect(
+      runBacktestStreamWithDataService("http://127.0.0.1:9010", strategy, settings)
+    ).rejects.toMatchObject({ code: "no_local_data", message: "本地仓库还没有日线数据" });
+  });
+
+  it("falls back to http_error when the error body is not JSON", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("gateway is down", { status: 502 })));
+
+    await expect(
+      runBacktestStreamWithDataService("http://127.0.0.1:9010", strategy, settings)
+    ).rejects.toMatchObject({ code: "http_error", message: expect.stringContaining("502") });
+  });
+
+  it("reports an unfinished backtest stream instead of resolving with nothing", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          jsonLineStream([
+            JSON.stringify({ type: "phase", phase: "读取本地数据" }),
+            JSON.stringify({ type: "trade_closed", trade: blockedTrade })
+          ]),
+          { status: 200 }
+        )
+      )
+    );
+    const trades: Trade[] = [];
+
+    await expect(
+      runBacktestStreamWithDataService("http://127.0.0.1:9010", strategy, settings, {
+        onTrade: (trade) => trades.push(trade)
+      })
+    ).rejects.toMatchObject({ code: "stream_incomplete" });
+
+    expect(trades).toEqual([blockedTrade]);
+  });
+
   it("cancels the response body when an NDJSON event cannot be parsed", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,

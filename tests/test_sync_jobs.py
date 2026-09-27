@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from threading import Event
 from time import sleep
 
@@ -9,9 +9,10 @@ import pandas as pd
 import pytest
 from astock_backtester.data.cache import LocalCache
 from astock_backtester.data.filelock import FileLockTimeout
-from astock_backtester.data.sync import SyncJobManager
+from astock_backtester.data.sync import SyncCapacityError, SyncJobManager
 from astock_backtester.data.trading_calendar import a_share_trade_dates
 from astock_backtester.data.warehouse import Warehouse
+from astock_backtester.models import SyncJobStatus
 
 
 class FakeProvider:
@@ -1099,3 +1100,152 @@ def test_narrow_fetch_window_clamps_to_the_task_window():
     assert _narrow_fetch_window(start, end, ["2026-04-10"]) == ("2026-03-26", "2026-04-25")
     # 多个缺失日：窗口覆盖 min..max
     assert _narrow_fetch_window(start, end, ["2026-03-10", "2026-03-02"]) == ("2026-02-15", "2026-03-25")
+
+
+class BlockingProvider(FakeProvider):
+    """卡在抓取里的 provider：让作业停在 running，才能测准入与回收。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+        self.calls: list[str] = []
+
+    def fetch_daily_bars(self, symbol, start_date, end_date):
+        self.calls.append(symbol)
+        self.entered.set()
+        assert self.release.wait(timeout=5), "provider 未被释放"
+        return super().fetch_daily_bars(symbol, start_date, end_date)
+
+
+def test_identical_in_flight_sync_is_reused_without_a_second_worker(tmp_path):
+    provider = BlockingProvider()
+    manager = SyncJobManager(warehouse=Warehouse(tmp_path), provider=provider)
+
+    first = manager.start_full_market(symbols=["000001", "000002"], start_date="2015-01-01", end_date="2015-01-05")
+    assert provider.entered.wait(timeout=5)
+    # 顺序不同但同一批股票/同日期/同模式：签名必须一致，否则去重等于没做。
+    second = manager.start_full_market(
+        symbols=["000002", "000001"], start_date="2015-01-01", end_date="2015-01-05"
+    )
+
+    assert second.job_id == first.job_id
+    assert second.admission == "reused"
+    assert first.admission == "started"
+    assert len(manager._jobs) == 1
+
+    provider.release.set()
+    _wait_for_job(manager, first.job_id)
+    # 只跑了一个 worker：每只股票抓一次，没有翻倍。
+    assert sorted(provider.calls) == ["000001", "000002"]
+
+
+def test_service_level_budget_rejects_extra_jobs_with_running_ids(tmp_path):
+    provider = BlockingProvider()
+    manager = SyncJobManager(warehouse=Warehouse(tmp_path), provider=provider, max_concurrent_jobs=1)
+
+    first = manager.start_full_market(symbols=["000001"], start_date="2015-01-01", end_date="2015-01-05")
+    assert provider.entered.wait(timeout=5)
+
+    with pytest.raises(SyncCapacityError) as refused:
+        manager.start_full_market(symbols=["000002"], start_date="2015-01-01", end_date="2015-01-05")
+
+    assert refused.value.running == [first.job_id]
+    assert refused.value.limit == 1
+    assert manager.running_job_ids() == [first.job_id]
+    assert "000002" not in provider.calls
+
+    provider.release.set()
+    _wait_for_job(manager, first.job_id)
+    # 预算释放后同一请求就能起来了。
+    after = manager.start_full_market(symbols=["000002"], start_date="2015-01-01", end_date="2015-01-05")
+    assert after.admission == "started"
+    _wait_for_job(manager, after.job_id)
+
+
+def _sync_job_record(job_id: str, status: str) -> SyncJobStatus:
+    return SyncJobStatus(
+        job_id=job_id,
+        mode="full_market_bootstrap",
+        status=status,
+        total_symbols=1,
+        start_date=date(2015, 1, 1),
+        end_date=date(2015, 1, 5),
+    )
+
+
+def _store_job(manager: SyncJobManager, job_id: str, status: str) -> str:
+    """直接落一条作业记录：回收规则针对的是记录状态，不需要真的起 worker。"""
+    manager._store(_sync_job_record(job_id, status))
+    manager._signatures[job_id] = job_id
+    return job_id
+
+
+def _store_finished_job(manager: SyncJobManager, job_id: str) -> str:
+    job_id = _store_job(manager, job_id, "completed")
+    manager._last_read[job_id] = 0.0  # 从未被再次读取 → 回收候选
+    return job_id
+
+
+def _admit_probe(manager: SyncJobManager) -> None:
+    """走一次真实准入，顺带触发回收（回收只发生在准入时）。"""
+    manager._admit(_sync_job_record("probe", "running"), "probe")
+
+
+def test_expired_terminal_job_records_are_pruned_with_their_markers(tmp_path, monkeypatch):
+    import astock_backtester.data.sync as sync_module
+
+    monkeypatch.setattr(sync_module, "TERMINAL_JOB_RETENTION_SECONDS", 0.0)
+    monkeypatch.setattr(sync_module, "JOB_READ_STALE_SECONDS", 0.0)
+    monkeypatch.setattr(sync_module, "TERMINAL_JOB_MAX_KEEP", 20)
+
+    manager = SyncJobManager(warehouse=Warehouse(tmp_path), provider=FakeProvider())
+    finished_ids = [_store_finished_job(manager, f"job-{index}") for index in range(5)]
+    manager._cancelled.update(finished_ids)
+
+    _admit_probe(manager)
+
+    assert sorted(manager._jobs) == ["probe"]
+    # 记录与它的签名、取消标记必须一起回收，否则 _cancelled 会无限增长。
+    assert set(manager._signatures) == {"probe"}
+    assert manager._cancelled == set()
+    assert manager.get_job(finished_ids[0]) is None
+
+
+def test_terminal_job_records_are_capped_by_count_within_retention(tmp_path, monkeypatch):
+    import astock_backtester.data.sync as sync_module
+
+    monkeypatch.setattr(sync_module, "TERMINAL_JOB_RETENTION_SECONDS", 3_600.0)
+    monkeypatch.setattr(sync_module, "JOB_READ_STALE_SECONDS", 0.0)
+    monkeypatch.setattr(sync_module, "TERMINAL_JOB_MAX_KEEP", 2)
+
+    manager = SyncJobManager(warehouse=Warehouse(tmp_path), provider=FakeProvider())
+    finished_ids = [_store_finished_job(manager, f"job-{index}") for index in range(5)]
+
+    _admit_probe(manager)
+
+    # 都还在保留期内，但超出条数上限的最旧记录要腾位置。
+    assert sorted(manager._jobs) == sorted([*finished_ids[-2:], "probe"])
+    assert manager.get_job(finished_ids[0]) is None
+
+
+def test_pruning_protects_running_and_recently_read_jobs(tmp_path, monkeypatch):
+    import astock_backtester.data.sync as sync_module
+
+    monkeypatch.setattr(sync_module, "TERMINAL_JOB_RETENTION_SECONDS", 0.0)
+    monkeypatch.setattr(sync_module, "TERMINAL_JOB_MAX_KEEP", 1)
+    monkeypatch.setattr(sync_module, "JOB_READ_STALE_SECONDS", 600.0)
+
+    manager = SyncJobManager(warehouse=Warehouse(tmp_path), provider=FakeProvider(), max_concurrent_jobs=3)
+    running = _store_job(manager, "job-running", "running")
+    stale = _store_finished_job(manager, "job-stale")
+    stale_read = _store_finished_job(manager, "job-stale-read")
+    # 前端还在轮询的那条：即使已经超过数量上限也不许回收。
+    manager._last_read[stale_read] = time.monotonic()
+    manager._last_read[stale] = time.monotonic() - 3_600
+
+    _admit_probe(manager)
+
+    assert manager.get_job(running) is not None
+    assert manager.get_job(stale_read) is not None
+    assert manager.get_job(stale) is None

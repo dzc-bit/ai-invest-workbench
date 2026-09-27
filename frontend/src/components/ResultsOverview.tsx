@@ -1,11 +1,14 @@
-import { useEffect, useState } from "react";
-import { Download, Play, Sparkles, ShieldQuestion } from "lucide-react";
-import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { aiOverfitCheck } from "../aiApi";
-import type { AiOverfitResult, AiTask } from "../aiTypes";
+import { Suspense, lazy, useMemo } from "react";
+import { Download, Play, Sparkles } from "lucide-react";
+import type { AiTask } from "../aiTypes";
 import { downloadBacktestReport } from "../reportHtml";
 import type { BacktestResult, BacktestSettingsConfig, DailyStrategyMatches, StrategyConfig } from "../types";
 import { AiOneShotLine } from "./AiOneShotLine";
+import { OverfitStrip, useOverfitAssessment } from "./OverfitAssessment";
+
+// recharts 整栈约 366 KB（raw），而本组件首屏即挂载 —— 静态 import 会让每个用户
+// 在跑第一次回测前就把图表库下载完。拆成懒加载块后，只有真的要画曲线才拉。
+const EquityCurve = lazy(() => import("./EquityCurve"));
 
 type Props = {
   result: BacktestResult | null;
@@ -73,42 +76,6 @@ function normalizedEquityCurve(result: BacktestResult | null): BacktestResult["e
   return Array.from(byDate.values()).sort((left, right) => left.trade_date.localeCompare(right.trade_date));
 }
 
-const OVERFIT_LEVEL_LABELS: Record<string, string> = {
-  critical: "过拟合风险：高",
-  warning: "过拟合风险：存在疑点",
-  info: "过拟合检测：轻微提示",
-  none: ""
-};
-
-function useOverfitAssessment(
-  aiBaseUrl: string | null,
-  result: BacktestResult | null
-): AiOverfitResult | null {
-  const [assessment, setAssessment] = useState<AiOverfitResult | null>(null);
-  useEffect(() => {
-    if (!aiBaseUrl || !result) {
-      setAssessment(null);
-      return;
-    }
-    let cancelled = false;
-    aiOverfitCheck(aiBaseUrl, { metrics: result.metrics as unknown as Record<string, unknown> })
-      .then((next) => {
-        if (!cancelled) {
-          setAssessment(next);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setAssessment(null);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [aiBaseUrl, result]);
-  return assessment;
-}
-
 function MatchedStocksPanel({ dailyMatches }: { dailyMatches?: DailyStrategyMatches | null }) {
   const hasPayload = Boolean(dailyMatches);
   const rawItems = dailyMatches?.matches ?? [];
@@ -171,14 +138,14 @@ export function ResultsOverview({
   settings
 }: Props) {
   const issueCount = result?.preflight_issues.length ?? 0;
+  const overfitRequest = useMemo(() => (result ? { metrics: result.metrics } : null), [result]);
+  const overfit = useOverfitAssessment(aiBaseUrl, overfitRequest);
   const chartData = normalizedEquityCurve(result);
   const chartStart = chartData[0]?.trade_date;
   const chartEnd = chartData.at(-1)?.trade_date;
   const zeroTradeHint = result && result.metrics.trade_count === 0
     ? "本次没有产生交易。常见原因是日期范围过短、股票池过窄、条件过严或本地字段缺失。"
     : null;
-  const overfit = useOverfitAssessment(aiBaseUrl, result);
-  const overfitFindings = overfit?.findings ?? [];
 
   return (
     <section className="surface results-surface">
@@ -255,14 +222,7 @@ export function ResultsOverview({
             <span>平均仓位 {(result.metrics.average_position_pct * 100).toFixed(2)}%</span>
             <span>最大仓位 {(result.metrics.max_position_pct * 100).toFixed(2)}%</span>
           </div>
-          {overfit && overfit.level !== "none" && overfitFindings.length > 0 ? (
-            <div className={`risk-strip overfit-strip overfit-${overfit.level}`} role="status">
-              <strong>
-                <ShieldQuestion size={14} aria-hidden="true" /> {OVERFIT_LEVEL_LABELS[overfit.level] ?? "过拟合检测"}
-              </strong>
-              <span>{overfitFindings.map((finding) => finding.message).join("；")}</span>
-            </div>
-          ) : null}
+          <OverfitStrip assessment={overfit} />
           {aiBaseUrl ? (
             <AiOneShotLine
               key={`${result.metrics.total_return_pct}-${result.metrics.trade_count}-${result.equity_curve.at(-1)?.trade_date ?? ""}`}
@@ -299,14 +259,9 @@ export function ResultsOverview({
               {chartStart && chartEnd ? <span>回测区间 {chartStart} 至 {chartEnd}</span> : null}
             </div>
             <div className="chart-body">
-              <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={220}>
-                <LineChart data={chartData}>
-                  <XAxis dataKey="trade_date" />
-                  <YAxis />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="equity" stroke="#0f766e" strokeWidth={2} dot={false} />
-                </LineChart>
-              </ResponsiveContainer>
+              <Suspense fallback={<div className="chart-placeholder">正在加载图表…</div>}>
+                <EquityCurve data={chartData} />
+              </Suspense>
             </div>
           </div>
         </>

@@ -10,11 +10,11 @@ import {
   loadDataServiceLogs,
   loadDiagnosticsDataGaps,
   loadDiagnosticsSources,
-  loadSyncJob,
   startFullMarketSync,
   startMissingOnlySync
 } from "../api";
 import { aiInsightOneshot } from "../aiApi";
+import { isSyncRunningJob as isSyncRunning, useSyncJobPolling } from "../hooks/useSyncJobPolling";
 import type { DataSourceHealth, DiagnosticsDataGapsResponse, DiagnosticsSourcesResponse } from "../types";
 import { recentAShareTradingDateRange } from "../tradingCalendar";
 import type { DailyBarsCoverageItem, DataServiceStatus, DatasetCoverage, ServiceLogEntry, SyncJobStatus } from "../types";
@@ -84,8 +84,9 @@ function connectionErrorMessage(error: unknown): string {
   return "本地数据服务连接失败，请重试。";
 }
 
-function isSyncRunning(job: SyncJobStatus | null): boolean {
-  return job?.status === "running" || job?.status === "cancelling";
+function reusedPrefix(job: SyncJobStatus): string {
+  // 准入是后端统一决定的：复用时不再重复抓，用户看到的进度属于那个在途任务。
+  return job.admission === "reused" ? "已有同参数任务在跑，本次请求并入该任务：" : "";
 }
 
 function syncRunningMessage(job: SyncJobStatus): string {
@@ -394,6 +395,9 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     return () => {
       cancelled = true;
     };
+    // 只在挂载/换仓路径时连接：这些 helper 每次渲染都是新闭包，把它们写进依赖
+    // 会让 ensureDataService 反复重跑，整面板状态被反复刷新。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheDir]);
 
   useEffect(() => {
@@ -431,51 +435,36 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
         window.clearTimeout(timer);
       }
     };
+  // applyCoverageDateRange 每次渲染都是新闭包，且它会写下面这四个日期状态：
+  // 把它加进依赖等于让轮询无限重启。这里列出的 state 就是它读到的输入集合。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [service, coverageRefreshToken, onCoverageChange, dateRangeTouched, startDate, endDate]);
 
-  useEffect(() => {
-    const activeSyncJob = syncJob;
-    if (!service || !activeSyncJob || !isSyncRunning(activeSyncJob)) {
-      return;
-    }
-    let cancelled = false;
-    const timer = window.setInterval(() => {
-      void loadSyncJob(service.base_url, activeSyncJob.job_id)
-        .then(async (result) => {
-          if (cancelled) {
-            return;
-          }
-          setSyncJob(result.job);
-          setMessage(
-            isSyncRunning(result.job)
-              ? syncRunningMessage(result.job)
-              : syncFinishedMessage(result.job)
-          );
-          if (!isSyncRunning(result.job)) {
-            // 先同步领取衔接标记再 await：防止区间回调重入时重复启动全市场任务。
-            const shouldChainFullMarket = pendingFullMarketRef.current && result.job.status !== "cancelled";
-            pendingFullMarketRef.current = false;
-            try {
-              await refreshAfterOperation(service);
-            } finally {
-              if (shouldChainFullMarket) {
-                // 衔接 message 只在 startFullMarketSync 返回前可见，随后被新 job 进度覆盖。
-                await runFullMarketSync("fetch", "资金流补齐结束，继续补全全市场缺失数据");
-              }
-            }
-          }
-        })
-        .catch((error: Error) => {
-          if (!cancelled) {
-            setMessage(error.message);
-          }
-        });
-    }, 1000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [service, syncJob?.job_id, syncJob?.status]);
+  useSyncJobPolling({
+    baseUrl: service?.base_url ?? null,
+    job: syncJob,
+    onSnapshot: (job) => {
+      setSyncJob(job);
+      setMessage(isSyncRunning(job) ? syncRunningMessage(job) : syncFinishedMessage(job));
+    },
+    onSettled: async (job) => {
+      if (!service) {
+        return;
+      }
+      // 先同步领取衔接标记再 await：防止区间回调重入时重复启动全市场任务。
+      const shouldChainFullMarket = pendingFullMarketRef.current && job.status !== "cancelled";
+      pendingFullMarketRef.current = false;
+      try {
+        await refreshAfterOperation(service);
+      } finally {
+        if (shouldChainFullMarket) {
+          // 衔接 message 只在 startFullMarketSync 返回前可见，随后被新 job 进度覆盖。
+          await runFullMarketSync("fetch", "资金流补齐结束，继续补全全市场缺失数据");
+        }
+      }
+    },
+    onFailure: (error) => setMessage(error.message)
+  });
 
   const handleRefreshDetails = async () => {
     if (!service) {
@@ -672,7 +661,7 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
       if (result.job) {
         setSyncJob(result.job);
       }
-      setMessage(`缺口补齐已启动：窗口内 ${result.missing_symbols} 只不完整（不扫描全市场）`);
+      setMessage(`${result.job ? reusedPrefix(result.job) : ""}缺口补齐已启动：窗口内 ${result.missing_symbols} 只不完整（不扫描全市场）`);
       if (result.job && !isSyncRunning(result.job)) {
         setMessage(syncFinishedMessage(result.job));
         await refreshAfterOperation(service);
@@ -695,7 +684,7 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
       const result = await startFullMarketSync(service.base_url, startDate, endDate);
       setSyncJob(result.job);
       if (result.job.status === "running") {
-        setMessage(syncRunningMessage(result.job));
+        setMessage(`${reusedPrefix(result.job)}${syncRunningMessage(result.job)}`);
       } else {
         setMessage(syncFinishedMessage(result.job));
         await refreshAfterOperation(service);

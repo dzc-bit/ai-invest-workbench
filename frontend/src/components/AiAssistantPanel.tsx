@@ -1,9 +1,7 @@
-import { memo, useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeSanitize from "rehype-sanitize";
-import remarkGfm from "remark-gfm";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Bot, Download, MessageSquarePlus, Send, Settings2, Sparkles, Square, X } from "lucide-react";
 import {
+  cancelAiChat,
   loadAiConfig,
   loadAiMemories,
   loadAiReportFile,
@@ -73,22 +71,8 @@ const QUICK_PROMPTS: Array<{ label: string; message: string }> = [
   }
 ];
 
-// 插件数组必须是模块级常量：内联字面量每次渲染都是新引用，memo 会直接失效。
-const MARKDOWN_REMARK = [remarkGfm];
-const MARKDOWN_REHYPE = [rehypeSanitize];
-
-// react-markdown@10 的 Markdown() 每次渲染都重建 processor 并同步 parse+run，
-// 自己不做 memo。流式期间每个 token 触发一次 setState，等于把**全部历史轮次**
-// 重解析一遍——回答越长、会话越长就越卡，所以历史与流式块都走这个 memo 组件。
-const MarkdownBlock = memo(function MarkdownBlock({ source }: { source: string }) {
-  return (
-    <div className="ai-markdown">
-      <ReactMarkdown remarkPlugins={MARKDOWN_REMARK} rehypePlugins={MARKDOWN_REHYPE}>
-        {source}
-      </ReactMarkdown>
-    </div>
-  );
-});
+// markdown 栈约 152 KB（raw），只在真的要渲染 AI 消息时才拉。
+const MarkdownBlock = lazy(() => import("./MarkdownBlock"));
 
 function formatSessionTime(value?: string | null): string {
   if (!value) {
@@ -138,6 +122,8 @@ export function AiAssistantPanel({
   const [unseenInsights, setUnseenInsights] = useState(0);
   const [lastStrategy, setLastStrategy] = useState<StrategyConfig | null>(null);
   const [lastChart, setLastChart] = useState<AiChartArtifact | null>(null);
+  // 已通知后台停止、但轮次还没走到安全边界：这是独立状态，不是"还在生成"。
+  const [stopping, setStopping] = useState(false);
   const [reports, setReports] = useState<AiReportMeta[]>([]);
   const [reportBusy, setReportBusy] = useState<string | null>(null);
   const [memories, setMemories] = useState<AiMemoryRecord[]>([]);
@@ -361,6 +347,7 @@ export function AiAssistantPanel({
     setPendingSteps([]);
     setPhase("准备请求");
     setError(null);
+    setStopping(false);
     try {
       // 历史回读结束后才能确定"这是哪条会话的追问"，否则会另开一条空会话。
       if (restoreRef.current) {
@@ -420,6 +407,7 @@ export function AiAssistantPanel({
       if (abortRef.current === controller) {
         abortRef.current = null;
         streamingRef.current = false;
+        setStopping(false);
         if (streamFrameRef.current != null) {
           cancelAnimationFrame(streamFrameRef.current);
           streamFrameRef.current = null;
@@ -438,8 +426,29 @@ export function AiAssistantPanel({
     }
   };
 
-  const stopStreaming = () => {
-    abortRef.current?.abort();
+  const stopStreaming = async () => {
+    const session = sessionIdRef.current;
+    if (!session || !baseUrl) {
+      // 还没拿到会话 id（首轮请求尚未回发 session）：只能断开本地接收，
+      // 后台轮次仍会在自己的边界收尾并保存会话。
+      abortRef.current?.abort();
+      return;
+    }
+    setStopping(true);
+    try {
+      const result = await cancelAiChat(baseUrl, session);
+      if (!result.cancelling) {
+        // 后台已经没有在途轮次（多半刚结束）：直接收流，别再挂着"正在停止"。
+        abortRef.current?.abort();
+      }
+      // 命中在途轮次时**不**断开接收：worker 会在安全边界结束并把终态 result
+      // 送回来，前端因此拿到含停止说明的完整历史，而不是丢掉已生成的部分。
+      // "正在停止"一直保持到这一轮真的结束（sendMessage 的 finally 负责清）。
+    } catch (caught) {
+      setStopping(false);
+      setError(translateAiError(caught));
+      abortRef.current?.abort();
+    }
   };
 
   const downloadReport = async (report: AiReportMeta) => {
@@ -817,7 +826,9 @@ export function AiAssistantPanel({
                 应用到策略工作台
               </button>
             ) : null}
-            <MarkdownBlock source={turn.content} />
+            <Suspense fallback={<div className="ai-markdown">{turn.content}</div>}>
+              <MarkdownBlock source={turn.content} />
+            </Suspense>
           </article>
         ))}
 
@@ -834,7 +845,11 @@ export function AiAssistantPanel({
                 ))}
               </ul>
             ) : null}
-            {streamingText ? <MarkdownBlock source={streamingText} /> : null}
+            {streamingText ? (
+              <Suspense fallback={<div className="ai-markdown">{streamingText}</div>}>
+                <MarkdownBlock source={streamingText} />
+              </Suspense>
+            ) : null}
           </article>
         ) : null}
 
@@ -856,9 +871,15 @@ export function AiAssistantPanel({
             }}
           />
           {streaming ? (
-            <button className="secondary-button" type="button" aria-label="停止生成" onClick={stopStreaming}>
+            <button
+              className="secondary-button"
+              type="button"
+              aria-label={stopping ? "正在停止" : "停止生成"}
+              disabled={stopping}
+              onClick={() => void stopStreaming()}
+            >
               <Square size={15} aria-hidden="true" />
-              停止
+              {stopping ? "正在停止" : "停止"}
             </button>
           ) : (
             <button

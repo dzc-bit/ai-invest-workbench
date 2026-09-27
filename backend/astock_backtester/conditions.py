@@ -248,17 +248,21 @@ def _close_below_ma(node: ConditionNode, row: pd.Series, frame: pd.DataFrame) ->
     return ConditionResult(value < 0, f"close {row['close']:.2f} below MA{window} {row[f'ma_{window}']:.2f}", value)
 
 
-def _turnover_ratio(value: float) -> float:
+def _turnover_ratio(value: float | pd.Series) -> float | pd.Series:
     """Normalize the warehouse's percent-scale ``turnover_rate`` to a fraction.
 
-    ``turnover_rate`` 在仓库里是**百分数量纲**（实测 229 万行：中位数 0.38、最大
-    98.28；``volume / 流通股 × 100`` 恰好等于该列），而条件参数是分数
-    （``{"min": 0.02, "max": 0.08}`` = 换手率 2%~8%）。行级 evaluator 与向量化
-    mask builder 必须共用这一处归一：二者给出相反结论时，engine 的 prefilter
-    （走 MASK）会把行级判定为通过的股票全部提前丢掉，推荐策略的换手率条件会
-    永远筛不出任何股票。
+    ``turnover_rate`` 在仓库里**恒为百分数量纲**（§9：由 ``_apply_turnover_rate``
+    用 ``volume / 流通股 × 100`` 补，实测 229 万行：中位数 0.38、最大 98.28），
+    而条件参数是分数（``{"min": 0.02, "max": 0.08}`` = 换手率 2%~8%）。因此归一
+    是**无条件**的：不能按 ``value > 1`` 猜量纲 —— 真实换手 0.7% 会被当成 70%，
+    0.05% 会被当成 5%，低换手区间的判定与用户意图正好相反。
+
+    行级 evaluator 与向量化 mask builder 必须共用这一处归一（§15-5）：二者给出
+    相反结论时，engine 的 prefilter（走 MASK）会把行级判定为通过的股票全部提前
+    丢掉，推荐策略的换手率条件会永远筛不出任何股票。它同时接受标量与 Series，
+    两套实现因此不可能各自演化。
     """
-    return value / 100.0 if value > 1 else value
+    return value / 100.0
 
 
 def _turnover_between(node: ConditionNode, row: pd.Series, frame: pd.DataFrame) -> ConditionResult:
@@ -425,11 +429,11 @@ def _mask_close_below_ma(node: ConditionNode, data: pd.DataFrame) -> pd.Series:
 
 
 def _mask_turnover_between(node: ConditionNode, data: pd.DataFrame) -> pd.Series:
-    # 与行级 ``_turnover_between`` 共用 ``_turnover_ratio``：百分数 >1 归一到分数。
-    # 不归一时 MASK 会用分数区间去比百分数量纲，prefilter 把候选全部丢掉。
-    values = pd.to_numeric(data["turnover_rate"], errors="coerce")
-    normalized = values.where(values <= 1, values / 100.0)
-    return normalized.between(float(node.params["min"]), float(node.params["max"]), inclusive="both")
+    # 与行级 ``_turnover_between`` 共用同一个 ``_turnover_ratio``（§15-5）：这里
+    # 若另写一份 ``where(values <= 1, values / 100)``，两套实现会各自演化，而
+    # prefilter 走 MASK，漂移的后果是候选被静默丢掉。
+    values = _turnover_ratio(pd.to_numeric(data["turnover_rate"], errors="coerce"))
+    return values.between(float(node.params["min"]), float(node.params["max"]), inclusive="both")
 
 
 def _mask_past_return_at_most(node: ConditionNode, data: pd.DataFrame) -> pd.Series:
@@ -553,5 +557,9 @@ def evaluate_group(
     for node, result in zip(group.conditions, results, strict=True):
         if result.passed:
             score += float(node.weight or 0.0)
-    threshold = float(score_threshold or 0.0)
-    return GroupResult(score >= threshold, reasons, score)
+    if score_threshold is None:
+        # SCORE 组没有阈值就等于"打分但未设通过线"：不能折叠成 0（那样
+        # ``score >= 0`` 对任意结果恒真，用户以为在过滤实际是零过滤）。
+        # 视为未满足，让调用方显式给出阈值。
+        return GroupResult(False, reasons, score)
+    return GroupResult(score >= float(score_threshold), reasons, score)

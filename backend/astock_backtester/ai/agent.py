@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
+from astock_backtester.ai.cancel import CancelToken
 from astock_backtester.ai.context import (
     ContextBudget,
     ToolResult,
@@ -24,12 +25,15 @@ from astock_backtester.ai.context import (
 )
 from astock_backtester.ai.llm_client import ChatModel
 from astock_backtester.ai.prompts import build_compaction_messages, build_final_answer_messages
-from astock_backtester.ai.tools.registry import ToolRegistry
+from astock_backtester.ai.tools.registry import CODE_INTERRUPTED, ToolExecution, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 AgentEvent = dict[str, Any]
 EventHandler = Callable[[AgentEvent], None]
+
+# 停止时只写进展示层的说明：协议消息保留模型原文，不把 UI 提示回灌进后续上下文。
+STOP_NOTE = "（本轮已被你停止：已生成的内容与工具结果都已保存，可重新提问。）"
 
 # 短期窗口按“条数”与“字符数”双阈值控制：只有两者都未超限时才不压缩，
 # 避免每轮工具对话（assistant+tool 消息膨胀很快）都在新问题开始时触发压缩。
@@ -90,12 +94,18 @@ class AgentRunner:
         max_steps: int,
         context: dict[str, Any] | None = None,
         on_event: EventHandler,
+        cancel: CancelToken | None = None,
     ) -> dict[str, Any]:
         """Run one user turn to completion; returns UI artifacts (e.g. a
-        runnable strategy JSON produced by a successful backtest tool call)."""
+        runnable strategy JSON produced by a successful backtest tool call).
+
+        ``cancel`` 是协作停止信号：只在安全边界查询（轮次之间、模型流的 token
+        之间、每个工具启动之前），已经开始的工具会跑完它自己那一步。
+        """
         # 实例属性会把并发运行的两个会话的工件串在一起（A 拿到 B 的回测策略），
         # 所以 artifacts 只活在单次 run 的作用域里。
         artifacts: dict[str, Any] = {}
+        token = cancel if cancel is not None else CancelToken()
         now = datetime.now(UTC).isoformat()
         # 上一次运行可能被中断（客户端断开/进程退出/模型异常），先修复悬空的
         # tool_calls——否则下次请求会被上游 API 以协议错误拒绝，表现为“失忆”。
@@ -114,15 +124,29 @@ class AgentRunner:
         schemas = self._registry.openai_schemas()
 
         for step in range(1, max_steps + 1):
+            if token.cancelled:
+                return self._finish_cancelled(session, artifacts, on_event)
             on_event({"type": "phase", "phase": f"思考中（第 {step}/{max_steps} 步）"})
             messages = self._build_request_messages(session, system_prompt)
             content_parts: list[str] = []
-            for event in self._model.chat(messages, tools=schemas):
-                if event[0] == "text":
-                    content_parts.append(event[1])
-                    on_event({"type": "token", "text": event[1]})
-                    continue
-                turn = event[1]
+            turn: dict[str, Any] = {}
+            # 停止时立刻关掉上游流：连接留在服务端排队会让下一次发送白等。
+            stream = iter(self._model.chat(messages, tools=schemas))
+            try:
+                for event in stream:
+                    if event[0] == "text":
+                        content_parts.append(event[1])
+                        on_event({"type": "token", "text": event[1]})
+                        if token.cancelled:
+                            return self._finish_cancelled(
+                                session, artifacts, on_event, partial="".join(content_parts)
+                            )
+                        continue
+                    turn = event[1]
+            finally:
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    close()
             tool_calls = turn.get("tool_calls")
             assistant_message: dict[str, Any] = {"role": "assistant", "content": turn.get("content")}
             if tool_calls:
@@ -140,7 +164,13 @@ class AgentRunner:
                 session["updated_at"] = datetime.now(UTC).isoformat()
                 return artifacts
 
-            steps = self._execute_tool_calls(session, tool_calls, on_event, artifacts)
+            if token.cancelled:
+                # 这一批一个都不启动，但 assistant(tool_calls) 已经落盘：必须逐条补齐
+                # 配对，否则整条会话会被上游判为协议非法（表现为“失忆”）。
+                self._abandon_tool_calls(session, tool_calls, on_event)
+                return self._finish_cancelled(session, artifacts, on_event)
+
+            steps = self._execute_tool_calls(session, tool_calls, on_event, artifacts, token)
             session["display"].append(
                 {
                     "role": "assistant",
@@ -152,6 +182,8 @@ class AgentRunner:
 
         # 步数耗尽时绝不“空手中断”：强制做一次不带工具的收尾回答，
         # 把已收集的工具结果整理成结论交给用户。
+        if token.cancelled:
+            return self._finish_cancelled(session, artifacts, on_event)
         if self._forced_final_answer(session, system_prompt, on_event):
             return artifacts
         note = "（已达到单次问题的工具调用上限，且收尾回答生成失败；请拆小问题后重试。）"
@@ -160,6 +192,55 @@ class AgentRunner:
         on_event({"type": "phase", "phase": "已达工具调用上限"})
         return artifacts
 
+    # ------------------------------------------------------------- 协作停止
+    def _finish_cancelled(
+        self,
+        session: dict[str, Any],
+        artifacts: dict[str, Any],
+        on_event: EventHandler,
+        *,
+        partial: str = "",
+    ) -> dict[str, Any]:
+        """在安全边界收尾：已生成的部分既留进协议历史也留进展示层。"""
+        timestamp = datetime.now(UTC).isoformat()
+        if partial:
+            # 协议消息保留模型原文，停止说明只进展示层。
+            session["messages"].append({"role": "assistant", "content": partial})
+        session["display"].append(
+            {
+                "role": "assistant",
+                "content": f"{partial}\n\n{STOP_NOTE}" if partial else STOP_NOTE,
+                "tool_steps": [],
+                "ts": timestamp,
+            }
+        )
+        session["updated_at"] = timestamp
+        on_event({"type": "phase", "phase": "已停止"})
+        return artifacts
+
+    def _abandon_tool_calls(
+        self,
+        session: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        on_event: EventHandler,
+    ) -> None:
+        """取消时补齐 assistant(tool_calls) 的配对：一个都不启动，逐条记为中断。"""
+        target = self._session_messages_target(session)
+        for call in tool_calls:
+            parsed = _ToolCall.of(call)
+            target.append(self._interrupted_tool_message(parsed.call_id, parsed.name))
+            on_event(
+                {
+                    "type": "tool_result",
+                    "id": parsed.call_id,
+                    "name": parsed.name,
+                    "ok": False,
+                    "summary": "用户已停止，本次未执行该工具。",
+                    "duration_ms": 0,
+                    "diagnostics": [],
+                }
+            )
+
     # --------------------------------------------------------------- tools
     def _execute_tool_calls(
         self,
@@ -167,14 +248,24 @@ class AgentRunner:
         tool_calls: list[dict[str, Any]],
         on_event: EventHandler,
         artifacts: dict[str, Any],
+        token: CancelToken,
     ) -> list[dict[str, Any]]:
         plans = [_ToolCall.of(call) for call in tool_calls]
         for plan in plans:
             on_event({"type": "tool_call", "id": plan.call_id, "name": plan.name, "args": plan.args})
-        executions = self._invoke(plans)
+        executions = self._invoke(plans, token)
 
         steps: list[dict[str, Any]] = []
         for plan, execution in zip(plans, executions, strict=True):
+            if execution is None:
+                # 取消后未启动的工具：立刻补一条 interrupted 结果，配对不能留到下次修复。
+                execution = ToolExecution(
+                    ok=False,
+                    payload={"ok": False, "error_code": CODE_INTERRUPTED, "error": "用户已停止，未执行该工具。"},
+                    summary="用户已停止，本次未执行该工具。",
+                    duration_ms=0,
+                    code=CODE_INTERRUPTED,
+                )
             self._result_store.put(
                 ToolResult(
                     call_id=plan.call_id,
@@ -244,20 +335,34 @@ class AgentRunner:
             self._session_messages_target(session).append(session_tool)
         return steps
 
-    def _invoke(self, plans: list[_ToolCall]) -> list[Any]:
+    def _invoke(self, plans: list[_ToolCall], token: CancelToken) -> list[Any]:
         """Execute one batch of tool calls, returning results in request order.
 
         Read-only batches fan out on a bounded pool; a batch containing a
         write or a full-frame backtest stays serial, and ordering is what keeps
         the assistant(tool_calls)->tool pairing ``_repair_interrupted_turn``
         relies on intact.
+
+        取消后**不再启动**新工具（槽位返回 ``None``，由调用方写成 interrupted 结
+        果）；已经提交的任务不杀线程，让它跑完自己的安全边界——半途杀线程会
+        留下写到一半的数据分区。
         """
         if len(plans) > 1 and not any(self._must_serialize(plan) for plan in plans):
             with ThreadPoolExecutor(
                 max_workers=min(MAX_PARALLEL_TOOLS, len(plans)), thread_name_prefix="ai-tool"
             ) as pool:
-                return list(pool.map(lambda plan: self._registry.execute(plan.name, plan.arguments), plans))
-        return [self._registry.execute(plan.name, plan.arguments) for plan in plans]
+                futures: list[Any] = [
+                    None if token.cancelled else pool.submit(self._registry.execute, plan.name, plan.arguments)
+                    for plan in plans
+                ]
+                return [None if future is None else future.result() for future in futures]
+        executions: list[Any] = []
+        for plan in plans:
+            if token.cancelled:
+                executions.append(None)
+                continue
+            executions.append(self._registry.execute(plan.name, plan.arguments))
+        return executions
 
     def _untrusted_tool_names(self) -> set[str]:
         """摘要含爬取正文、进上下文前必须套不可信围栏的工具集合。

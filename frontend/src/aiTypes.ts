@@ -306,13 +306,16 @@ export type AiInsightOneshotResult = {
 
 export function translateAiError(error: unknown): string {
   if (error instanceof Error) {
-    if (error.message.includes("ai_not_configured") || error.message.includes("尚未配置")) {
+    // 先按后端稳定码分支：码是契约，message 是给人看的文案，会随措辞变化。
+    const code = (error as Error & { code?: unknown }).code;
+    const message = error.message;
+    if (code === "ai_not_configured" || message.includes("ai_not_configured") || message.includes("尚未配置")) {
       return "AI 服务尚未配置，请点击右上角设置填写 base_url、API Key 和模型名。";
     }
-    if (error.message.includes("ai_session_busy") || error.message.includes("仍在生成中")) {
+    if (code === "ai_session_busy" || message.includes("ai_session_busy") || message.includes("仍在生成中")) {
       return "上一轮回答还在生成中，请等它结束（或点击停止）后再发送。";
     }
-    if (error.message.includes("ai_upstream_error") || error.message.includes("模型服务调用失败")) {
+    if (code === "ai_upstream_error" || message.includes("ai_upstream_error") || message.includes("模型服务调用失败")) {
       // 后端 detail 里带着真正的病因（上下文超长 / 401 / 429 / 超时），
       // 整句换成固定文案等于让用户照着“检查网络”盲猜。
       const detail = error.message

@@ -19,6 +19,15 @@ function blockedReasonOf(trade: Trade): string | null {
   return trade.blocked_reason?.trim() || null;
 }
 
+/** 交易行的身份：与 App 侧的去重口径一致，必须含 buy_signal_date。
+
+ ``symbol-buy_date`` 比去重用的身份粗一档：同一天同一只股票的两笔（例如一笔
+ 被阻断、一笔成交）会撞 key，React 复用错位行。
+ */
+function tradeIdentity(trade: Trade): string {
+  return `${trade.symbol}-${trade.buy_signal_date}-${trade.buy_date}`;
+}
+
 function formatPrice(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value)) {
     return "--";
@@ -122,7 +131,7 @@ export function TradesTable({ trades }: Props) {
                 const isBlockedEvent = trade.shares === 0 && blockedReason != null;
                 const buyReasonText = trade.buy_reason.map(translateReason).join("；");
                 return (
-                  <tr className={isBlockedEvent ? "trade-blocked-row" : undefined} key={`${trade.symbol}-${trade.buy_date}`}>
+                  <tr className={isBlockedEvent ? "trade-blocked-row" : undefined} key={tradeIdentity(trade)}>
                     <td>
                       <strong>{trade.symbol}</strong>
                       {blockedReason ? <div className="trade-status-badge">阻断/延迟</div> : null}

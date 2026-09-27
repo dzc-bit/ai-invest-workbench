@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 
 from astock_backtester.ai import AiService
+from astock_backtester.ai.cancel import CancelToken
 from astock_backtester.ai.errors import AiError
 from astock_backtester.ai.models import AiChatRequest, AiConfigUpdate
 from astock_backtester.ai.optimizer import (
@@ -56,7 +57,7 @@ from astock_backtester.data.providers import (
 )
 from astock_backtester.data.realtime import RealtimeMarketProvider, unavailable_market_snapshot
 from astock_backtester.data.risk import RiskAlertProvider
-from astock_backtester.data.sync import SyncJobManager
+from astock_backtester.data.sync import SyncCapacityError, SyncJobManager
 from astock_backtester.data.warehouse import Warehouse
 from astock_backtester.models import (
     BacktestSettings,
@@ -654,10 +655,17 @@ class DataServiceHandler(BaseHTTPRequestHandler):
             return
         write_lock = Lock()
         stop_heartbeat = Event()
+        # 组合边界的协作停止：心跳线程是"长时间不回写"期间唯一能发现客户端断开
+        # 的地方，发现后置位令牌，让网格在下一个组合边界收手。
+        cancel_token = CancelToken()
 
         def write_event(event: dict[str, Any]) -> None:
             with write_lock:
-                self._write_ndjson(event)
+                try:
+                    self._write_ndjson(event)
+                except ClientDisconnected:
+                    cancel_token.cancel()
+                    raise
 
         def beat() -> None:
             # 网格里单个组合的回测 + AI 解读可以静默几分钟；与 chat 流一样
@@ -667,6 +675,7 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                     with write_lock:
                         self._write_ndjson({"type": "heartbeat"})
                 except ClientDisconnected:
+                    cancel_token.cancel()
                     return
 
         heartbeat_thread: Thread | None = None
@@ -679,7 +688,11 @@ class DataServiceHandler(BaseHTTPRequestHandler):
             if frame.empty:
                 raise LocalDataUnavailable("No cached daily bars found for the optimization range.")
 
-            summary = run_optimization(frame, strategy, settings, grid, write_event)
+            summary = run_optimization(frame, strategy, settings, grid, write_event, cancel=cancel_token)
+            if summary.get("cancelled"):
+                # 客户端已经走了：不再花一次模型调用去解读没人听的网格。
+                self.server.state.log("info", "ai optimize stopped by client disconnect")
+                return
             self._write_ndjson({"type": "phase", "phase": "生成 AI 解读"})
             insight: str | None = None
             insight_error: str | None = None
@@ -1165,6 +1178,13 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 deleted = self.server.state.ai_service().delete_session(session_id)
                 self._send_json({"session_id": session_id, "deleted": deleted})
                 return
+            if self.path == "/ai/chat/cancel":
+                # 断开前端接收不会让 worker 停下来；停止必须显式打到后台轮次上。
+                session_id = str(payload.get("session_id", "")).strip()
+                if not session_id:
+                    raise ValueError("缺少要停止的 session_id。")
+                self._send_json(self.server.state.ai_service().cancel_turn(session_id))
+                return
             if self.path == "/ai/memory/update":
                 memory_id = str(payload.get("id", "")).strip()
                 if not memory_id:
@@ -1233,6 +1253,14 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                 self._run_ai_chat_stream(payload)
                 return
             self._send_json({"code": "not_found", "message": self.path}, HTTPStatus.NOT_FOUND)
+        except SyncCapacityError as exc:
+            # 准入冲突必须是独立稳定码：它要告诉调用方"已有任务在跑"，
+            # 而不是被归进 request_failed 让前端只能显示"请求失败"。
+            self.server.state.log("warning", str(exc))
+            self._send_json(
+                {"code": "sync_capacity", "message": str(exc), "running_jobs": exc.running},
+                HTTPStatus.CONFLICT,
+            )
         except LocalDataUnavailable as exc:
             self.server.state.log("error", str(exc))
             self._send_json({"code": "no_local_data", "message": str(exc)}, HTTPStatus.BAD_REQUEST)

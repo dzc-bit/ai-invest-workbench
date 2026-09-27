@@ -38,6 +38,32 @@ FULL_MARKET_WRITE_LOCK_BACKOFF_SECONDS = 0.5
 # 并容忍缺口边缘的停牌/节假日抖动。窗口本身仍被夹在任务 [start, end] 内。
 MISSING_FETCH_BUFFER_DAYS = 15
 
+# 服务级并发预算：单个作业内部已经有 full_market_workers 线程池与攒批写盘，
+# 两个以上同时跑只会互相抢锁与网络预算，并把 /health 拖慢。
+MAX_CONCURRENT_JOBS = 2
+# 终态作业记录的回收口径：条数上限与保留期满足其一即回收（过期即回收，或
+# 超出条数上限时回收最旧的）；仍被读取（get_job 最近访问过）的记录不参与
+# 回收，否则前端轮询会突然拿到 not_found。
+TERMINAL_JOB_MAX_KEEP = 20
+TERMINAL_JOB_RETENTION_SECONDS = 30 * 60
+JOB_READ_STALE_SECONDS = 5 * 60
+# 在途作业的失活判定：worker 线程崩溃或被卡死时记录会永远停在 running，
+# 而并发预算只按 running/cancelling 计数 —— 两条僵尸就能让所有补数入口永久
+# 409。进度推进会刷新心跳（_mutate/_append_* 都算推进），超过这个时长既没
+# 心跳也没进度推进的在途作业判为失活并按 failed 回收。
+RUNNING_JOB_STALE_SECONDS = 30 * 60
+
+
+class SyncCapacityError(RuntimeError):
+    """服务级并发预算已满：调用方据此告诉用户先等待或取消，而不是静默排队。"""
+
+    def __init__(self, running: list[str], limit: int) -> None:
+        self.running = running
+        self.limit = limit
+        super().__init__(
+            f"已有 {len(running)} 个数据同步任务在跑（上限 {limit}），请等待完成或先取消其中一个。"
+        )
+
 
 def _lifecycle_clipped_required_dates(
     required_dates: set[pd.Timestamp],
@@ -249,11 +275,112 @@ class SyncJobManager:
     full_market_workers: int = 4
     full_market_write_batch_rows: int = 25_000
     capital_flow_batch_size: int = 50
+    max_concurrent_jobs: int = MAX_CONCURRENT_JOBS
 
     def __post_init__(self) -> None:
         self._jobs: dict[str, SyncJobStatus] = {}
         self._cancelled: set[str] = set()
         self._lock = Lock()
+        # job_id -> 归一化签名（模式 + 排序后的股票集 + 有效日期）：在途去重的依据。
+        self._signatures: dict[str, str] = {}
+        self._finished_at: dict[str, float] = {}
+        self._last_read: dict[str, float] = {}
+        # job_id -> 最近一次进度推进的墙钟：在途作业失活判定的依据。
+        self._last_progress_at: dict[str, float] = {}
+
+    @staticmethod
+    def _signature(mode: str, symbols: list[str], start_date: str, end_date: str) -> str:
+        return (
+            f"{mode}|{start_date}|{end_date}|{','.join(sorted({str(symbol) for symbol in symbols}))}"
+        )
+
+    def _reap_stale_running_locked(self, now: float) -> None:
+        """回收失活的在途作业：把永远停在 running 的僵尸判为 failed。
+
+        worker 线程被卡死（跨进程写锁等待、网络挂住）或崩溃前没走到终态时，
+        记录会一直是 running，而并发预算只按 running/cancelling 计数且回收
+        保护在途记录 —— 不回收的话僵尸会占满预算，让所有补数入口永久 409。
+        """
+        for job_id, job in list(self._jobs.items()):
+            if job.status not in ("running", "cancelling"):
+                continue
+            heartbeat = max(self._last_progress_at.get(job_id, 0.0), self._last_read.get(job_id, 0.0))
+            if now - heartbeat < RUNNING_JOB_STALE_SECONDS:
+                continue
+            job.status = "failed"
+            job.current_symbol = None
+            job.last_error = f"作业失活：超过 {RUNNING_JOB_STALE_SECONDS // 60} 分钟没有进度推进，已按失败回收。"
+            job.errors.append(job.last_error)
+            self._finished_at.setdefault(job_id, now)
+            self._cancelled.discard(job_id)
+
+    def _prune_locked(self, now: float) -> None:
+        """回收终态作业记录（含其取消标记），数量与保留期双重上限。
+
+        运行中、取消中以及 ``JOB_READ_STALE_SECONDS`` 内仍被读取的记录一律不动：
+        前端还在轮询的任务被回收会直接变成 ``not_found``。两者满足其一即回收
+        （过期，或超出条数上限保留最新的若干条），不是"两者都满足"。
+        """
+        self._reap_stale_running_locked(now)
+        terminal = sorted(
+            (
+                (self._finished_at.get(job_id, 0.0), job_id)
+                for job_id, job in self._jobs.items()
+                if job.status not in ("running", "cancelling") and job_id in self._finished_at
+            )
+        )
+        for finished_at, job_id in terminal:
+            if now - finished_at >= TERMINAL_JOB_RETENTION_SECONDS:
+                self._drop_locked(job_id, now=now)
+        remaining = [entry for entry in terminal if entry[1] in self._jobs]
+        if len(remaining) > TERMINAL_JOB_MAX_KEEP:
+            for _finished_at, job_id in remaining[:-TERMINAL_JOB_MAX_KEEP]:
+                self._drop_locked(job_id, now=now)
+
+    def _drop_locked(self, job_id: str, *, now: float) -> None:
+        if now - self._last_read.get(job_id, 0.0) < JOB_READ_STALE_SECONDS:
+            return
+        self._jobs.pop(job_id, None)
+        self._signatures.pop(job_id, None)
+        self._finished_at.pop(job_id, None)
+        self._last_read.pop(job_id, None)
+        self._cancelled.discard(job_id)
+
+    def _put_locked(self, status: SyncJobStatus) -> None:
+        self._jobs[status.job_id] = status
+        if status.status in ("running", "cancelling"):
+            self._finished_at.pop(status.job_id, None)
+            # 每次写回都算一次进度推进：作业还在动就不会被判失活。
+            self._last_progress_at[status.job_id] = time.monotonic()
+        else:
+            self._finished_at.setdefault(status.job_id, time.monotonic())
+            self._last_progress_at.pop(status.job_id, None)
+
+    def _admit(self, status: SyncJobStatus, signature: str) -> tuple[SyncJobStatus, bool]:
+        """同签名在途任务直接复用，否则在预算内新建。
+
+        判定与写入必须在同一把锁里完成：两个请求各自"查不到相同任务"再各自建
+        job 就是这个竞态的结果。返回的快照带 ``admission`` 告诉本次调用方发生
+        了什么，存储里的记录保持原样。
+        """
+        with self._lock:
+            now = time.monotonic()
+            self._prune_locked(now)
+            for job_id, existing_signature in self._signatures.items():
+                if existing_signature != signature:
+                    continue
+                existing = self._jobs.get(job_id)
+                if existing is None or existing.status not in ("running", "cancelling"):
+                    continue
+                self._last_read[job_id] = now
+                return existing.model_copy(deep=True, update={"admission": "reused"}), False
+            running = self.running_job_ids_locked()
+            if len(running) >= max(1, self.max_concurrent_jobs):
+                raise SyncCapacityError(running, self.max_concurrent_jobs)
+            self._put_locked(status.model_copy(deep=True))
+            self._signatures[status.job_id] = signature
+            self._last_read[status.job_id] = now
+            return status.model_copy(deep=True, update={"admission": "started"}), True
 
     def run_full_market(self, symbols: list[str], start_date: str, end_date: str) -> SyncJobStatus:
         effective_range = effective_a_share_date_range(start_date, end_date)
@@ -284,6 +411,11 @@ class SyncJobManager:
         return status
 
     def start_full_market(self, symbols: list[str], start_date: str, end_date: str) -> SyncJobStatus:
+        """启动（或复用）一个全市场日线作业。
+
+        去重、并发预算与回收全部走 :meth:`_admit`，因此 HTTP、AI 工具和其它入口
+        共享同一套准入规则；命中同一个在途任务时**不再启动第二个 worker**。
+        """
         effective_range = effective_a_share_date_range(start_date, end_date)
         effective_start_date, effective_end_date = effective_range or (start_date, end_date)
         status = SyncJobStatus(
@@ -294,7 +426,12 @@ class SyncJobManager:
             start_date=date.fromisoformat(effective_start_date),
             end_date=date.fromisoformat(effective_end_date),
         )
-        self._store(status)
+        job, created = self._admit(
+            status,
+            self._signature("full_market_bootstrap", symbols, effective_start_date, effective_end_date),
+        )
+        if not created:
+            return job
         if effective_range is None:
             status.status = "completed"
             status.processed_symbols = len(symbols)
@@ -310,6 +447,7 @@ class SyncJobManager:
         return self.get_job(status.job_id) or status
 
     def start_capital_flow_backfill(self, symbols: list[str], start_date: str, end_date: str) -> SyncJobStatus:
+        """启动（或复用）一个资金流补齐作业，准入规则与全市场同步同源。"""
         effective_range = effective_a_share_date_range(start_date, end_date)
         effective_start_date, effective_end_date = effective_range or (start_date, end_date)
         status = SyncJobStatus(
@@ -320,7 +458,12 @@ class SyncJobManager:
             start_date=date.fromisoformat(effective_start_date),
             end_date=date.fromisoformat(effective_end_date),
         )
-        self._store(status)
+        job, created = self._admit(
+            status,
+            self._signature("capital_flow_backfill", symbols, effective_start_date, effective_end_date),
+        )
+        if not created:
+            return job
         if effective_range is None:
             status.status = "completed"
             status.processed_symbols = len(symbols)
@@ -338,29 +481,44 @@ class SyncJobManager:
     def get_job(self, job_id: str) -> SyncJobStatus | None:
         with self._lock:
             status = self._jobs.get(job_id)
-            return status.model_copy(deep=True) if status else None
+            if status is None:
+                return None
+            # 读一次就等于"还在被用"：回收不能把正在轮询的任务抽走。
+            self._last_read[job_id] = time.monotonic()
+            return status.model_copy(deep=True)
+
+    def running_job_ids_locked(self) -> list[str]:
+        """在途作业 id（已排序）。调用方必须持锁。"""
+        return sorted(
+            job_id for job_id, status in self._jobs.items() if status.status in ("running", "cancelling")
+        )
+
+    def running_job_ids(self) -> list[str]:
+        """当前在途（运行中/取消中）的作业，供预算冲突的诊断与文案使用。"""
+        with self._lock:
+            return self.running_job_ids_locked()
 
     def cancel_job(self, job_id: str) -> SyncJobStatus | None:
         with self._lock:
             status = self._jobs.get(job_id)
             if status is None:
                 return None
+            self._last_read[job_id] = time.monotonic()
             if status.status == "running":
                 status.status = "cancelling"
                 self._cancelled.add(job_id)
-                self._jobs[job_id] = status
             return status.model_copy(deep=True)
 
     def _store(self, status: SyncJobStatus) -> None:
         with self._lock:
-            self._jobs[status.job_id] = status.model_copy(deep=True)
+            self._put_locked(status.model_copy(deep=True))
 
     def _mutate(self, job_id: str, **updates: object) -> None:
         with self._lock:
             status = self._jobs[job_id]
             for key, value in updates.items():
                 setattr(status, key, value)
-            self._jobs[job_id] = status
+            self._put_locked(status)
 
     def _append_error(self, job_id: str, message: str) -> None:
         with self._lock:
@@ -388,6 +546,10 @@ class SyncJobManager:
         try:
             snapshot = self._daily_completeness_snapshot(start_date, end_date)
             self._run_full_market_loop(symbols, start_date, end_date, snapshot, JobStatusSink(self, job_id))
+            # 与资金流作业同口径：取消的作业终态必须是 cancelled，不能被下面的
+            # completed 改写盖掉（循环里已经 flush 过已抓到的帧，数据不丢）。
+            if self._finish_cancelled(job_id):
+                return
             final = self.get_job(job_id)
             if final:
                 final.current_symbol = None
@@ -550,6 +712,8 @@ class SyncJobManager:
             start_date=expected_dates[0],
             end_date=expected_dates[1],
             require_ohlc=True,
+            # 快照只用到这些列：其余列（资金流/名称等）整年解码头是纯浪费。
+            columns=["symbol", "trade_date", *OHLC_COLUMNS, "float_market_cap"],
         )
         if frame.empty or not {"symbol", "trade_date"}.issubset(frame.columns):
             return DailyCompletenessSnapshot(
