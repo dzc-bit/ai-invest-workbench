@@ -1,8 +1,10 @@
-"""AI 投研原语工具：全市场筛选 / 单股事件时间轴 / 持仓感知。
+"""AI 投研原语工具：全市场筛选 / 单股事件时间轴 / 持仓感知与长期记忆管理。
 
-三个工具只复用既有读取路径——条件语义来自 conditions.py 的双注册表
+工具只复用既有读取路径——条件语义来自 conditions.py 的双注册表
 （EVALUATORS + MASK_BUILDERS，AGENTS.md §15-5），数据来自本地仓公共接口，
-跨源爬取复用 astock_data_tools 的既有函数；不新增写工具、不新增爬虫。
+跨源爬取复用 astock_data_tools 的既有函数。数据仓零写入（唯一例外仍是
+update_stock_data 数据补齐）；唯一的非数据仓写路径是 manage_memory
+（AI 自己的记忆仓，与写侧提炼共用同一套拦截与合并语义）。
 """
 
 from __future__ import annotations
@@ -13,6 +15,15 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 from astock_backtester.ai.context import retain_rows
+from astock_backtester.ai.memory import (
+    CATEGORIES as MEMORY_CATEGORIES,
+)
+from astock_backtester.ai.memory import (
+    PROFILE_CATEGORIES as MEMORY_PROFILE_CATEGORIES,
+)
+from astock_backtester.ai.memory import (
+    looks_like_market_fact,
+)
 from astock_backtester.ai.tools.astock_data_tools import (
     fetch_dragon_tiger_records,
     fetch_limit_up_rows,
@@ -20,7 +31,7 @@ from astock_backtester.ai.tools.astock_data_tools import (
     fetch_tencent_quotes,
 )
 from astock_backtester.ai.tools.local_tools import validated_condition_nodes
-from astock_backtester.ai.tools.registry import CODE_BAD_ARGUMENTS, CODE_NO_DATA, AiTool
+from astock_backtester.ai.tools.registry import CODE_BAD_ARGUMENTS, CODE_NO_DATA, CODE_TOOL_ERROR, AiTool
 from astock_backtester.backtest_runner import enrich_for_strategy
 from astock_backtester.conditions import MASK_BUILDERS
 from astock_backtester.data.symbols import normalize_symbol
@@ -421,10 +432,160 @@ def build_memory_tools(memory: MemoryStore) -> list[AiTool]:
             name="my_positions",
             description=(
                 "读取长期记忆中的用户持仓与自选股记录（含备注与更新时间），回答\"我的持仓该不该走\""
-                "类问题前先调用。记忆是用户自述而非行情事实；本工具只读，不写入。"
+                "类问题前先调用。记忆是用户自述而非行情事实；本工具只读，写入用 manage_memory。"
             ),
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             executor=my_positions,
             summarizer=summarize_positions,
         ),
+        _build_manage_memory_tool(memory),
     ]
+
+
+def _build_manage_memory_tool(memory: MemoryStore) -> AiTool:
+    """模型的记忆写入通道：用户陈述持仓/自选/战法变化时当场落库。
+
+    语义与写侧自动提炼（apply_ops）同源——行情数字拦截、同文/同标的合并、
+    类别校验都走同一个实现，避免出现第二套记忆写入规则。delete 走显式删除
+    （id 不存在按 no_data 反馈，让模型改用 list 先拿到 id）。
+    """
+
+    def manage_memory(args: dict[str, Any]) -> dict[str, Any]:
+        op = str(args.get("op", "")).strip().lower()
+        if op == "list":
+            try:
+                records = memory.load()
+            except Exception as exc:  # noqa: BLE001 - 记忆读取失败按无数据返回
+                return {"ok": False, "error_code": CODE_NO_DATA, "error": f"长期记忆读取失败：{exc}"}
+            rows = [
+                {
+                    "id": record.id,
+                    "category": record.category,
+                    "content": record.content[:80],
+                    "weight": record.weight,
+                    "updated_at": str(record.updated_at)[:10],
+                }
+                for record in records
+            ]
+            if not rows:
+                return {"ok": False, "error_code": CODE_NO_DATA, "error": "长期记忆目前是空的。"}
+            return {"ok": True, "rows": rows, "note": "全部记忆条目（含 id），更新/删除时引用 id。"}
+
+        memory_id = str(args.get("id", "")).strip()
+        content = str(args.get("content", "")).strip()
+        category = str(args.get("category", "")).strip()
+        if op == "delete":
+            if not memory_id:
+                return {
+                    "ok": False,
+                    "error_code": CODE_BAD_ARGUMENTS,
+                    "error": "delete 需要提供记录 id（先用 op=list 查到 id）。",
+                }
+            deleted = memory.delete_record(memory_id)
+            if not deleted:
+                return {
+                    "ok": False,
+                    "error_code": CODE_NO_DATA,
+                    "error": f"记忆 {memory_id} 不存在或已删除；用 op=list 核对现有条目。",
+                }
+            return {"ok": True, "note": f"已删除记忆 {memory_id}。"}
+        if op not in ("add", "update"):
+            return {
+                "ok": False,
+                "error_code": CODE_BAD_ARGUMENTS,
+                "error": "op 只支持 list/add/update/delete。",
+            }
+        if op == "update" and not memory_id:
+            return {
+                "ok": False,
+                "error_code": CODE_BAD_ARGUMENTS,
+                "error": "update 需要提供记录 id（先用 op=list 查到 id）。",
+            }
+        if not content:
+            return {
+                "ok": False,
+                "error_code": CODE_BAD_ARGUMENTS,
+                "error": "add/update 需要提供 content（≤60 字，沿用用户原话口径）。",
+            }
+        if op == "add" and category not in MEMORY_CATEGORIES:
+            return {
+                "ok": False,
+                "error_code": CODE_BAD_ARGUMENTS,
+                "error": f"category 必须是 {'/'.join(MEMORY_CATEGORIES)} 之一。",
+            }
+        # 行情数字拦截（与写侧提炼同一口径）：模型生成的内容同样会把过时数字
+        # 当持久事实。update 时按目标记录改后的类别判定（holding 等画像类豁免）。
+        if category not in MEMORY_PROFILE_CATEGORIES and looks_like_market_fact(content):
+            memory.rejected_market_facts += 1
+            return {
+                "ok": False,
+                "error_code": CODE_BAD_ARGUMENTS,
+                "error": (
+                    "该内容像行情数字（价格/涨跌幅/资金流，第二天就过时），记忆只存持久事实；"
+                    "行情数字请用行情工具查询，不要写入记忆。"
+                ),
+            }
+        op_payload: dict[str, Any] = {"op": op, "content": content}
+        if op == "update":
+            op_payload["id"] = memory_id
+            if category:
+                op_payload["category"] = category
+        else:
+            op_payload["category"] = category
+        if args.get("weight") is not None:
+            op_payload["weight"] = args.get("weight")
+        try:
+            applied = memory.apply_ops([op_payload])
+        except Exception as exc:  # noqa: BLE001 - 记忆写失败按工具错误返回
+            return {"ok": False, "error_code": CODE_TOOL_ERROR, "error": f"长期记忆写入失败：{exc}"}
+        if applied == 0:
+            return {
+                "ok": False,
+                "error_code": CODE_TOOL_ERROR,
+                "error": (
+                    "写入没有生效：多数是与现有记忆重复（同内容/同标的同类别会合并），"
+                    "或 update 的 id 不存在。用 op=list 核对后再试。"
+                ),
+            }
+        return {
+            "ok": True,
+            "note": f"长期记忆已{'新增' if op == 'add' else '更新'}：[{category or '原类别'}] {content[:40]}",
+        }
+
+    def summarize_memory_write(payload: dict[str, Any]) -> str:
+        if not payload.get("ok"):
+            return f"记忆写入失败：{payload.get('error')}"
+        if payload.get("rows") is not None:
+            rows = payload["rows"]
+            retained = retain_rows(rows, columns=["id", "category", "content", "updated_at"], max_rows=20)
+            return f"长期记忆全部条目（共 {len(rows)} 条）：\n{retained.text}"
+        return str(payload.get("note") or "长期记忆已更新。")
+
+    return AiTool(
+        name="manage_memory",
+        description=(
+            "管理你的长期记忆（list/add/update/delete）。用户陈述持仓变化（已卖出/止损离场/清仓）、"
+            "自选增减、风险偏好或战法规则变化时，**当场调用本工具落库**，不要只口头确认、"
+            "也不要让用户自己去记忆面板改；下一轮会话才能记住。战法/买卖规则沿用用户原话口径，"
+            "category 用 strategy。行情数字绝不写入（会被拒绝）。add 需 content+category，"
+            "update/delete 需 id（可先 op=list 查）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "description": "list/add/update/delete"},
+                "content": {"type": "string", "description": "记忆内容（add/update 必填，≤60 字）"},
+                "category": {
+                    "type": "string",
+                    "description": "类别：risk_preference/watchlist/holding/style/strategy/fact（add 必填）",
+                },
+                "weight": {"type": "number", "description": "1-3，用户明确强调的战法用 3"},
+                "id": {"type": "string", "description": "记录 id（update/delete 必填，op=list 可查）"},
+            },
+            "required": ["op"],
+            "additionalProperties": False,
+        },
+        executor=manage_memory,
+        summarizer=summarize_memory_write,
+        read_only=False,
+    )

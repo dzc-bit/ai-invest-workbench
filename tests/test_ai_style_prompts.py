@@ -267,6 +267,19 @@ def test_core_rules_require_realtime_first_for_current_market():
         assert "realtime_stock_detail" in block, f"{style} 取证清单缺少实时个股工具"
 
 
+def test_core_rules_subordinate_model_opinion_to_user_strategy():
+    """用户战法优先于模型自身默认观点，且模型要当场用工具维护记忆。
+
+    背景：用户反馈"总需要每个对话重新解释战法"且"agent 太偏于所接模型自身的
+    风格"。锁住两件事：CORE_RULES 必须写死战法优先纪律 + 当场落库要求；
+    manage_memory 工具描述必须引导模型在用户陈述持仓/战法变化时立即写入。
+    """
+    assert "用户战法" in CORE_RULES
+    assert "不得用自己的偏好覆盖用户战法" in CORE_RULES
+    assert "manage_memory" in CORE_RULES
+    assert "不要让用户每个对话重新解释一遍" in CORE_RULES
+
+
 def test_insight_template_has_no_unescaped_json_placeholder_trap():
     """提示词含字面 JSON 时必须 {{ }} 转义（str.format 会把 {\"content\": ...}
     当占位符，项目踩过）。这里直接 format 一遍验证不抛 KeyError/IndexError。"""

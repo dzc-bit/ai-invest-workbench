@@ -825,7 +825,10 @@ def test_research_tools_declare_untrusted_and_read_only():
     assert tools["stock_timeline"].untrusted_body is True
     assert tools["screen_stocks"].untrusted_body is False
     assert tools["my_positions"].untrusted_body is False
-    assert all(tool.read_only for tool in tools.values())
+    # 研究工具全部只读；记忆组里唯一的写工具是 manage_memory（AI 自己的记忆仓，
+    # 不碰数据仓），read_only=False 让它按 registry 单一事实来源自动串行。
+    assert all(tool.read_only for name, tool in tools.items() if name != "manage_memory")
+    assert tools["manage_memory"].read_only is False
 
 
 def test_frontend_mock_status_lists_every_registered_tool():
@@ -870,3 +873,81 @@ def test_frontend_mock_status_lists_every_registered_tool():
     assert mock_names == registered, (
         f"前端 mock 工具清单漂移：缺 {sorted(registered - mock_names)}，多 {sorted(mock_names - registered)}"
     )
+
+
+def _memory_tool_registry(tmp_path):
+    from astock_backtester.ai.memory import MemoryStore
+    from astock_backtester.ai.tools.research_tools import build_memory_tools
+
+    store = MemoryStore(tmp_path)
+    registry = ToolRegistry()
+    registry.register_all(build_memory_tools(store))
+    return registry, store
+
+
+def test_manage_memory_tool_roundtrip(tmp_path):
+    """模型的记忆管理通道：list/add/update/delete 走治理级 MemoryStore。"""
+    import json
+
+    registry, store = _memory_tool_registry(tmp_path)
+
+    added = registry.execute("manage_memory", '{"op": "add", "content": "只做首板，断板就走", "category": "strategy", "weight": 3}')
+    assert added.ok is True, added.summary
+
+    listing = registry.execute("manage_memory", '{"op": "list"}')
+    assert listing.ok is True and len(listing.payload["rows"]) == 1
+    memory_id = listing.payload["rows"][0]["id"]
+
+    updated = registry.execute("manage_memory", json.dumps({"op": "update", "id": memory_id, "content": "只做首板，断板走一半"}))
+    assert updated.ok is True, updated.summary
+    assert store.load()[0].content == "只做首板，断板走一半"
+
+    deleted = registry.execute("manage_memory", json.dumps({"op": "delete", "id": memory_id}))
+    assert deleted.ok is True, deleted.summary
+    assert store.load() == []
+    # 删空后再 list 是"没数据"，不是工具故障
+    empty = registry.execute("manage_memory", '{"op": "list"}')
+    assert empty.ok is False and empty.code == "no_data"
+
+
+def test_manage_memory_rejects_market_numbers_like_the_daemon_path(tmp_path):
+    """模型写记忆与写侧提炼同一拦截口径：行情数字不是持久事实。"""
+    registry, store = _memory_tool_registry(tmp_path)
+
+    rejected = registry.execute("manage_memory", '{"op": "add", "content": "主力净流出 4.44 亿", "category": "fact"}')
+    assert rejected.ok is False and rejected.code == "bad_arguments"
+    assert store.load() == []
+    assert store.rejected_market_facts == 1
+
+    # 画像类豁免：持仓变化自带价格语境（止损离场），必须能写——这正是
+    # "通鼎互联已止损离场，不是持仓了"该当场落库的场景。
+    allowed = registry.execute("manage_memory", '{"op": "add", "content": "通鼎互联已止损离场，当前空仓", "category": "holding"}')
+    assert allowed.ok is True, allowed.summary
+
+
+def test_manage_memory_validates_arguments(tmp_path):
+    registry, _store = _memory_tool_registry(tmp_path)
+
+    bad_category = registry.execute("manage_memory", '{"op": "add", "content": "x", "category": "不存在"}')
+    assert bad_category.ok is False and bad_category.code == "bad_arguments"
+
+    update_without_id = registry.execute("manage_memory", '{"op": "update", "content": "x"}')
+    assert update_without_id.ok is False and update_without_id.code == "bad_arguments"
+
+    delete_unknown = registry.execute("manage_memory", '{"op": "delete", "id": "ghost"}')
+    assert delete_unknown.ok is False and delete_unknown.code == "no_data"
+
+    bad_op = registry.execute("manage_memory", '{"op": "merge"}')
+    assert bad_op.ok is False and bad_op.code == "bad_arguments"
+
+
+def test_manage_memory_is_serial_and_positions_tool_mentions_it(tmp_path):
+    from astock_backtester.ai.memory import MemoryStore
+    from astock_backtester.ai.tools.research_tools import build_memory_tools
+
+    registry = ToolRegistry()
+    registry.register_all(build_memory_tools(MemoryStore(tmp_path)))
+    tool = registry.get("manage_memory")
+    assert tool is not None and tool.read_only is False, "写记忆工具必须串行（read_only=False）"
+    positions = registry.get("my_positions")
+    assert positions is not None and "manage_memory" in positions.description

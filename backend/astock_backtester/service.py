@@ -1185,6 +1185,17 @@ class DataServiceHandler(BaseHTTPRequestHandler):
                     raise ValueError("缺少要停止的 session_id。")
                 self._send_json(self.server.state.ai_service().cancel_turn(session_id))
                 return
+            if self.path == "/ai/memory/create":
+                # 用户/模型显式新增记忆（治理面板录入 / manage_memory 工具均落到
+                # MemoryStore.create_record；显式路径不做行情数字静默拦截）。
+                self._send_json(
+                    self.server.state.ai_service().create_memory(
+                        content=str(payload.get("content", "")),
+                        category=str(payload.get("category", "")),
+                        weight=payload.get("weight"),
+                    )
+                )
+                return
             if self.path == "/ai/memory/update":
                 memory_id = str(payload.get("id", "")).strip()
                 if not memory_id:

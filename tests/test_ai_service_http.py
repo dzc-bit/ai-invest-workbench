@@ -780,3 +780,31 @@ def test_ai_chat_stream_timeout_does_not_unlock_other_holder(tmp_path, monkeypat
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_ai_memory_create_route_roundtrip(tmp_path):
+    """治理路由第四条：显式新增记忆落库并可读取（战法手动录入的闭环）。"""
+    server, thread, port = _start_server(tmp_path)
+    try:
+        created = _request_json(
+            "POST",
+            f"http://127.0.0.1:{port}/ai/memory/create",
+            {"content": "只做放量突破首板，断板就走", "category": "strategy", "weight": 3},
+        )
+        assert created["ok"] is True
+        assert created["category"] == "strategy" and created["weight"] == 3
+
+        items = _request_json("GET", f"http://127.0.0.1:{port}/ai/memories")["items"]
+        assert [item["id"] for item in items] == [created["id"]]
+
+        # 校验失败带稳定码（validation_error），不落库
+        status, body = _request_json_allow_error(
+            "POST",
+            f"http://127.0.0.1:{port}/ai/memory/create",
+            {"content": "x", "category": "不存在"},
+        )
+        assert status == 400 and body["code"] == "validation_error"
+        assert _request_json("GET", f"http://127.0.0.1:{port}/ai/memories")["items"][0]["id"] == created["id"]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)

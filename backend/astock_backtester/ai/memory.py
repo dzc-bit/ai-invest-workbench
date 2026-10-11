@@ -35,6 +35,9 @@ MAX_CONTENT_CHARS = 160
 PROFILE_LIMIT = 5
 FACTS_LIMIT = 10
 FACTS_BUDGET_CHARS = 1_400
+# 战法库（strategy 类）置顶注入的独立预算：战法是用户既定的交易规则，
+# 不与其他记忆抢召回名额；条目通常很少，900 字足够放十几条战法。
+STRATEGY_BUDGET_CHARS = 900
 # hit-boost 必须封顶：注入集合本身是"当前 top-N"，不封顶就成自反馈——
 # 只要进过一次就永远加分，约 44 轮后新记忆再也挤不进注入集，
 # "越用越准"变成"越用越固化"。
@@ -46,6 +49,9 @@ MAX_HITS_FOR_RECALL = 12
 
 CATEGORIES = ("risk_preference", "watchlist", "holding", "style", "strategy", "fact")
 PROFILE_CATEGORIES = ("risk_preference", "style", "holding")
+# 战法类：用户既定的交易规则/选股口径/仓位纪律。召回时**置顶**独立注入，
+# 不参与 facts 的召回评分竞争——"越用越了解用户的战法"靠的是它每次都在场。
+STRATEGY_CATEGORY = "strategy"
 VALID_OPS = ("add", "update", "delete")
 # 中国无夏令时，固定 +08:00 即可（与 facade.BEIJING_TZ 同口径；不用 zoneinfo 是
 # 因为 Windows 上它依赖 tzdata 包会抛 ZoneInfoNotFoundError）。
@@ -62,7 +68,9 @@ MEMORY_OPS_PROMPT = """你是用户记忆管理员。根据“最新对话”维
 规则：
 - 只产出 ≤4 条操作；与现有记忆重复或矛盾时用 update（带上原 id）修正，过时/作废的用 delete。
 - add/update 的 content ≤60 字；category 从 risk_preference(风险偏好)/watchlist(关注标的)/holding(持仓)\
-/style(交易风格)/strategy(常用策略参数)/fact(其他事实) 中选。
+/style(交易风格)/strategy(用户战法：买卖规则、选股口径、仓位纪律)/fact(其他事实) 中选。
+- 用户陈述自己的战法、买卖规则、选股条件、仓位纪律（如“我只做首板，断板就走”“回调到20日线买”）时\
+归 strategy 类，**尽量沿用用户的原话口径**，不要改写成你的通用术语——strategy 类会置顶注入之后每一次对话。
 - weight 1-3：3=用户明确强调（如“我只做低估值”），2=明确陈述，1=顺带提及。
 - 用户表明风险偏好、交易风格、加减仓习惯的变化时必须更新。
 - 时间性事实（某日买卖、某日的判断）必须带上绝对日期，否则以后无法判断是否过时。
@@ -265,6 +273,38 @@ class MemoryStore:
         return None
 
     # --------------------------------------------------- explicit user ops
+    def create_record(self, *, content: str, category: str, weight: float = 2.0) -> MemoryRecord:
+        """显式新增一条记忆（用户在治理面板录入 / 模型经 manage_memory 工具写入）。
+
+        与写侧自动提炼（apply_ops）分离：**不做**同文/同标的合并（用户点"新增"
+        就该新增，重复了可以自己删）、**不做**行情数字拦截的静默丢弃——调用方
+        （模型工具路径）自行预检并给出可读反馈。类别、权重与内容长度仍校验。
+        """
+        text = str(content).strip()[:MAX_CONTENT_CHARS]
+        if not text:
+            raise ValueError("记忆内容不能为空。")
+        if category not in CATEGORIES:
+            raise ValueError(f"未知记忆类别：{category}")
+        try:
+            clamped_weight = min(3.0, max(1.0, float(weight)))
+        except (TypeError, ValueError):
+            clamped_weight = 2.0
+        with self._lock:
+            records = self.load()
+            now = _now_iso()
+            record = MemoryRecord(
+                id=uuid4().hex[:12],
+                content=text,
+                category=category,
+                created_at=now,
+                updated_at=now,
+                weight=clamped_weight,
+            )
+            records.append(record)
+            records.sort(key=lambda item: item.updated_at, reverse=True)
+            self.save(records[:MAX_RECORDS])
+            return record
+
     def update_record(
         self,
         memory_id: str,
@@ -335,21 +375,39 @@ class MemoryStore:
         *,
         profile_limit: int = PROFILE_LIMIT,
         facts_limit: int = FACTS_LIMIT,
-    ) -> tuple[str, str, list[str]]:
-        """Return ``(profile_block, facts_block, injected_ids)`` in one pass.
+    ) -> tuple[str, str, str, list[str]]:
+        """Return ``(strategy_block, profile_block, facts_block, injected_ids)`` in one pass.
 
         拆分过的 ``profile_context``/``facts_context`` 各自排序一次，无法知道
         "这次到底注入了哪几条"，hit-boost 因此无从累计——合并成一次召回，
         由调用方把 ``injected_ids`` 交给 :meth:`bump_hits`。
 
-        事实段按**整行**累加预算：被预算挡住的记录不会进入 ``injected_ids``，
-        否则"没真正进上下文"的记忆也会被 hit-boost 加成（会与召回排序形成
-        正反馈）。行内 ``content[:MAX_CONTENT_CHARS]`` 只作用于单条已定长字段。
+        战法库（strategy 类）**置顶**独立注入：它是用户既定的交易规则，不参与
+        facts 的召回评分竞争（"每条对话都要重新解释一遍战法"的解药就是它每次
+        都在场）。事实段按**整行**累加预算：被预算挡住的记录不会进入
+        ``injected_ids``，否则"没真正进上下文"的记忆也会被 hit-boost 加成
+        （会与召回排序形成正反馈）。行内 ``content[:MAX_CONTENT_CHARS]`` 只作用
+        于单条已定长字段。
         """
         ranked = self._ranked()
         labels = {"risk_preference": "风险偏好", "style": "交易风格", "holding": "持仓/关注"}
+        strategy_lines: list[str] = []
+        kept_strategy: list[MemoryRecord] = []
+        used = 0
+        for record in (item for item in ranked if item.category == STRATEGY_CATEGORY):
+            line = f"- {record.content[:MAX_CONTENT_CHARS]}"
+            cost = len(line) + (1 if strategy_lines else 0)
+            if used + cost > STRATEGY_BUDGET_CHARS:
+                break
+            strategy_lines.append(line)
+            kept_strategy.append(record)
+            used += cost
         profile_records = [record for record in ranked if record.category in PROFILE_CATEGORIES][:profile_limit]
-        fact_records = [record for record in ranked if record.category not in PROFILE_CATEGORIES][:facts_limit]
+        fact_records = [
+            record
+            for record in ranked
+            if record.category not in PROFILE_CATEGORIES and record.category != STRATEGY_CATEGORY
+        ][:facts_limit]
         profile_lines = [
             f"- {labels.get(record.category, record.category)}：{record.content[:MAX_CONTENT_CHARS]}"
             for record in profile_records
@@ -365,15 +423,19 @@ class MemoryStore:
             fact_lines.append(line)
             kept_facts.append(record)
             used += cost
-        injected_ids = [record.id for record in (*profile_records, *kept_facts)]
-        return "\n".join(profile_lines), "\n".join(fact_lines), injected_ids
+        injected_ids = [record.id for record in (*kept_strategy, *profile_records, *kept_facts)]
+        return "\n".join(strategy_lines), "\n".join(profile_lines), "\n".join(fact_lines), injected_ids
+
+    def strategy_context(self) -> str:
+        """用户战法库：既定交易规则，每次对话置顶注入。"""
+        return self.recall()[0]
 
     def profile_context(self) -> str:
         """用户画像：风险偏好 / 交易风格 / 持仓——最"懂你"的部分。"""
-        return self.recall()[0]
+        return self.recall()[1]
 
     def facts_context(self) -> str:
-        return self.recall()[1]
+        return self.recall()[2]
 
     def count(self) -> int:
         return len(self.load())

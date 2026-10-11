@@ -84,7 +84,7 @@ extend or amend this file when the system needs to grow.
 | `--space-6` | 24px | 大区块分隔 |
 
 ## Layout
-抽屉宽度：`--drawer-width: 480px`（AI 抽屉的唯一宽度声明，窄屏由 `min(…, 100vw)` 收口）。
+抽屉宽度：`--drawer-width: 560px`（AI 抽屉的唯一宽度声明，窄屏由 `min(…, 100vw)` 收口；1.6.1 由 480px 加宽，容纳对话与记忆面板）。
 
 ## Radius
 `--radius-s: 6px` · `--radius-m: 8px` · `--radius-l: 12px` · `--radius-xl: 16px` · `--radius-pill: 999px`。

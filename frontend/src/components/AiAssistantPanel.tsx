@@ -9,6 +9,7 @@ import {
   loadAiSession,
   loadAiSessions,
   loadAiStatus,
+  createAiMemory,
   deleteAiMemory,
   revealAiKey,
   runAiChatStream,
@@ -131,16 +132,24 @@ export function AiAssistantPanel({
   const [memoryBusy, setMemoryBusy] = useState<string | null>(null);
   const [editingMemory, setEditingMemory] = useState<string | null>(null);
   const [editingContent, setEditingContent] = useState("");
+  const [newMemoryContent, setNewMemoryContent] = useState("");
+  const [newMemoryCategory, setNewMemoryCategory] = useState("strategy");
+  const [creatingMemory, setCreatingMemory] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const streamingRef = useRef(false);
   const pendingTaskRef = useRef<AiTask | null>(null);
   const streamingTextRef = useRef("");
+  // 当前会话是否有内容的同步真相：会话恢复 effect 读 state 会拿到旧值。
+  const turnsRef = useRef<AiDisplayTurn[]>([]);
+  turnsRef.current = turns;
   // 当前会话 id 的同步真相：sendMessage 常在 effect 闭包里执行，读 state 会拿到旧值。
   const sessionIdRef = useRef<string | null>(null);
   // 历史回读未完成前不允许开新一轮，否则会带着空 session_id 开出第二条会话。
   const restoreRef = useRef<Promise<void> | null>(null);
-  const restoredRef = useRef(false);
+  // 每次打开抽屉都要重新尝试恢复：上一次打开时的失败（服务未就绪）不该让
+  // 本次打开也拿不到最新会话。
+  const restoredForOpenRef = useRef(false);
   // 分片可能比一帧还密：合帧 setState，避免流式块被重解析几十次。
   const streamFrameRef = useRef<number | null>(null);
 
@@ -182,17 +191,24 @@ export function AiAssistantPanel({
   }, [open, baseUrl, view, onInsightsShown]);
 
   useEffect(() => {
-    if (!open || !baseUrl || restoredRef.current) {
+    if (!open) {
+      // 关抽屉重置恢复标记：下次打开重新拉会话列表并尝试续上最新会话。
+      restoredForOpenRef.current = false;
       return;
     }
-    restoredRef.current = true;
+    if (!baseUrl || restoredForOpenRef.current) {
+      return;
+    }
+    restoredForOpenRef.current = true;
     const restore = async () => {
       try {
         const list = await loadAiSessions(baseUrl);
         const history = list.items.filter((item) => item.message_count > 0);
         setSessions(history);
         const latest = history[0];
-        if (!latest || sessionIdRef.current) {
+        // 当前会话已有内容（正在聊/从历史选过）就不打断；空会话（新建过、
+        // 或上次恢复失败）才自动续上最新一条。
+        if (!latest || (sessionIdRef.current && turnsRef.current.length > 0)) {
           return;
         }
         const detail = await loadAiSession(baseUrl, latest.session_id);
@@ -203,7 +219,8 @@ export function AiAssistantPanel({
         setSessionId(detail.session_id);
         setTurns(detail.display);
       } catch {
-        // 回读失败不影响开新对话：服务未就绪或会话已被清理时从空白开始即可。
+        // 回读失败不影响开新对话：服务未就绪或会话已被清理时从空白开始，
+        // 下次打开抽屉会重新尝试（restoredForOpenRef 随关闭重置）。
       }
     };
     restoreRef.current = restore();
@@ -474,6 +491,22 @@ export function AiAssistantPanel({
     }
   };
 
+  const submitNewMemory = async () => {
+    if (!baseUrl || !newMemoryContent.trim()) {
+      return;
+    }
+    setCreatingMemory(true);
+    try {
+      const record = await createAiMemory(baseUrl, { content: newMemoryContent.trim(), category: newMemoryCategory });
+      setMemories((prev) => [record, ...prev]);
+      setNewMemoryContent("");
+    } catch (caught) {
+      setError(translateAiError(caught));
+    } finally {
+      setCreatingMemory(false);
+    }
+  };
+
   const saveMemoryEdit = async (record: AiMemoryRecord) => {
     if (!baseUrl) {
       return;
@@ -706,8 +739,43 @@ export function AiAssistantPanel({
 
       {view === "memories" ? (
         <section className="ai-panel-view" aria-label="长期记忆面板">
-          <p className="ai-memory-note">记忆是 AI 从对话里沉淀的用户自述，可以修改或删除；行情数字由写侧自动拦截，不会入记忆。</p>
+          <p className="ai-memory-note">
+            记忆是 AI 从对话里沉淀的用户自述，可以修改或删除；行情数字由写侧自动拦截，不会入记忆。
+            战法（strategy 类）会置顶注入每一次对话，AI 也会在对话中用 manage_memory 工具自行维护。
+          </p>
           {memoriesNote ? <p className="ai-memory-note">{memoriesNote}</p> : null}
+          <div className="ai-memory-create">
+            <select
+              aria-label="新增记忆类别"
+              value={newMemoryCategory}
+              onChange={(event) => setNewMemoryCategory(event.target.value)}
+            >
+              {Object.entries(AI_MEMORY_CATEGORY_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <input
+              aria-label="新增记忆内容"
+              placeholder="把战法写进来，例如：只做首板，断板就走"
+              value={newMemoryContent}
+              onChange={(event) => setNewMemoryContent(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && newMemoryContent.trim() && !creatingMemory) {
+                  void submitNewMemory();
+                }
+              }}
+            />
+            <button
+              className="ai-reveal-button"
+              type="button"
+              disabled={creatingMemory || !newMemoryContent.trim()}
+              onClick={() => void submitNewMemory()}
+            >
+              {creatingMemory ? "新增中" : "新增"}
+            </button>
+          </div>
           {memories.length > 0 ? (
             <ul>
               {memories.map((record) => (

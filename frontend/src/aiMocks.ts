@@ -43,6 +43,7 @@ export function mockAiStatus(): AiStatus {
       "screen_stocks",
       "stock_timeline",
       "my_positions",
+      "manage_memory",
       "read_tool_result",
       "retrieve_knowledge",
       "latest_market_digest"

@@ -148,6 +148,18 @@ describe("AI 抽屉横向溢出（CSS 契约）", () => {
   it("快讯条目允许长 URL 换行", () => {
     expect(declarationsFor(panelCss, ".ai-insight span")).toMatch(/overflow-wrap: anywhere/);
   });
+
+  it("研究风格卡片按钮必须恢复换行（全局 button 的 nowrap 不许泄漏进多行卡片）", () => {
+    // styles.css 的全局 button 规则按单行标签惯例写了 white-space:nowrap；
+    // .ai-style-option 是多行卡片（标题+描述+例句），继承 nowrap 会让长中文
+    // 描述一行撑爆卡片与弹窗（实测描述 span 一行 ≈742px，卡片仅 495px）。
+    expect(declarationsFor(panelCss, ".ai-style-option")).toMatch(/white-space: normal/);
+  });
+
+  it("AI 设置弹窗不得留下横向滚动面", () => {
+    // 与 .ai-messages 同一条红线：只写 overflow-y 时另一轴被规范推成 auto。
+    expect(declarationsFor(panelCss, ".ai-settings-modal")).toMatch(/overflow-x: hidden/);
+  });
 });
 
 describe("AI 抽屉横向溢出（渲染结构）", () => {

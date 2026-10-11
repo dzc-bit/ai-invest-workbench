@@ -15,10 +15,24 @@ vi.mock("../aiApi", () => ({
   loadAiReports: vi.fn(),
   loadAiReportFile: vi.fn(),
   loadAiSessions: vi.fn(),
-  loadAiSession: vi.fn()
+  loadAiSession: vi.fn(),
+  loadAiMemories: vi.fn(),
+  createAiMemory: vi.fn(),
+  updateAiMemory: vi.fn(),
+  deleteAiMemory: vi.fn()
 }));
 
-import { loadAiReportFile, loadAiReports, loadAiSession, loadAiSessions, loadAiStatus, cancelAiChat, runAiChatStream } from "../aiApi";
+import {
+  createAiMemory,
+  loadAiMemories,
+  loadAiReportFile,
+  loadAiReports,
+  loadAiSession,
+  loadAiSessions,
+  loadAiStatus,
+  cancelAiChat,
+  runAiChatStream
+} from "../aiApi";
 
 const mockedCancelChat = vi.mocked(cancelAiChat);
 
@@ -28,6 +42,8 @@ const mockedLoadReports = vi.mocked(loadAiReports);
 const mockedLoadReportFile = vi.mocked(loadAiReportFile);
 const mockedLoadSessions = vi.mocked(loadAiSessions);
 const mockedLoadSession = vi.mocked(loadAiSession);
+const mockedLoadMemories = vi.mocked(loadAiMemories);
+const mockedCreateMemory = vi.mocked(createAiMemory);
 
 const configuredStatus = {
   configured: true,
@@ -338,6 +354,89 @@ describe("AiAssistantPanel", () => {
     expect(mockedLoadSession).toHaveBeenCalledWith("http://x", "s-1");
     // 会话数徽标在切换条上，不再是常驻的折叠块标题。
     expect(await screen.findByRole("tab", { name: /历史（1）/ })).toBeTruthy();
+  });
+
+  it("retries session restore on the next open after a failed attempt", async () => {
+    // 首次打开时服务未就绪：回读失败被吞掉，但绝不能把"本次启动永远恢复不了"固定下来。
+    mockedLoadSessions.mockRejectedValueOnce(new Error("service not ready"));
+    const view = render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    await screen.findByPlaceholderText(/帮我看看 600519/);
+    expect(mockedLoadSession).not.toHaveBeenCalled();
+
+    mockedLoadSessions.mockResolvedValue({
+      items: [{ session_id: "s-1", title: "600519 诊断", updated_at: "2026-09-18T10:00:00Z", message_count: 2 }]
+    });
+    mockedLoadSession.mockResolvedValue({
+      session_id: "s-1",
+      title: "600519 诊断",
+      display: [
+        { role: "user", content: "帮我看看 600519" },
+        { role: "assistant", content: "茅台近 30 日 +5.2%。" }
+      ]
+    });
+    // 关闭再打开（同一实例保持挂载，与桌面端 App 的行为一致）
+    view.rerender(
+      <AiAssistantPanel open={false} baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    view.rerender(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    expect(await screen.findByText(/茅台近 30 日/)).toBeTruthy();
+    expect(mockedLoadSession).toHaveBeenCalledWith("http://x", "s-1");
+  });
+
+  it("resumes the latest conversation again when reopening with an empty new chat", async () => {
+    const user = userEvent.setup();
+    mockedLoadSessions.mockResolvedValue({
+      items: [{ session_id: "s-1", title: "600519 诊断", updated_at: "2026-09-18T10:00:00Z", message_count: 2 }]
+    });
+    mockedLoadSession.mockResolvedValue({
+      session_id: "s-1",
+      title: "600519 诊断",
+      display: [
+        { role: "user", content: "帮我看看 600519" },
+        { role: "assistant", content: "茅台近 30 日 +5.2%。" }
+      ]
+    });
+    const view = render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    await screen.findByText(/茅台近 30 日/);
+    // 新建空会话后关抽屉：重开必须重新自动续上最新会话，而不是停在空对话。
+    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    expect(screen.queryByText(/茅台近 30 日/)).toBeNull();
+    view.rerender(
+      <AiAssistantPanel open={false} baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    view.rerender(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    expect(await screen.findByText(/茅台近 30 日/)).toBeTruthy();
+    expect(mockedLoadSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("adds a memory from the create form and shows it in the list", async () => {
+    const user = userEvent.setup();
+    mockedLoadMemories.mockResolvedValue({ items: [], rejected_market_facts_total: 0 });
+    mockedCreateMemory.mockResolvedValue({
+      id: "m-new",
+      category: "strategy",
+      content: "只做放量突破首板，断板就走",
+      weight: 2,
+      hits: 0,
+      created_at: "2026-10-11T09:00:00+00:00",
+      updated_at: "2026-10-11T09:00:00+00:00"
+    });
+    render(
+      <AiAssistantPanel open baseUrl="http://x" insights={[]} task={null} onTaskConsumed={() => undefined} onClose={() => undefined} />
+    );
+    await user.click(await screen.findByRole("tab", { name: "记忆" }));
+    await user.type(await screen.findByLabelText("新增记忆内容"), "只做放量突破首板，断板就走");
+    await user.click(screen.getByRole("button", { name: "新增" }));
+    expect(await screen.findByText(/只做放量突破首板/)).toBeTruthy();
+    expect(mockedCreateMemory).toHaveBeenCalledWith("http://x", { content: "只做放量突破首板，断板就走", category: "strategy" });
   });
 
   it("keeps follow-ups inside the restored session so the agent keeps its history", async () => {

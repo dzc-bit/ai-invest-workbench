@@ -200,7 +200,7 @@ export const AI_MEMORY_CATEGORY_LABELS: Record<string, string> = {
   watchlist: "关注标的",
   holding: "持仓",
   style: "交易风格",
-  strategy: "策略参数",
+  strategy: "战法",
   fact: "其他事实"
 };
 

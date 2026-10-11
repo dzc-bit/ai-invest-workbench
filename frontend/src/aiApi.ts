@@ -12,6 +12,7 @@ import type {
   AiInsightOneshotResult,
   AiInsightScene,
   AiMemoriesResponse,
+  AiMemoryRecord,
   AiNewsDigest,
   AiOverfitResult,
   AiReportsResponse,
@@ -215,6 +216,25 @@ export async function loadAiMemories(baseUrl: string): Promise<AiMemoriesRespons
     return { items: [], rejected_market_facts_total: 0 };
   }
   return aiGetJson<AiMemoriesResponse>(baseUrl, "/ai/memories", "长期记忆列表读取失败");
+}
+
+export async function createAiMemory(
+  baseUrl: string,
+  payload: { content: string; category: string; weight?: number }
+): Promise<AiMemoryRecord> {
+  if (!isTauriRuntime()) {
+    const now = new Date().toISOString();
+    return {
+      id: `preview-memory-${now}`,
+      category: payload.category,
+      content: payload.content,
+      weight: payload.weight ?? 2,
+      hits: 0,
+      created_at: now,
+      updated_at: now
+    };
+  }
+  return aiPostJson<AiMemoryRecord>(baseUrl, "/ai/memory/create", payload as Record<string, unknown>, "记忆新增失败");
 }
 
 export async function updateAiMemory(

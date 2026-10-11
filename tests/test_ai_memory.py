@@ -103,8 +103,31 @@ def test_profile_and_facts_context_split(tmp_path):
     profile = store.profile_context()
     assert "风险偏好" in profile and "交易风格" in profile
     assert "watchlist" not in profile
+    # 战法（strategy）不再混进事实段：它有独立的置顶注入通道
     facts = store.facts_context()
-    assert "[watchlist]" in facts and "[strategy]" in facts
+    assert "[watchlist]" in facts and "[strategy]" not in facts
+    strategy = store.strategy_context()
+    assert "最大持仓 5 只" in strategy
+
+
+def test_strategy_memories_are_pinned_regardless_of_recall_score(tmp_path):
+    """战法库置顶注入：不与事实记忆抢召回评分，也不被事实字符预算挤掉。
+
+    "每个对话都要重新解释一遍战法"的解药就是战法每次都在场——哪怕它很旧、
+    hits 为 0，而事实记忆又多到把 1400 字预算占满。
+    """
+    store = MemoryStore(tmp_path)
+    strategy_op = {"op": "add", "content": "只做首板，断板就走，仓位单票不超过三成", "category": "strategy", "weight": 3}
+    store.apply_ops([strategy_op])
+    _add_many(store, [((f"{index:02d}" + "很长的记忆内容" * 20)[:160], "fact", 3) for index in range(10)])
+    records = store.load()
+    strategy_record = next(record for record in records if record.category == "strategy")
+
+    strategy_block, _profile, facts, injected = store.recall()
+    assert "只做首板" in strategy_block, "战法必须进入置顶段"
+    assert strategy_record.id in injected
+    rendered_fact_lines = [line for line in facts.splitlines() if line.strip()]
+    assert all("[strategy]" not in line for line in rendered_fact_lines), "战法不得重复占用事实段预算"
 
 
 def test_recall_reports_the_injected_ids(tmp_path):
@@ -116,7 +139,7 @@ def test_recall_reports_the_injected_ids(tmp_path):
             {"op": "add", "content": "关注 600519", "category": "watchlist"},
         ]
     )
-    profile, facts, injected = store.recall()
+    _strategy, profile, facts, injected = store.recall()
     assert "风险偏好" in profile
     assert "[watchlist]" in facts
     assert len(injected) == 2
@@ -173,7 +196,7 @@ def test_hit_boost_is_capped_so_new_memories_still_get_injected(tmp_path):
     store.apply_ops([{"op": "add", "content": "新偏好：只做低估值高股息", "category": "risk_preference", "weight": 3}])
     newest = next(record for record in store.load() if record.content.startswith("新偏好"))
 
-    _profile, _facts, injected = store.recall()
+    _strategy, _profile, _facts, injected = store.recall()
     assert newest.id in injected, "新写的高权重记忆必须能进入注入集合，不能被老记忆的 hits 永久挤掉"
 
     # weight 仍是主序：新记忆得分必须高于 weight=1 的老记忆（哪怕它们 hits 拉满）
@@ -191,7 +214,7 @@ def test_recall_excludes_facts_dropped_by_the_char_budget(tmp_path):
     records = store.load()
     assert len(records) == 10
 
-    _profile, facts, injected = store.recall()
+    _strategy, profile, facts, injected = store.recall()
     rendered = len([line for line in facts.splitlines() if line.strip()])
     assert 0 < rendered < 10, "本用例需要预算真的裁掉了一部分事实"
     assert len(injected) == rendered, "injected_ids 必须与实际渲染进上下文的事实条数一致"
@@ -212,6 +235,36 @@ def test_plan_memory_ops_anchors_relative_time_to_a_reference_date():
     prompt_text = model.prompts[0][0]["content"]
     assert "2026-09-22" in prompt_text
     assert "绝对日期" in prompt_text or "换算成绝对日期" in prompt_text
+
+
+def test_create_record_explicit_user_add(tmp_path):
+    """治理面板/模型工具的显式新增：直接落库，不做合并与拦截。"""
+    store = MemoryStore(tmp_path)
+    record = store.create_record(content="只做放量突破首板，断板就走", category="strategy", weight=3)
+    assert record.category == "strategy" and record.weight == 3
+    loaded = store.load()
+    assert len(loaded) == 1 and loaded[0].id == record.id
+    # 与写侧提炼不同：显式新增不合并同文（重复了用户可以自己删）
+    duplicate = store.create_record(content="只做放量突破首板，断板就走", category="strategy")
+    assert len(store.load()) == 2 and duplicate.id != record.id
+
+
+def test_create_record_validates_category_content_and_weight(tmp_path):
+    store = MemoryStore(tmp_path)
+    try:
+        store.create_record(content="x", category="不存在")
+    except ValueError as exc:
+        assert "未知记忆类别" in str(exc)
+    else:
+        raise AssertionError("未知类别必须抛 ValueError")
+    try:
+        store.create_record(content="   ", category="strategy")
+    except ValueError as exc:
+        assert "内容不能为空" in str(exc)
+    else:
+        raise AssertionError("空内容必须抛 ValueError")
+    record = store.create_record(content="正常内容", category="fact", weight=99)
+    assert record.weight == 3.0, "权重必须收敛到 1~3"
 
 
 def test_apply_ops_rejects_market_numbers_for_non_profile_categories(tmp_path):

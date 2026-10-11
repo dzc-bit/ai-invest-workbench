@@ -339,23 +339,32 @@ class AiService:
             yield {"type": "session", "session_id": session_id, "title": session.get("title")}
 
             system_prompt = f"{build_system_prompt(self._knowledge.is_ready(), config.research_style)}\n\n{today_context()}"
-            profile, facts, recalled_ids = self._memory.recall()
+            strategy_block, profile, facts, recalled_ids = self._memory.recall()
+            if strategy_block:
+                system_prompt += f"\n\n## 用户战法（长期记忆，既定交易规则）\n{strategy_block}"
             if profile:
                 system_prompt += f"\n\n## 用户画像（长期记忆，越用越准）\n{profile}"
             if facts:
                 system_prompt += f"\n\n## 已知用户事实（长期记忆）\n{facts}"
-            if profile or facts:
+            if strategy_block or profile or facts:
                 # 记忆里常有一条自述的"交易风格"，它与本次设置的研究风格会互相拉扯：
                 # 不定优先级的话，模型永远把两种风格揉成一个中间态，切风格等于没切。
+                # 战法（strategy 类）是另一回事：它是用户既定的交易规则，优先级高于
+                # 模型自身的默认观点——这正是"总要用每个对话重新解释战法"的解药。
                 system_prompt += (
-                    "\n\n## 风格与记忆的优先级（必须遵守）\n"
+                    "\n\n## 战法、风格与记忆的优先级（必须遵守）\n"
                     f"本次研究风格（{RESEARCH_STYLE_LABELS.get(config.research_style, config.research_style)}）"
                     "是用户当下的显式选择，优先级高于长期记忆里关于交易风格/风险偏好的自述：\n"
-                    "- 输出骨架、取证清单、术语与决策口径一律按本次风格执行。\n"
-                    "- 长期记忆只用来个性化与本风格不冲突的部分（关注标的、持仓、已确认的事实）。\n"
+                    "- 输出骨架、取证清单、术语与表达口径一律按本次风格执行。\n"
+                    "- 长期记忆只用来个性化与本风格不冲突的部分（关注标的、持仓、已确认的事实；"
+                    "用户战法除外，见下条）。\n"
                     "- 若记忆与本次风格直接冲突（例如记忆说偏好妖股、本次是保守风格），"
                     "按本次风格作答，并在结尾用一句话点明该冲突（如“按你的保守设置，这类标的我不建议参与；"
-                    "你此前提到偏好情绪妖股，若要按那个口径看，请在设置里切到激进风格”）。"
+                    "你此前提到偏好情绪妖股，若要按那个口径看，请在设置里切到激进风格”）。\n"
+                    "- **用户战法是既定交易规则，是用户更早定下的口径：涉及选股、买卖点、仓位的问题"
+                    "先对照战法执行；你自己的默认交易观点只作补充，不得覆盖战法；战法没有覆盖的领域"
+                    "才按你的通用框架分析。**若战法与本次风格的决策口径冲突，按战法执行，"
+                    "并在结尾用一句话点明冲突。"
                 )
             # 本轮真正进了 system prompt 的记忆计入 hit-boost：不记的话
             # recall_score 的 hits 项恒为 1，长期记忆的"越用越准"只剩时间衰减。
@@ -499,6 +508,26 @@ class AiService:
                 for record in records
             ],
             "rejected_market_facts_total": self._memory.rejected_market_facts,
+        }
+
+    def create_memory(self, *, content: str, category: str, weight: float | None = None) -> dict[str, Any]:
+        """显式新增一条记忆（用户在治理面板手动录入；与模型提炼/工具写入分离）。"""
+        from astock_backtester.ai.memory import CATEGORIES
+
+        content = str(content or "").strip()[:160]
+        if not content:
+            raise ValueError("记忆内容不能为空。")
+        if str(category) not in CATEGORIES:
+            raise ValueError(f"未知记忆类别：{category}")
+        record = self._memory.create_record(content=content, category=str(category), weight=weight if weight is not None else 2.0)
+        return {
+            "ok": True,
+            "id": record.id,
+            "category": record.category,
+            "content": record.content,
+            "weight": record.weight,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
         }
 
     def update_memory(self, memory_id: str, *, content: str, category: str | None = None, weight: float | None = None) -> dict[str, Any]:

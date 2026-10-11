@@ -78,7 +78,7 @@
   --space-5: 20px;
   --space-6: 24px;
   /* layout */
-  --drawer-width: 480px;
+  --drawer-width: 560px;
   font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
   color: var(--ink);
   background: var(--backdrop);
