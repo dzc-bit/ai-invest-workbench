@@ -10,8 +10,7 @@ import {
   loadDataServiceLogs,
   loadDiagnosticsDataGaps,
   loadDiagnosticsSources,
-  startFullMarketSync,
-  startMissingOnlySync
+  startFullMarketSync
 } from "../api";
 import { aiInsightOneshot } from "../aiApi";
 import { isSyncRunningJob as isSyncRunning, useSyncJobPolling } from "../hooks/useSyncJobPolling";
@@ -26,7 +25,7 @@ type Props = {
   onServiceReady?: (service: DataServiceStatus) => void;
 };
 
-type BusyAction = "refresh" | "fetch" | "capital-flow" | "sample" | "file" | "sync" | "missing-only" | null;
+type BusyAction = "refresh" | "fetch" | "fetch-recent" | "capital-flow" | "sample" | "file" | "sync" | null;
 
 const COVERAGE_REFRESH_RETRY_MS = 1200;
 const COVERAGE_REFRESH_MAX_ATTEMPTS = 150;
@@ -93,7 +92,7 @@ function syncRunningMessage(job: SyncJobStatus): string {
   if (job.status === "cancelling") {
     return "正在停止任务，已导入的数据会保留";
   }
-  return `${job.mode === "capital_flow_backfill" ? "正在补齐全市场资金流" : "正在下载全市场历史数据"}，已处理 ${job.processed_symbols ?? job.completed_symbols}/${job.total_symbols}`;
+  return `${job.mode === "capital_flow_backfill" ? "正在补齐全市场资金流" : "正在下载全市场日线"}，已处理 ${job.processed_symbols ?? job.completed_symbols}/${job.total_symbols}`;
 }
 
 function syncFinishedMessage(job: SyncJobStatus): string {
@@ -207,9 +206,12 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
   const [items, setItems] = useState<DailyBarsCoverageItem[]>([]);
   const [logs, setLogs] = useState<ServiceLogEntry[]>([]);
   const [syncJob, setSyncJob] = useState<SyncJobStatus | null>(null);
-  // 「补全缺失数据」的资金流优先编排：资金流 job 启动后置位，轮询到 job 结束时
-  // 消费它去自动衔接全市场日线同步；用户点「停止任务」时必须清掉，避免停止后又自动开跑。
+  // 「补齐近期缺口 / 按窗口补齐」的资金流优先编排：资金流 job 启动后置位，轮询到
+  // job 结束时消费它去自动衔接全市场日线；窗口一并存进 ref——衔接用同一次补齐的
+  // 窗口，不受资金流任务运行期间改日期影响。用户点「停止任务」时两个 ref 都必须
+  // 清掉，避免停止后又自动开跑。
   const pendingFullMarketRef = useRef(false);
+  const pendingRangeRef = useRef<{ start: string; end: string } | null>(null);
   const [message, setMessage] = useState("正在连接本地数据服务");
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [coverageRefreshToken, setCoverageRefreshToken] = useState(0);
@@ -454,12 +456,14 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
       // 先同步领取衔接标记再 await：防止区间回调重入时重复启动全市场任务。
       const shouldChainFullMarket = pendingFullMarketRef.current && job.status !== "cancelled";
       pendingFullMarketRef.current = false;
+      const chainRange = pendingRangeRef.current;
+      pendingRangeRef.current = null;
       try {
         await refreshAfterOperation(service);
       } finally {
         if (shouldChainFullMarket) {
           // 衔接 message 只在 startFullMarketSync 返回前可见，随后被新 job 进度覆盖。
-          await runFullMarketSync("fetch", "资金流补齐结束，继续补全全市场缺失数据");
+          await runFullMarketSync("fetch", "资金流补齐结束，继续补全全市场缺失数据", chainRange?.start, chainRange?.end);
         }
       }
     },
@@ -483,63 +487,50 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     }
   };
 
-  // 「补全缺失数据」全市场路径：资金流补齐速度快，先跑资金流，结束后自动衔接全市场日线。
-  // 三种出口：①资金流返回 running job → 置位 pendingFullMarketRef，交给 syncJob 轮询结束时衔接；
-  // ②资金流无缺口立即返回（无 job）→ 直接启动日线；③资金流失败 → 不阻断，照样启动日线。
-  // 取消语义：handleCancelSyncJob 清掉 pendingFullMarketRef，衔接不会在停止后触发。
-  const runCapitalFlowFirstFullMarket = async () => {
+  // 补齐入口共用编排（「补齐近期缺口」「按窗口补齐」同一套规则，只有窗口来源不同）：
+  // 填了股票代码 → 只补这几只（/fetch/daily-bars）；留空 → 资金流优先衔接全市场（§9：空代码走 /sync/full-market）。
+  const runFill = async (rangeStart: string, rangeEnd: string, action: BusyAction = "fetch", rangeTouched = dateRangeTouched) => {
     if (!service) {
       return;
     }
-    pendingFullMarketRef.current = false;
-    setBusyAction("fetch");
-    setMessage("正在优先补齐资金流");
-    let startMessage = "正在补全全市场缺失数据";
-    try {
-      const result = await fetchCapitalFlow(service.base_url, symbols, startDate, endDate);
-      onCoverageChange(result.coverage);
-      if (result.job && isSyncRunning(result.job)) {
-        // 资金流 job 在跑：交给现有轮询，job 结束时自动衔接日线（见 syncJob effect）。
-        // 释放 busyAction（syncRunning 仍让 busy=true 保持按钮禁用）——否则用户取消
-        // 后 busyAction 卡在 "fetch"，按钮永远无法恢复。
-        pendingFullMarketRef.current = true;
-        setSyncJob(result.job);
-        setMessage(syncRunningMessage(result.job));
-        setBusyAction(null);
-        return;
-      }
-      startMessage = result.job
-        ? `${syncFinishedMessage(result.job)}，继续补全全市场缺失数据`
-        : "资金流无缺口，继续补全全市场缺失数据";
-    } catch (error) {
-      startMessage = `资金流补齐失败，继续日线补齐（${connectionErrorMessage(error)}）`;
+    if (symbols.length > 0) {
+      await runSymbolFetch(rangeStart, rangeEnd, action, rangeTouched);
+      return;
     }
-    await runFullMarketSync("fetch", startMessage);
+    await runCapitalFlowFirstFullMarket(rangeStart, rangeEnd, action);
   };
 
   const handleFetch = async () => {
+    await runFill(startDate, endDate);
+  };
+
+  // 「补齐近期缺口」：窗口自动取「上次覆盖日 → 最近交易日」（coverageFillDateRange 的默认窗口），
+  // 并把日期输入同步回这个窗口作为可见反馈。窗口外的历史旧缺口不会被重抓——
+  // 覆盖表里的旧缺口（停牌类/疑似写入失败日）不在本次补齐范围。
+  const handleFillRecent = async () => {
+    const range = resetToRecentWindow();
+    await runFill(range.startDate, range.endDate, "fetch-recent", false);
+  };
+
+  const runSymbolFetch = async (rangeStart: string, rangeEnd: string, action: BusyAction, rangeTouched: boolean) => {
     if (!service) {
       return;
     }
-    if (symbols.length === 0) {
-      await runCapitalFlowFirstFullMarket();
-      return;
-    }
-    setBusyAction("fetch");
+    setBusyAction(action);
     setMessage("正在补全缺失数据");
     try {
-      const result = await fetchDailyBars(service.base_url, symbols, startDate, endDate);
+      const result = await fetchDailyBars(service.base_url, symbols, rangeStart, rangeEnd);
       setMessage(operationMessage(result));
       onCoverageChange(result.coverage);
       const nextRange = coverageFillDateRange(result.coverage);
       const fetchedEndDate = latestCoverageEndDate(result.coverage);
-      const detailRange = dateRangeTouched
-        ? { startDate, endDate: fetchedEndDate && fetchedEndDate > endDate ? fetchedEndDate : endDate }
+      const detailRange = rangeTouched
+        ? { startDate: rangeStart, endDate: fetchedEndDate && fetchedEndDate > rangeEnd ? fetchedEndDate : rangeEnd }
         : nextRange;
-      if (!dateRangeTouched) {
+      if (!rangeTouched) {
         setStartDate(nextRange.startDate);
         setEndDate(nextRange.endDate);
-      } else if (fetchedEndDate && fetchedEndDate > endDate) {
+      } else if (fetchedEndDate && fetchedEndDate > rangeEnd) {
         setEndDate(fetchedEndDate);
       }
       await refreshAfterOperation(service, symbols, detailRange.startDate, detailRange.endDate);
@@ -555,6 +546,42 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     } finally {
       setBusyAction(null);
     }
+  };
+
+  // 全市场路径：资金流补齐速度快，先跑资金流，结束后自动衔接全市场日线。
+  // 三种出口：①资金流返回 running job → 置位 pendingFullMarketRef，交给 syncJob 轮询结束时衔接；
+  // ②资金流无缺口立即返回（无 job）→ 直接启动日线；③资金流失败 → 不阻断，照样启动日线。
+  // 取消语义：handleCancelSyncJob 清掉 pending 标记与窗口，衔接不会在停止后触发。
+  const runCapitalFlowFirstFullMarket = async (rangeStart: string, rangeEnd: string, action: BusyAction = "fetch") => {
+    if (!service) {
+      return;
+    }
+    pendingFullMarketRef.current = false;
+    pendingRangeRef.current = null;
+    setBusyAction(action);
+    setMessage("正在优先补齐资金流");
+    let startMessage = "正在补全全市场缺失数据";
+    try {
+      const result = await fetchCapitalFlow(service.base_url, symbols, rangeStart, rangeEnd);
+      onCoverageChange(result.coverage);
+      if (result.job && isSyncRunning(result.job)) {
+        // 资金流 job 在跑：交给现有轮询，job 结束时自动衔接日线（见 syncJob effect）。
+        // 释放 busyAction（syncRunning 仍让 busy=true 保持按钮禁用）——否则用户取消
+        // 后 busyAction 卡在当前动作，按钮永远无法恢复。
+        pendingFullMarketRef.current = true;
+        pendingRangeRef.current = { start: rangeStart, end: rangeEnd };
+        setSyncJob(result.job);
+        setMessage(syncRunningMessage(result.job));
+        setBusyAction(null);
+        return;
+      }
+      startMessage = result.job
+        ? `${syncFinishedMessage(result.job)}，继续补全全市场缺失数据`
+        : "资金流无缺口，继续补全全市场缺失数据";
+    } catch (error) {
+      startMessage = `资金流补齐失败，继续日线补齐（${connectionErrorMessage(error)}）`;
+    }
+    await runFullMarketSync("fetch", startMessage, rangeStart, rangeEnd);
   };
 
   const handleCapitalFlowBackfill = async () => {
@@ -646,42 +673,24 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     await runFullMarketSync("sync");
   };
 
-  const handleMissingOnlySync = async () => {
-    if (!service) {
-      return;
-    }
-    setBusyAction("missing-only");
-    setMessage("正在按缺口计算补齐名单");
-    try {
-      const result = await startMissingOnlySync(service.base_url, startDate, endDate);
-      if (!result.started) {
-        setMessage(result.reason ?? "窗口内没有不完整的股票，无需补齐。");
-        return;
-      }
-      if (result.job) {
-        setSyncJob(result.job);
-      }
-      setMessage(`${result.job ? reusedPrefix(result.job) : ""}缺口补齐已启动：窗口内 ${result.missing_symbols} 只不完整（不扫描全市场）`);
-      if (result.job && !isSyncRunning(result.job)) {
-        setMessage(syncFinishedMessage(result.job));
-        await refreshAfterOperation(service);
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "缺口补齐启动失败");
-      await refreshLogs(service);
-    } finally {
-      setBusyAction(null);
-    }
+  const resetToRecentWindow = () => {
+    const range = coverageFillDateRange(coverage);
+    setStartDate(range.startDate);
+    setEndDate(range.endDate);
+    setDateRangeTouched(false);
+    return range;
   };
 
-  const runFullMarketSync = async (action: "fetch" | "sync", startMessage?: string) => {
+  const runFullMarketSync = async (action: "fetch" | "sync", startMessage?: string, rangeStart?: string, rangeEnd?: string) => {
     if (!service) {
       return;
     }
+    const windowStart = rangeStart ?? startDate;
+    const windowEnd = rangeEnd ?? endDate;
     setBusyAction(action);
-    setMessage(startMessage ?? (action === "fetch" ? "正在补全全市场缺失数据" : "正在下载全市场历史数据"));
+    setMessage(startMessage ?? (action === "fetch" ? "正在补全全市场缺失数据" : "正在下载日线历史"));
     try {
-      const result = await startFullMarketSync(service.base_url, startDate, endDate);
+      const result = await startFullMarketSync(service.base_url, windowStart, windowEnd);
       setSyncJob(result.job);
       if (result.job.status === "running") {
         setMessage(`${reusedPrefix(result.job)}${syncRunningMessage(result.job)}`);
@@ -703,6 +712,7 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
     }
     // 用户主动停止：撤销「资金流结束后自动衔接日线」的意图，衔接不得再触发。
     pendingFullMarketRef.current = false;
+    pendingRangeRef.current = null;
     setMessage("正在停止任务，已导入的数据会保留");
     try {
       const result = await cancelSyncJob(service.base_url, syncJob.job_id);
@@ -765,48 +775,56 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
               }}
             />
           </label>
-          <label>
-            导入文件路径
-            <input
-              value={importPath}
-              onChange={(event) => setImportPath(event.target.value)}
-              placeholder="C:\\data\\daily.csv"
-            />
-          </label>
+        </div>
+        <div className="fill-window-note">
+          <p className="muted-code">
+            补齐规则：所有补齐只作用于上方窗口内的缺口（默认窗口＝上次覆盖日 → 最近交易日，即只补近期），
+            窗口外的历史旧缺口不会被重抓；股票代码留空＝全市场，填了＝只补这几只。
+          </p>
+          {dateRangeTouched ? (
+            <button className="secondary-button compact" type="button" onClick={resetToRecentWindow}>
+              恢复近期窗口
+            </button>
+          ) : null}
         </div>
         <div className="service-actions">
-          <button className="primary-button" type="button" onClick={handleFullMarketSync} disabled={!service || busy}>
-            {busyAction === "sync" ? "正在下载全市场历史数据" : "下载全市场历史数据"}
+          <button
+            className="primary-button"
+            type="button"
+            title="窗口自动取「上次覆盖日 → 最近交易日」：先补资金流，再补全市场日线+市值；填了股票代码则只补这几只"
+            onClick={handleFillRecent}
+            disabled={!service || busy}
+          >
+            {busyAction === "fetch-recent" ? "正在补齐近期缺口" : "补齐近期缺口"}
           </button>
-          <button className="primary-button" type="button" onClick={handleFetch} disabled={!service || busy}>
-            {busyAction === "fetch" ? "正在补全缺失数据" : "补全缺失数据"}
+          <button
+            className="secondary-button"
+            type="button"
+            title="用上方开始/结束日期作为补齐窗口：先补资金流，再补全市场日线+市值；填了股票代码则只补这几只"
+            onClick={handleFetch}
+            disabled={!service || busy}
+          >
+            {busyAction === "fetch" ? "正在按窗口补齐" : "按窗口补齐"}
           </button>
-          <button className="secondary-button" type="button" onClick={handleMissingOnlySync} disabled={!service || busy}>
-            {busyAction === "missing-only" ? "正在只补缺口" : "只补缺口"}
+          <button
+            className="secondary-button"
+            type="button"
+            title="只补窗口内的资金流缺口，不动日线；窗口内没有资金流缺口时不启动任务"
+            onClick={handleCapitalFlowBackfill}
+            disabled={!service || busy}
+          >
+            {busyAction === "capital-flow" ? "正在补齐资金流" : "只补资金流"}
           </button>
-          <button className="secondary-button" type="button" onClick={handleCapitalFlowBackfill} disabled={!service || busy}>
-            {busyAction === "capital-flow" ? "\u6b63\u5728\u8865\u9f50\u8d44\u91d1\u6d41" : "\u8865\u9f50\u8d44\u91d1\u6d41"}
-          </button>
-          <button className="secondary-button" type="button" onClick={handleImportSample} disabled={!service || busy}>
-            {busyAction === "sample" ? "正在导入示例数据" : "导入示例数据"}
-          </button>
-          <button className="secondary-button" type="button" onClick={handleImportFile} disabled={!service || busy || !importPath.trim()}>
-            {busyAction === "file" ? "正在导入本地文件" : "导入本地文件"}
-          </button>
-          <button className="secondary-button" type="button" aria-label="AI 诊断缺失" onClick={handleDiagnoseCoverage} disabled={!service || isDiagnosing}>
-            {isDiagnosing ? "AI 诊断中…" : "AI 诊断缺失"}
+          <button
+            className="secondary-button"
+            type="button"
+            title="按窗口从数据源下载全市场日线+市值（不抓资金流）；首次建仓或深度补历史时用，把开始日期改早即可下载更久"
+            onClick={handleFullMarketSync}
+            disabled={!service || busy}
+          >
+            {busyAction === "sync" ? "正在下载日线历史" : "下载日线历史"}
           </button>
         </div>
-        {diagnosisError ? (
-          <div className="condition-validation bad" role="alert">
-            {diagnosisError}
-          </div>
-        ) : null}
-        {aiCoverageDiagnosis ? (
-          <p className="ai-oneshot-line" aria-label="AI 覆盖诊断">
-            {aiCoverageDiagnosis}
-          </p>
-        ) : null}
         <p className={`operation-status ${busy ? "is-busy" : ""}`} role="status" aria-label="数据中心状态">
           {message}
         </p>
@@ -846,12 +864,33 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
             ))}
           </div>
         ) : null}
+        <details className="source-health-card import-card">
+          <summary>导入数据（示例 / 本地 CSV）</summary>
+          <div className="service-form import-form">
+            <label>
+              导入文件路径
+              <input
+                value={importPath}
+                onChange={(event) => setImportPath(event.target.value)}
+                placeholder="C:\\data\\daily.csv"
+              />
+            </label>
+          </div>
+          <div className="service-actions">
+            <button className="secondary-button" type="button" onClick={handleImportSample} disabled={!service || busy}>
+              {busyAction === "sample" ? "正在导入示例数据" : "导入示例数据"}
+            </button>
+            <button className="secondary-button" type="button" onClick={handleImportFile} disabled={!service || busy || !importPath.trim()}>
+              {busyAction === "file" ? "正在导入本地文件" : "导入本地文件"}
+            </button>
+          </div>
+        </details>
       </div>
 
       {displayCoverage.length === 0 ? (
         <div className="empty-state">
           <strong>等待数据覆盖信息</strong>
-          <span>如果本地缓存为空，运行回测前需要先导入或补全 a-stock-data 历史数据。</span>
+          <span>如果本地缓存为空，先用「下载日线历史」按窗口建立全市场数据；之后每天用「补齐近期缺口」只补最近的缺口。</span>
         </div>
       ) : (
         <div className="table-wrap">
@@ -1023,6 +1062,23 @@ export function DataCenter({ cacheDir, coverage, onCoverageChange, onServiceRead
             {isLoadingDataGaps ? "正在扫描数据仓缺口…" : dataGaps?.profile?.reason ?? "尚未获取缺口画像，连接本地服务后自动加载。"}
           </p>
         )}
+        {service ? (
+          <div className="data-gap-section">
+            <button className="secondary-button" type="button" aria-label="AI 诊断缺失" onClick={handleDiagnoseCoverage} disabled={!service || isDiagnosing}>
+              {isDiagnosing ? "AI 诊断中…" : "AI 诊断缺失"}
+            </button>
+            {diagnosisError ? (
+              <div className="condition-validation bad" role="alert">
+                {diagnosisError}
+              </div>
+            ) : null}
+            {aiCoverageDiagnosis ? (
+              <p className="ai-oneshot-line" aria-label="AI 覆盖诊断">
+                {aiCoverageDiagnosis}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
         {service ? (
           <button
             className="secondary-button compact"

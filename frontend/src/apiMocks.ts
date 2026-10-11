@@ -653,7 +653,7 @@ export function mockFetchDailyBarsResult(
   };
 }
 
-/** 「补全缺失数据」资金流优先编排的三种预览/测试场景（§见 DataCenter.runCapitalFlowFirstFullMarket）：
+/** 「按窗口补齐 / 补齐近期缺口」资金流优先编排的三种预览/测试场景（§见 DataCenter.runCapitalFlowFirstFullMarket）：
  * - `no_gap`：后端无缺口 200 立即返回，没有 job → 编排应直接启动全市场日线；
  * - `running_job`：返回 running 的资金流 job → 编排应等 job 结束再衔接日线；
  * - `failure`：抛错 → 编排不得阻断日线补齐。

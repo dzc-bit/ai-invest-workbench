@@ -582,41 +582,6 @@ export async function startFullMarketSync(
   );
 }
 
-/** 「只补缺口」：以缺口为基准的补齐入口（§9）。后端用 incomplete_symbols
- * 计算窗口内不完整的股票名单，只对名单发起抓取，不做全量扫描。 */
-export type MissingOnlySyncResponse = {
-  started: boolean;
-  reason?: string;
-  missing_symbols: number;
-  start_date: string;
-  end_date: string;
-  job?: SyncJobStatus;
-};
-
-export async function startMissingOnlySync(
-  baseUrl: string,
-  startDate: string,
-  endDate: string
-): Promise<MissingOnlySyncResponse> {
-  if (!isTauriRuntime()) {
-    const mocks = await previewApiMocks();
-    if (mocks) {
-      const mock = await mocks.mockStartFullMarketSync(startDate, endDate);
-      return { started: true, missing_symbols: mock.job.total_symbols, start_date: startDate, end_date: endDate, job: mock.job };
-    }
-    throw new BackendError("no_local_data", "本地数据服务未连接（当前不是桌面端运行环境）。");
-  }
-  return serviceFetch<MissingOnlySyncResponse>(
-    baseUrl,
-    "/sync/missing-only",
-    {
-      start_date: startDate,
-      end_date: endDate
-    },
-    { timeoutMs: LONG_RUNNING_SERVICE_TIMEOUT_MS }
-  );
-}
-
 export async function loadSyncJob(baseUrl: string, jobId: string): Promise<{ job: SyncJobStatus }> {
   if (!isTauriRuntime()) {
     const mocks = await previewApiMocks();

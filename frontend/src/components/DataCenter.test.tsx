@@ -13,8 +13,7 @@ const apiMocks = vi.hoisted(() => ({
   loadDataServiceLogs: vi.fn(),
   loadDailyBarsCoverage: vi.fn(),
   loadSyncJob: vi.fn(),
-  startFullMarketSync: vi.fn(),
-  startMissingOnlySync: vi.fn()
+  startFullMarketSync: vi.fn()
 }));
 
 // Spread the real api module so newly added exports (e.g. BackendError) stay
@@ -346,7 +345,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={oldCoverage} onCoverageChange={onCoverageChange} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1100);
@@ -372,7 +371,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     expect(await screen.findByText(/Baidu daily source returned malformed kline/)).toBeInTheDocument();
   });
@@ -422,7 +421,7 @@ describe("DataCenter", () => {
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     await user.clear(screen.getByLabelText("股票代码"));
     await user.type(screen.getByLabelText("股票代码"), "600519 000001");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.fetchDailyBars).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -442,7 +441,7 @@ describe("DataCenter", () => {
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     expect(screen.getByLabelText("股票代码")).toHaveValue("");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.startFullMarketSync).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -486,7 +485,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={missingCoverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     const rows = screen.getAllByRole("row");
     expect(within(rows[1]).getByText("100")).toBeInTheDocument();
@@ -542,7 +541,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={missingCoverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    const capitalFlowButton = screen.getByRole("button", { name: "补齐资金流" });
+    const capitalFlowButton = screen.getByRole("button", { name: "只补资金流" });
     await user.click(capitalFlowButton);
 
     await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalled());
@@ -589,7 +588,7 @@ describe("DataCenter", () => {
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     apiMocks.loadDataServiceHealth.mockClear();
-    await user.click(screen.getByRole("button", { name: "补齐资金流" }));
+    await user.click(screen.getByRole("button", { name: "只补资金流" }));
 
     await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalled());
     expect(apiMocks.loadDataServiceHealth).not.toHaveBeenCalled();
@@ -605,7 +604,7 @@ describe("DataCenter", () => {
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     await user.clear(screen.getByLabelText("\u80a1\u7968\u4ee3\u7801"));
     await user.type(screen.getByLabelText("\u80a1\u7968\u4ee3\u7801"), "600519 000001");
-    await user.click(screen.getByRole("button", { name: "补齐资金流" }));
+    await user.click(screen.getByRole("button", { name: "只补资金流" }));
 
     await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -642,7 +641,7 @@ describe("DataCenter", () => {
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     expect(screen.getByLabelText("股票代码")).toHaveValue("");
-    await user.click(screen.getByRole("button", { name: "补齐资金流" }));
+    await user.click(screen.getByRole("button", { name: "只补资金流" }));
 
     await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -674,7 +673,7 @@ describe("DataCenter", () => {
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     await user.clear(screen.getByLabelText("股票代码"));
     await user.type(screen.getByLabelText("股票代码"), "600519 000001");
-    await user.click(screen.getByRole("button", { name: "补齐资金流" }));
+    await user.click(screen.getByRole("button", { name: "只补资金流" }));
 
     expect(await screen.findByRole("status", { name: "数据中心状态" })).toHaveTextContent(
       "部分失败: 000001"
@@ -771,7 +770,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={onCoverageChange} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补齐资金流" }));
+    await user.click(screen.getByRole("button", { name: "只补资金流" }));
 
     expect(await screen.findByRole("button", { name: "停止任务" })).toBeInTheDocument();
     expect(screen.getByText(/接口返回 8 行，写入 5 行/)).toBeInTheDocument();
@@ -833,7 +832,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补齐资金流" }));
+    await user.click(screen.getByRole("button", { name: "只补资金流" }));
 
     const failures = await screen.findByLabelText("最近失败原因");
     expect(within(failures).getByText(/000003/)).toHaveTextContent("network_error");
@@ -859,9 +858,9 @@ describe("DataCenter", () => {
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     await user.type(screen.getByLabelText("股票代码"), "600519");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
-    expect(screen.getByRole("button", { name: "正在补全缺失数据" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "正在按窗口补齐" })).toBeDisabled();
     expect(screen.getByRole("status", { name: "数据中心状态" })).toHaveTextContent("正在补全缺失数据");
 
     resolveFetch({
@@ -898,7 +897,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "下载全市场历史数据" }));
+    await user.click(screen.getByRole("button", { name: "下载日线历史" }));
 
     expect(screen.getByText(/当前 000002/)).toBeInTheDocument();
     await act(async () => {
@@ -930,7 +929,7 @@ describe("DataCenter", () => {
     expect(await screen.findByLabelText("开始日期")).toHaveValue("2026-06-01");
     expect(screen.getByLabelText("结束日期")).toHaveValue("2026-06-05");
     await user.type(screen.getByLabelText("股票代码"), "600519");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.fetchDailyBars).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -951,7 +950,7 @@ describe("DataCenter", () => {
 
     expect(await screen.findByLabelText("开始日期")).toHaveValue("2026-06-12");
     expect(screen.getByLabelText("结束日期")).toHaveValue("2026-06-18");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.startFullMarketSync).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -978,7 +977,7 @@ describe("DataCenter", () => {
     expect(await screen.findByLabelText("开始日期")).toHaveValue("2026-05-26");
     expect(screen.getByLabelText("结束日期")).toHaveValue("2026-06-05");
     await user.type(screen.getByLabelText("股票代码"), "600519");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.fetchDailyBars).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -1009,7 +1008,7 @@ describe("DataCenter", () => {
     await user.type(screen.getByLabelText("股票代码"), "600519");
     await user.clear(screen.getByLabelText("开始日期"));
     await user.type(screen.getByLabelText("开始日期"), "2026-05-26");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.fetchDailyBars).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -1036,7 +1035,7 @@ describe("DataCenter", () => {
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
     await user.type(screen.getByLabelText("股票代码"), "600519");
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.fetchDailyBars).toHaveBeenCalled());
     expect(onCoverageChange).toHaveBeenCalledWith(coverage);
@@ -1048,27 +1047,37 @@ describe("DataCenter", () => {
     expect(within(dailyRow!).queryByText("0")).toBeNull();
   });
 
-  it("「只补缺口」入口以缺口名单发起，完成后显示缺口数量", async () => {
-    apiMocks.startMissingOnlySync.mockResolvedValue({
-      started: true,
-      missing_symbols: 3,
-      start_date: "2026-05-26",
-      end_date: "2026-06-05"
-    });
+  it("「补齐近期缺口」自动把窗口重置为「上次覆盖日→最近交易日」并资金流优先衔接", async () => {
+    // 即便用户改过日期，一键补齐近期也必须拉回默认窗口（stale 覆盖 → 2026-05-26 ~ 2026-06-05），
+    // 窗口外的历史旧缺口不会被重抓（§9：空代码走资金流优先 + /sync/full-market）。
     const user = setupUser();
-    render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
+    render(<DataCenter cacheDir=".astock-cache" coverage={staleRecentCoverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "只补缺口" }));
+    await user.clear(screen.getByLabelText("开始日期"));
+    await user.type(screen.getByLabelText("开始日期"), "2015-01-01");
+    await user.click(screen.getByRole("button", { name: "补齐近期缺口" }));
 
-    await waitFor(() => expect(apiMocks.startMissingOnlySync).toHaveBeenCalledWith(
+    expect(screen.getByLabelText("开始日期")).toHaveValue("2026-05-26");
+    expect(screen.getByLabelText("结束日期")).toHaveValue("2026-06-05");
+    await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
-      expect.any(String),
-      expect.any(String)
+      [],
+      "2026-05-26",
+      "2026-06-05"
     ));
+    await waitFor(() => expect(apiMocks.startFullMarketSync).toHaveBeenCalledWith(
+      "http://127.0.0.1:9011",
+      "2026-05-26",
+      "2026-06-05"
+    ));
+    // 资金流必须先于全市场日线启动
+    expect(apiMocks.fetchCapitalFlow.mock.invocationCallOrder[0]).toBeLessThan(
+      apiMocks.startFullMarketSync.mock.invocationCallOrder[0]
+    );
   });
 
-  // —— 「补全缺失数据」资金流优先编排（DataCenter.runCapitalFlowFirstFullMarket）——
+  // —— 「按窗口补齐 / 补齐近期缺口」资金流优先编排（DataCenter.runCapitalFlowFirstFullMarket）——
 
   it("starts the full-market daily sync immediately when capital flow reports no gaps", async () => {
     const user = setupUser();
@@ -1092,7 +1101,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -1168,7 +1177,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() =>
       expect(screen.getByRole("status", { name: "数据中心状态" })).toHaveTextContent("正在补齐全市场资金流")
@@ -1207,7 +1216,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     await waitFor(() => expect(apiMocks.fetchCapitalFlow).toHaveBeenCalledWith(
       "http://127.0.0.1:9011",
@@ -1287,7 +1296,7 @@ describe("DataCenter", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9011/);
-    await user.click(screen.getByRole("button", { name: "补全缺失数据" }));
+    await user.click(screen.getByRole("button", { name: "按窗口补齐" }));
 
     const stopButton = await screen.findByRole("button", { name: "停止任务" });
     await user.click(stopButton);

@@ -111,9 +111,11 @@ describe("DataCenter lifecycle badges", () => {
     render(<DataCenter cacheDir=".astock-cache" coverage={coverage} onCoverageChange={vi.fn()} />);
 
     await screen.findByText(/http:\/\/127\.0\.0\.1:9013/);
+    // AI 诊断缺失移入「缺失数据监控」折叠区，先展开再点击。
+    await user.click(screen.getByText(/缺失数据监控/));
     await user.click(screen.getByRole("button", { name: "AI 诊断缺失" }));
 
-    expect(await screen.findByLabelText("AI 覆盖诊断")).toHaveTextContent("补齐资金流");
+    expect(await screen.findByLabelText("AI 覆盖诊断")).toHaveTextContent("只补资金流");
   });
 
   it("shows the source health card with realtime news finance rows", async () => {

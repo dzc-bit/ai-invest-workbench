@@ -330,7 +330,7 @@ export function mockAiConditionParse(text: string): AiConditionParseResult {
 
 const ONESHOT_MOCK_TEXTS: Record<AiInsightScene, string> = {
   results_overview: "本次回测收益平稳但交易次数偏少，胜率的优势不足以支撑加仓，建议先扩大日期范围验证稳定性。（演示数据）",
-  data_coverage: "缺失集中在资金流字段，日线覆盖完整；新上市股票的上市前区间不再计为缺失，点击“补齐资金流”即可修复。（演示数据）",
+  data_coverage: "缺失集中在资金流字段，日线覆盖完整；新上市股票的上市前区间不再计为缺失，点击“只补资金流”即可修复。（演示数据）",
   risk_alerts: "风险名单以 ST 类为主，集中在小市值方向；持仓若命中名单应以减仓优先，避免退市整理期流动性风险。（演示数据）"
 };
 
