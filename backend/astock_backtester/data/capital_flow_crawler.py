@@ -255,10 +255,14 @@ class CapitalFlowCrawler:
             self._eastmoney_json_getters = (("injected", json_get),)
         self._baidu_json_get = baidu_json_get or _default_json_get
         self._sina_json_get = sina_json_get or _default_sina_json_get
-        self._enable_baidu_fallback = baidu_json_get is not None or json_get is None
-        self._enable_sina_fallback = sina_json_get is not None or (
-            json_get is None and eastmoney_json_getters is None
-        )
+        # 注入式构造必须完全离线（与 HttpAStockFetcher 同款纪律）：任何显式注入
+        # transport（json_get / eastmoney_json_getters）都视为测试 harness，未注入
+        # 的回退源一律停用——否则注入 eastmoney 的用例会经**真实**百度回退偶发
+        # "成功"（CI 境外 runner 可达 finance.pae.baidu.com，本机境内 403），变体
+        # 上限测试在 CI 上偶发 DID NOT RAISE 而本地恒绿。零注入的生产路径不受影响。
+        injected_any = json_get is not None or eastmoney_json_getters is not None
+        self._enable_baidu_fallback = baidu_json_get is not None or not injected_any
+        self._enable_sina_fallback = sina_json_get is not None or not injected_any
         self._recent_success_rows: dict[str, list[dict[str, Any]]] = {}
         self._recent_success_lock = Lock()
         self._sina_request_lock = Lock()

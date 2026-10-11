@@ -1162,6 +1162,38 @@ def test_sina_fund_flow_endpoint_uses_https():
     assert SINA_FUND_FLOW_URL.startswith("https://"), SINA_FUND_FLOW_URL
 
 
+def test_injected_crawler_disables_uninjected_fallbacks():
+    """注入 transport 的构造必须完全离线：未注入的回退源不得启用真实网络。
+
+    背景（1.6.2 CI 实测）：eastmoney_json_getters 注入恒 403 后，baidu 回退
+    带着**真实** requests 打到 finance.pae.baidu.com——境外 runner 偶发可达，
+    回退"成功"让两个变体上限测试 DID NOT RAISE；本机（境内 403）恒绿，
+    漂移只在 CI 可见。收口后：显式注入任一 transport 即停用未注入的回退，
+    零注入的生产路径保持全开。
+    """
+    def forbidden(url, params, headers, timeout):
+        raise RuntimeError("456 Client Error: Forbidden")
+
+    harness = CapitalFlowCrawler(eastmoney_json_getters=(("requests", forbidden), ("curl_cffi", forbidden)))
+    assert harness._enable_baidu_fallback is False
+    assert harness._enable_sina_fallback is False
+
+    injected_json = CapitalFlowCrawler(json_get=forbidden)
+    assert injected_json._enable_baidu_fallback is False
+    assert injected_json._enable_sina_fallback is False
+
+    explicit = CapitalFlowCrawler(
+        eastmoney_json_getters=(("requests", forbidden),),
+        baidu_json_get=forbidden,
+    )
+    assert explicit._enable_baidu_fallback is True
+    assert explicit._enable_sina_fallback is False
+
+    production = CapitalFlowCrawler()
+    assert production._enable_baidu_fallback is True
+    assert production._enable_sina_fallback is True
+
+
 def test_eastmoney_variant_matrix_stops_at_combination_cap(monkeypatch):
     """变体矩阵必须有上限：403/429 这类非网络层失败原本会走满全部组合。"""
     cap = capital_flow_crawler.EASTMONEY_VARIANT_MAX_COMBINATIONS
