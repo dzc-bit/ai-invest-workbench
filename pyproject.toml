@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astock-backtester"
-version = "1.6.1"
+version = "1.6.2"
 description = "Windows desktop A-share daily historical backtester backend"
 # 支持范围 = CI 矩阵实际验证过的版本（.github/workflows/ci.yml 的 3.11 / 3.13）；
 # 上界必须跟着矩阵一起改，否则等于承诺未验证的版本可用。
